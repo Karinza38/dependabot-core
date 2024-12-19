@@ -16,6 +16,7 @@ public partial class AnalyzeWorker : IAnalyzeWorker
 {
     public const string AnalysisDirectoryName = "./.dependabot/analysis";
 
+    private readonly ExperimentsManager _experimentsManager;
     private readonly ILogger _logger;
 
     internal static readonly JsonSerializerOptions SerializerOptions = new()
@@ -24,8 +25,9 @@ public partial class AnalyzeWorker : IAnalyzeWorker
         Converters = { new JsonStringEnumConverter(), new RequirementArrayConverter() },
     };
 
-    public AnalyzeWorker(ILogger logger)
+    public AnalyzeWorker(ExperimentsManager experimentsManager, ILogger logger)
     {
+        _experimentsManager = experimentsManager;
         _logger = logger;
     }
 
@@ -140,6 +142,7 @@ public partial class AnalyzeWorker : IAnalyzeWorker
                     dependenciesToUpdate,
                     updatedVersion,
                     nugetContext,
+                    _experimentsManager,
                     _logger,
                     CancellationToken.None);
             }
@@ -391,6 +394,7 @@ public partial class AnalyzeWorker : IAnalyzeWorker
         ImmutableHashSet<string> packageIds,
         NuGetVersion updatedVersion,
         NuGetContext nugetContext,
+        ExperimentsManager experimentsManager,
         ILogger logger,
         CancellationToken cancellationToken)
     {
@@ -430,6 +434,7 @@ public partial class AnalyzeWorker : IAnalyzeWorker
             packageIds,
             updatedVersion,
             nugetContext,
+            experimentsManager,
             logger,
             cancellationToken);
 
