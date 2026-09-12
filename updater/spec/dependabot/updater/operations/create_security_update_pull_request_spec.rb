@@ -37,7 +37,8 @@ RSpec.describe Dependabot::Updater::Operations::CreateSecurityUpdatePullRequest 
       record_update_job_error: nil,
       create_pull_request: nil,
       record_update_job_warning: nil,
-      record_ecosystem_meta: nil
+      record_ecosystem_meta: nil,
+      record_cooldown_meta: nil
     )
   end
 
@@ -50,14 +51,14 @@ RSpec.describe Dependabot::Updater::Operations::CreateSecurityUpdatePullRequest 
   let(:job) do
     Dependabot::Job.new_update_job(
       job_id: "1558782000",
-      job_definition: job_definition_with_fetched_files
+      job_definition: job_definition
     )
   end
 
   let(:dependency_snapshot) do
     Dependabot::DependencySnapshot.create_from_job_definition(
-      job: job,
-      job_definition: job_definition_with_fetched_files
+      job:,
+      fetched_files:
     )
   end
 
@@ -81,11 +82,8 @@ RSpec.describe Dependabot::Updater::Operations::CreateSecurityUpdatePullRequest 
   let(:supported_versions) { %w(2 3) }
   let(:deprecated_versions) { %w(1) }
 
-  let(:job_definition_with_fetched_files) do
-    job_definition.merge({
-      "base_commit_sha" => "mock-sha",
-      "base64_dependency_files" => encode_dependency_files(dependency_files)
-    })
+  let(:fetched_files) do
+    Dependabot::FetchedFiles.new(base_commit_sha: "mock-sha", dependency_files:)
   end
 
   let(:dependency_files) do
@@ -363,23 +361,19 @@ RSpec.describe Dependabot::Updater::Operations::CreateSecurityUpdatePullRequest 
         allow(job)
           .to receive_messages(security_fix?: true, allowed_update?: true)
         allow(job)
+          .to receive(:blocked_versions_for?).with(dependency).and_return(true)
+        allow(job)
           .to receive(:existing_pull_requests).and_return(
             [
-              Dependabot::PullRequest.new([
-                Dependabot::PullRequest::Dependency.new(
-                  name: "dummy-pkg-a", version: "4.0.1"
-                )
-              ])
+              Dependabot::PullRequest.new(
+                [
+                  Dependabot::PullRequest::Dependency.new(
+                    name: "dummy-pkg-a", version: "4.0.1"
+                  )
+                ]
+              )
             ]
           )
-      end
-
-      it "checks if a pull request already exists" do
-        expect(create_security_update_pull_request)
-          .to receive(:record_pull_request_exists_for_latest_version)
-          .with(stub_update_checker)
-        create_security_update_pull_request
-          .send(:check_and_create_pull_request, dependency)
       end
 
       context "when pull request doesn't exists" do
@@ -396,6 +390,19 @@ RSpec.describe Dependabot::Updater::Operations::CreateSecurityUpdatePullRequest 
 
           create_security_update_pull_request
             .send(:check_and_create_pull_request, dependency)
+        end
+
+        it "increments the blocked versions ignored metric" do
+          create_security_update_pull_request
+            .send(:check_and_create_pull_request, dependency)
+
+          expect(mock_service).to have_received(:increment_metric).with(
+            "blocked_versions.ignored",
+            tags: {
+              operation: "security_update",
+              package_manager: "bundler"
+            }
+          )
         end
       end
     end
@@ -417,6 +424,35 @@ RSpec.describe Dependabot::Updater::Operations::CreateSecurityUpdatePullRequest 
           .with(stub_update_checker)
         create_security_update_pull_request
           .send(:check_and_create_pull_request, dependency)
+      end
+    end
+
+    context "when every possible update is ignored" do
+      before do
+        allow(stub_update_checker)
+          .to receive(:latest_version)
+          .and_raise(Dependabot::AllVersionsIgnored)
+        allow(job)
+          .to receive(:blocked_versions_for?).with(dependency).and_return(false)
+      end
+
+      it "reraises so the backend records an update job error" do
+        expect do
+          create_security_update_pull_request
+            .send(:check_and_create_pull_request, dependency)
+        end.to raise_error(Dependabot::AllVersionsIgnored)
+      end
+
+      it "does not increment the blocked versions ignored metric" do
+        expect do
+          create_security_update_pull_request
+            .send(:check_and_create_pull_request, dependency)
+        end.to raise_error(Dependabot::AllVersionsIgnored)
+
+        expect(mock_service).not_to have_received(:increment_metric).with(
+          "blocked_versions.ignored",
+          tags: anything
+        )
       end
     end
 
@@ -456,12 +492,14 @@ RSpec.describe Dependabot::Updater::Operations::CreateSecurityUpdatePullRequest 
 
       it "does not create a pull request if there is a conflict" do
         allow(transitive_stub_update_checker)
-          .to receive(:conflicting_dependencies).and_return([{
-            "explanation" => "dummy-pkg-b@0.2.0 requires dummy-pkg-a@~2.0.1",
-            "name" => "dummy-pkg-b",
-            "version" => "0.2.0",
-            "requirement" => "~2.0.1"
-          }])
+          .to receive(:conflicting_dependencies).and_return(
+            [{
+              "explanation" => "dummy-pkg-b@0.2.0 requires dummy-pkg-a@~2.0.1",
+              "name" => "dummy-pkg-b",
+              "version" => "0.2.0",
+              "requirement" => "~2.0.1"
+            }]
+          )
         expect(mock_service).not_to receive(:create_pull_request)
         create_security_update_pull_request
           .send(:check_and_create_pull_request, transitive_dependency)

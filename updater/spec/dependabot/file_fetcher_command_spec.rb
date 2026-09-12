@@ -5,6 +5,7 @@ require "spec_helper"
 require "dependabot/file_fetcher_command"
 require "dependabot/errors"
 require "tmpdir"
+require "fileutils"
 
 require "support/dummy_package_manager/dummy"
 
@@ -22,20 +23,26 @@ RSpec.describe Dependabot::FileFetcherCommand do
     allow(api_client).to receive(:mark_job_as_processed)
     allow(api_client).to receive(:record_update_job_error)
     allow(api_client).to receive(:record_ecosystem_versions)
+    allow(api_client).to receive(:close_pull_request)
     allow(api_client).to receive(:is_a?).with(Dependabot::ApiClient).and_return(true)
 
-    allow(Dependabot::Environment).to receive_messages(job_id: job_id, job_token: "job_token",
-                                                       output_path: File.join(Dir.mktmpdir,
-                                                                              "output.json"),
-                                                       job_definition: job_definition,
-                                                       job_path: nil)
+    allow(Dependabot::Environment).to receive_messages(
+      job_id: job_id,
+      job_token: "job_token",
+      output_path: File.join(
+        Dir.mktmpdir,
+        "output.json"
+      ),
+      job_definition: job_definition,
+      job_path: nil
+    )
   end
 
   describe "#perform_job" do
     subject(:perform_job) { job.perform_job }
 
     let(:job_definition) do
-      JSON.parse(fixture("jobs/job_with_credentials.json"))
+      JSON.parse(fixture("jobs/job_without_credentials.json"))
     end
 
     after do
@@ -43,17 +50,106 @@ RSpec.describe Dependabot::FileFetcherCommand do
       Dependabot::Experiments.reset!
     end
 
-    it "fetches the files and writes the fetched files to output.json", :vcr do
+    it "fetches the files", :vcr do
       expect(api_client).not_to receive(:mark_job_as_processed)
 
       perform_job
 
-      output = JSON.parse(File.read(Dependabot::Environment.output_path))
-      dependency_file = output["base64_dependency_files"][0]
-      expect(dependency_file["name"]).to eq(
+      dependency_file = job.files.dependency_files.first
+      expect(dependency_file.name).to eq(
         "dependabot-test-ruby-package.gemspec"
       )
-      expect(dependency_file["content_encoding"]).to eq("utf-8")
+      expect(dependency_file.content_encoding).to eq("utf-8")
+    end
+
+    context "when empty directories are specified" do
+      before do
+        allow(Dependabot::Environment).to receive(:repo_contents_path).and_return(Dir.mktmpdir)
+      end
+
+      context "with non-graph jobs" do
+        let(:job_definition) do
+          JSON.parse(fixture("jobs/job_with_directories.json"))
+        end
+
+        it "raises a DependencyFileNotFound error" do
+          expect(api_client)
+            .to receive(:record_update_job_error)
+            .with(
+              error_details: { "file-path": nil, message: "No files found in /foo" },
+              error_type: "dependency_file_not_found"
+            )
+          expect(api_client).to receive(:mark_job_as_processed)
+
+          expect { perform_job }.to output(/Error during file fetching; aborting/).to_stdout_from_any_process
+        end
+      end
+
+      context "with graph jobs" do
+        let(:job_definition) do
+          JSON.parse(fixture("jobs/job_with_graph_command.json"))
+        end
+
+        it "does not raise an error" do
+          expect(api_client).not_to receive(:mark_job_as_processed)
+
+          expect { perform_job }.not_to raise_error
+
+          expect(job.files.dependency_files).to be_empty
+        end
+      end
+
+      context "when command is update" do
+        let(:job_definition) do
+          job_def = JSON.parse(fixture("jobs/job_with_directories.json"))
+          job_def["job"]["command"] = "update"
+          job_def["job"]["dependencies"] = ["pandas"]
+          job_def
+        end
+
+        it "closes the pull request before raising DependencyFileNotFound error" do
+          expect(api_client)
+            .to receive(:close_pull_request)
+            .with(["pandas"], :dependency_removed)
+
+          expect(api_client)
+            .to receive(:record_update_job_error)
+            .with(
+              error_details: { "file-path": nil, message: "No files found in /foo" },
+              error_type: "dependency_file_not_found"
+            )
+
+          expect(api_client).to receive(:mark_job_as_processed)
+
+          expect { perform_job }.to output(/Error during file fetching; aborting/).to_stdout_from_any_process
+        end
+      end
+
+      context "when command is recreate" do
+        let(:job_definition) do
+          job_def = JSON.parse(fixture("jobs/job_with_directories.json"))
+          job_def["job"]["command"] = "recreate"
+          job_def["job"]["dependencies"] = ["pandas"]
+          job_def
+        end
+
+        it "closes the pull request before raising DependencyFileNotFound error" do
+          expect(api_client)
+            .to receive(:close_pull_request)
+            .with(["pandas"], :dependency_removed)
+
+          expect(api_client)
+            .to receive(:record_update_job_error)
+            .with(
+              error_details: { "file-path": nil, message: "No files found in /foo" },
+              error_type: "dependency_file_not_found"
+            )
+
+          expect(api_client).to receive(:mark_job_as_processed)
+
+          expect { perform_job }.to output(/Error during file fetching; aborting/).to_stdout_from_any_process
+        end
+      end
     end
 
     context "when the fetcher raises a ToolVersionNotSupported error", :vcr do
@@ -91,8 +187,174 @@ RSpec.describe Dependabot::FileFetcherCommand do
         expect(api_client)
           .to receive(:record_update_job_error)
           .with(
-            error_details: { "branch-name": "my_branch" },
+            error_details: {
+              "branch-name": "my_branch",
+              message: anything # The original tests don't specify custom messages
+            },
             error_type: "branch_not_found"
+          )
+        expect(api_client).to receive(:mark_job_as_processed)
+
+        expect { perform_job }.to output(/Error during file fetching; aborting/).to_stdout_from_any_process
+      end
+    end
+
+    context "when target-branch validation detects non-existent branch early" do
+      let(:job_definition) do
+        job_def = JSON.parse(fixture("jobs/job_with_credentials.json"))
+        job_def["job"]["source"]["branch"] = "nonexistent-branch"
+        job_def
+      end
+
+      let(:git_metadata_fetcher) { double("GitMetadataFetcher") }
+
+      before do
+        allow_any_instance_of(described_class)
+          .to receive(:git_metadata_fetcher)
+          .and_return(git_metadata_fetcher)
+
+        allow(git_metadata_fetcher).to receive_messages(
+          ref_names: %w(main develop feature-branch),
+          upload_pack: nil
+        )
+      end
+
+      it "raises BranchNotFound error with helpful message before file operations" do
+        expect(api_client)
+          .to receive(:record_update_job_error)
+          .with(
+            error_details: {
+              "branch-name": "nonexistent-branch",
+              message: "The branch 'nonexistent-branch' specified in the target-branch field " \
+                       "does not exist. Please check that the branch name is correct and that " \
+                       "the branch exists in the repository."
+            },
+            error_type: "branch_not_found"
+          )
+        expect(api_client).to receive(:mark_job_as_processed)
+
+        expect { perform_job }.to output(/Error during file fetching; aborting/).to_stdout_from_any_process
+      end
+    end
+
+    context "when target-branch validation fails gracefully" do
+      let(:job_definition) do
+        job_def = JSON.parse(fixture("jobs/job_with_credentials.json"))
+        job_def["job"]["source"]["branch"] = "some-branch"
+        job_def
+      end
+
+      let(:git_metadata_fetcher) { double("GitMetadataFetcher") }
+
+      before do
+        allow_any_instance_of(described_class)
+          .to receive(:git_metadata_fetcher)
+          .and_return(git_metadata_fetcher)
+
+        # Simulate an error in git metadata fetching (e.g., network issues)
+        allow(git_metadata_fetcher)
+          .to receive(:ref_names)
+          .and_raise(StandardError, "Network error")
+
+        # Mock the file fetcher to verify it still gets called
+        allow_any_instance_of(Dependabot::Bundler::FileFetcher)
+          .to receive(:commit)
+          .and_return("abc123")
+        allow_any_instance_of(Dependabot::Bundler::FileFetcher)
+          .to receive(:files)
+          .and_raise(Dependabot::BranchNotFound, "some-branch")
+      end
+
+      it "falls back to existing validation and continues processing" do
+        # Should not raise error during early validation, but log warning
+        expect(Dependabot.logger).to receive(:warn)
+          .with(/Could not validate target branch early:/).ordered
+
+        expect(Dependabot.logger).to receive(:warn)
+          .with(/Could not validate the existence of the 'dependabot' branch/).ordered
+
+        expect(api_client).to receive(:record_update_job_error)
+          .with(
+            error_details: {
+              "branch-name": "some-branch",
+              message: "Dependabot::BranchNotFound"
+            },
+            error_type: "branch_not_found"
+          )
+        expect(api_client).to receive(:mark_job_as_processed)
+
+        expect { perform_job }.to output(/Error during file fetching; aborting/).to_stdout_from_any_process
+      end
+    end
+
+    context "with multiple update configurations and invalid target-branch" do
+      let(:job_definition) do
+        job_def = JSON.parse(fixture("jobs/job_with_credentials.json"))
+        # Simulate a case where we have multiple update configs but one has invalid branch
+        job_def["job"]["source"]["branch"] = "invalid-branch"
+        job_def
+      end
+
+      let(:git_metadata_fetcher) { double("GitMetadataFetcher") }
+
+      before do
+        allow_any_instance_of(described_class)
+          .to receive(:git_metadata_fetcher)
+          .and_return(git_metadata_fetcher)
+
+        allow(git_metadata_fetcher).to receive_messages(
+          ref_names: %w(main develop feature-branch),
+          upload_pack: nil
+        )
+      end
+
+      it "validates branch early and prevents silent failures" do
+        expect(api_client)
+          .to receive(:record_update_job_error)
+          .with(
+            error_details: {
+              "branch-name": "invalid-branch",
+              message: "The branch 'invalid-branch' specified in the target-branch field " \
+                       "does not exist. Please check that the branch name is correct and that " \
+                       "the branch exists in the repository."
+            },
+            error_type: "branch_not_found"
+          )
+        expect(api_client).to receive(:mark_job_as_processed)
+
+        expect { perform_job }.to output(/Error during file fetching; aborting/).to_stdout_from_any_process
+      end
+    end
+
+    context "when the dependabot branch exists" do
+      let(:job_definition) do
+        job_def = JSON.parse(fixture("jobs/job_with_credentials.json"))
+        job_def
+      end
+
+      let(:git_metadata_fetcher) { double("GitMetadataFetcher") }
+
+      before do
+        allow_any_instance_of(described_class)
+          .to receive(:git_metadata_fetcher)
+          .and_return(git_metadata_fetcher)
+
+        allow(git_metadata_fetcher).to receive_messages(
+          ref_names: %w(main develop dependabot),
+          upload_pack: nil
+        )
+      end
+
+      it "raises error with helpful message before file operations" do
+        expect(api_client)
+          .to receive(:record_update_job_error)
+          .with(
+            error_details: {
+              message: "Branch 'dependabot' already exists and causes a Git ref namespace conflict. " \
+                       "Git can’t create `dependabot/...` branches while the branch `dependabot` exists." \
+                       "Please delete the 'dependabot' branch and retry."
+            },
+            error_type: "file_fetcher_error"
           )
         expect(api_client).to receive(:mark_job_as_processed)
 
@@ -285,7 +547,10 @@ RSpec.describe Dependabot::FileFetcherCommand do
           expect(api_client)
             .to receive(:record_update_job_error)
             .with(
-              error_details: { "branch-name": "my_branch" },
+              error_details: {
+                "branch-name": "my_branch",
+                message: anything # The original tests don't specify custom messages
+              },
               error_type: "branch_not_found"
             )
           expect(api_client).to receive(:mark_job_as_processed)
@@ -338,15 +603,17 @@ RSpec.describe Dependabot::FileFetcherCommand do
             .to receive(:new)
             .and_call_original
           allow(Octokit::Client)
-            .to receive(:new).with({
-              api_endpoint: "https://api.github.com/",
-              connection_options: {
-                request: {
-                  open_timeout: 20,
-                  timeout: 5
+            .to receive(:new).with(
+              {
+                api_endpoint: "https://api.github.com/",
+                connection_options: {
+                  request: {
+                    open_timeout: 20,
+                    timeout: 5
+                  }
                 }
               }
-            })
+            )
                              .and_return(mock_octokit)
           allow(mock_octokit).to receive(:repository)
             .and_raise(Octokit::Error)
@@ -361,6 +628,441 @@ RSpec.describe Dependabot::FileFetcherCommand do
           expect(Dependabot.logger).to have_received(:info).with(/Connectivity check starting/)
           expect(Dependabot.logger).to have_received(:error).with(/Connectivity check failed/)
         end
+      end
+    end
+  end
+
+  describe "single-directory normalization" do
+    subject(:perform_job) { command.perform_job }
+
+    let(:command) { described_class.new }
+    let(:single_directory_file) do
+      Dependabot::DependencyFile.new(name: "manifest.txt", content: "contents", directory: "/tests")
+    end
+
+    before do
+      allow(Dependabot::Environment).to receive_messages(
+        job_definition: job_definition,
+        repo_contents_path: nil
+      )
+      allow_any_instance_of(DummyPackageManager::FileFetcher).to receive(:commit).and_return("a" * 40)
+      allow_any_instance_of(DummyPackageManager::FileFetcher)
+        .to receive(:files)
+        .and_raise(Dependabot::DependencyFileNotFound, "/tests not found")
+    end
+
+    context "when directories has a single literal entry and directory is nil" do
+      let(:job_definition) do
+        {
+          "job" => {
+            "package_manager" => "dummy",
+            "allowed_updates" => [],
+            "dependencies" => nil,
+            "ignore_conditions" => [],
+            "security_advisories" => [],
+            "security_updates_only" => true,
+            "update_subdependencies" => false,
+            "updating_a_pull_request" => false,
+            "existing_pull_requests" => [],
+            "requirements_update_strategy" => nil,
+            "lockfile_only" => false,
+            "source" => {
+              "provider" => "github",
+              "repo" => "test/test-repo",
+              "directory" => nil,
+              "directories" => ["/tests"],
+              "branch" => nil,
+              "hostname" => "github.com",
+              "api-endpoint" => "https://api.github.com/"
+            }
+          }
+        }
+      end
+
+      before do
+        allow_any_instance_of(described_class).to receive(:validate_target_branch)
+        allow_any_instance_of(described_class).to receive(:dependabot_ref_namespace_available?)
+        allow_any_instance_of(described_class).to receive(:clone_repo_contents)
+        allow_any_instance_of(DummyPackageManager::FileFetcher)
+          .to receive(:files)
+          .and_return([single_directory_file])
+      end
+
+      it "routes through the single-directory fetch path" do
+        perform_job
+
+        expect(command.job.source.directory).to eq("/tests")
+        expect(command.job.source.directories).to be_nil
+      end
+    end
+
+    context "when directories has a single glob entry" do
+      let(:job_definition) do
+        {
+          "job" => {
+            "command" => "update",
+            "package_manager" => "dummy",
+            "allowed_updates" => [],
+            "dependencies" => [],
+            "ignore_conditions" => [],
+            "security_advisories" => [],
+            "security_updates_only" => false,
+            "update_subdependencies" => false,
+            "updating_a_pull_request" => false,
+            "existing_pull_requests" => [],
+            "requirements_update_strategy" => nil,
+            "lockfile_only" => false,
+            "source" => {
+              "provider" => "github",
+              "repo" => "test/test-repo",
+              "directory" => nil,
+              "directories" => ["**/*"],
+              "branch" => nil,
+              "hostname" => "github.com",
+              "api-endpoint" => "https://api.github.com/"
+            }
+          }
+        }
+      end
+
+      before do
+        allow_any_instance_of(described_class).to receive(:validate_target_branch)
+        allow_any_instance_of(described_class).to receive(:dependabot_ref_namespace_available?)
+        allow_any_instance_of(described_class).to receive(:clone_repo_contents)
+        allow(Dependabot::Environment).to receive(:repo_contents_path).and_return(Dir.mktmpdir)
+      end
+
+      it "keeps the multi-directory path and closes the pull request from the multi-directory path" do
+        expect(api_client).to receive(:close_pull_request).with([], :dependency_removed)
+        expect(api_client)
+          .to receive(:record_update_job_error)
+          .with(
+            error_details: { "file-path": "/**/*", message: "/**/* not found" },
+            error_type: "dependency_file_not_found"
+          )
+        expect(api_client).to receive(:mark_job_as_processed)
+
+        expect { perform_job }.to output(/Error during file fetching; aborting/).to_stdout_from_any_process
+        expect(command.job.source.directory).to be_nil
+        expect(command.job.source.directories).to eq(["/**/*"])
+      end
+    end
+
+    context "when directories has multiple entries" do
+      let(:job_definition) do
+        {
+          "job" => {
+            "package_manager" => "dummy",
+            "allowed_updates" => [],
+            "dependencies" => nil,
+            "ignore_conditions" => [],
+            "security_advisories" => [],
+            "security_updates_only" => false,
+            "update_subdependencies" => false,
+            "updating_a_pull_request" => false,
+            "existing_pull_requests" => [],
+            "requirements_update_strategy" => nil,
+            "lockfile_only" => false,
+            "source" => {
+              "provider" => "github",
+              "repo" => "test/test-repo",
+              "directory" => nil,
+              "directories" => ["/", "/tests"],
+              "branch" => nil,
+              "hostname" => "github.com",
+              "api-endpoint" => "https://api.github.com/"
+            }
+          }
+        }
+      end
+
+      before do
+        allow(Dependabot::Environment).to receive(:repo_contents_path).and_return(Dir.mktmpdir)
+      end
+
+      it "does not normalize" do
+        expect { perform_job }.to output(/Error during file fetching; aborting/).to_stdout_from_any_process
+
+        expect(command.job.source.directory).to be_nil
+        expect(command.job.source.directories).to eq(["/", "/tests"])
+      end
+    end
+
+    context "when directory is already set" do
+      let(:job_definition) do
+        {
+          "job" => {
+            "package_manager" => "dummy",
+            "allowed_updates" => [],
+            "dependencies" => nil,
+            "ignore_conditions" => [],
+            "security_advisories" => [],
+            "security_updates_only" => false,
+            "update_subdependencies" => false,
+            "updating_a_pull_request" => false,
+            "existing_pull_requests" => [],
+            "requirements_update_strategy" => nil,
+            "lockfile_only" => false,
+            "source" => {
+              "provider" => "github",
+              "repo" => "test/test-repo",
+              "directory" => "/tests",
+              "branch" => nil,
+              "hostname" => "github.com",
+              "api-endpoint" => "https://api.github.com/"
+            }
+          }
+        }
+      end
+
+      before do
+        allow_any_instance_of(DummyPackageManager::FileFetcher)
+          .to receive(:files)
+          .and_return([single_directory_file])
+      end
+
+      it "does not modify the source" do
+        perform_job
+
+        expect(command.job.source.directory).to eq("/tests")
+        expect(command.job.source.directories).to be_nil
+      end
+    end
+
+    context "when it is a graph job with a single directory" do
+      let(:job_definition) do
+        {
+          "job" => {
+            "command" => "graph",
+            "package_manager" => "dummy",
+            "allowed_updates" => [],
+            "dependencies" => nil,
+            "ignore_conditions" => [],
+            "security_advisories" => [],
+            "security_updates_only" => false,
+            "update_subdependencies" => false,
+            "updating_a_pull_request" => false,
+            "existing_pull_requests" => [],
+            "requirements_update_strategy" => nil,
+            "lockfile_only" => false,
+            "source" => {
+              "provider" => "github",
+              "repo" => "test/test-repo",
+              "directory" => nil,
+              "directories" => ["/tests"],
+              "branch" => nil,
+              "hostname" => "github.com",
+              "api-endpoint" => "https://api.github.com/"
+            }
+          }
+        }
+      end
+
+      before do
+        allow(Dependabot::Environment).to receive(:repo_contents_path).and_return(Dir.mktmpdir)
+      end
+
+      it "does not normalize because graph jobs need lenient error handling" do
+        expect { perform_job }.not_to raise_error
+
+        expect(command.job.source.directory).to be_nil
+        expect(command.job.source.directories).to eq(["/tests"])
+      end
+    end
+  end
+
+  describe "#files_from_multidirectories" do
+    let(:job_definition) do
+      {
+        "job" => {
+          "package_manager" => "dummy",
+          "allowed_updates" => [],
+          "dependencies" => nil,
+          "ignore_conditions" => [],
+          "security_advisories" => [],
+          "security_updates_only" => false,
+          "update_subdependencies" => false,
+          "updating_a_pull_request" => false,
+          "existing_pull_requests" => [],
+          "requirements_update_strategy" => nil,
+          "lockfile_only" => false,
+          "source" => {
+            "provider" => "github",
+            "repo" => "test/test-repo",
+            "directory" => nil,
+            "directories" => ["/", "/tools"],
+            "branch" => nil,
+            "hostname" => "github.com",
+            "api-endpoint" => "https://api.github.com/"
+          }
+        }
+      }
+    end
+
+    let(:repo_contents_path) { Dir.mktmpdir }
+
+    before do
+      allow(Dependabot::Environment).to receive_messages(
+        job_definition: job_definition,
+        repo_contents_path: repo_contents_path
+      )
+    end
+
+    after do
+      FileUtils.rm_rf(repo_contents_path)
+    end
+
+    context "when only some directories have required files" do
+      let(:command) { described_class.new }
+
+      before do
+        # Create tools directory with a.dummy
+        FileUtils.mkdir_p(File.join(repo_contents_path, "tools"))
+        File.write(File.join(repo_contents_path, "tools/a.dummy"), "dummy content")
+
+        # Root directory has no dummy files - should be skipped gracefully
+
+        # Stub file fetcher behavior to avoid cloning
+
+        # Mock the file fetchers to return different behavior per directory
+        allow(command).to receive(:file_fetcher_for_directory) do |dir|
+          fetcher = double("FileFetcher")
+          if dir == "/tools"
+            # Tools directory has files
+            dummy_file = double("DependencyFile")
+            allow(dummy_file).to receive_messages(name: "a.dummy", directory: "/tools")
+            allow(fetcher).to receive(:files).and_return([dummy_file])
+          else
+            # Root directory has no files, should raise DependencyFileNotFound
+            allow(fetcher).to receive(:files).and_raise(Dependabot::DependencyFileNotFound.new("No files found"))
+          end
+          fetcher
+        end
+      end
+
+      it "processes only directories with required files" do
+        files = command.send(:files_from_multidirectories)
+
+        expect(files).not_to be_empty
+
+        tools_files = files.select { |f| f.directory == "/tools" }
+        root_files = files.select { |f| f.directory == "/" }
+
+        expect(tools_files).not_to be_empty
+        expect(tools_files.map(&:name)).to include("a.dummy")
+
+        # Root directory should be skipped since it has no dummy files
+        expect(root_files).to be_empty
+      end
+    end
+
+    context "when a directory raises PathDependenciesNotReachable for a graph job" do
+      let(:command) { described_class.new }
+
+      before do
+        FileUtils.mkdir_p(File.join(repo_contents_path, "tools"))
+        File.write(File.join(repo_contents_path, "tools/a.dummy"), "dummy content")
+
+        allow(command.job).to receive(:update_graph?).and_return(true)
+        allow(command).to receive(:base_commit_sha).and_return("sha")
+
+        allow(command).to receive(:file_fetcher_for_directory) do |dir|
+          fetcher = double("FileFetcher")
+          if dir == "/tools"
+            dummy_file = double("DependencyFile")
+            allow(dummy_file).to receive_messages(name: "a.dummy", directory: "/tools")
+            allow(fetcher).to receive(:files).and_return([dummy_file])
+          else
+            allow(fetcher).to receive(:files)
+              .and_raise(Dependabot::PathDependenciesNotReachable.new(["./local"]))
+          end
+          fetcher
+        end
+      end
+
+      it "does not abort the whole job and still returns the other directory's files" do
+        files = command.files.dependency_files
+
+        tools_files = files.select { |f| f.directory == "/tools" }
+        root_files = files.select { |f| f.directory == "/" }
+
+        expect(tools_files.map(&:name)).to include("a.dummy")
+        expect(root_files).to be_empty
+      end
+
+      it "surfaces the fetch error for the affected directory on the returned FetchedFiles" do
+        fetched = command.files
+
+        expect(fetched.directory_fetch_errors).to have_key("/")
+        expect(fetched.directory_fetch_errors["/"]).to be_a(Dependabot::PathDependenciesNotReachable)
+      end
+    end
+
+    context "when a directory raises PathDependenciesNotReachable for a non-graph job" do
+      let(:command) { described_class.new }
+
+      before do
+        FileUtils.mkdir_p(File.join(repo_contents_path, "tools"))
+        File.write(File.join(repo_contents_path, "tools/a.dummy"), "dummy content")
+
+        allow(command.job).to receive(:update_graph?).and_return(false)
+
+        allow(command).to receive(:file_fetcher_for_directory) do |dir|
+          fetcher = double("FileFetcher")
+          if dir == "/tools"
+            dummy_file = double("DependencyFile")
+            allow(dummy_file).to receive_messages(name: "a.dummy", directory: "/tools")
+            allow(fetcher).to receive(:files).and_return([dummy_file])
+          else
+            allow(fetcher).to receive(:files)
+              .and_raise(Dependabot::PathDependenciesNotReachable.new(["./local"]))
+          end
+          fetcher
+        end
+      end
+
+      it "propagates the error so the update job surfaces it" do
+        expect { command.files }
+          .to raise_error(Dependabot::PathDependenciesNotReachable)
+      end
+    end
+
+    context "when all directories have required files" do
+      let(:command) { described_class.new }
+
+      before do
+        # Create root directory with a.dummy
+        File.write(File.join(repo_contents_path, "a.dummy"), "dummy content")
+
+        # Create tools directory with a.dummy
+        FileUtils.mkdir_p(File.join(repo_contents_path, "tools"))
+        File.write(File.join(repo_contents_path, "tools/a.dummy"), "dummy content")
+
+        # Stub file fetcher behavior to avoid cloning
+
+        # Mock the file fetchers to return files for both directories
+        allow(command).to receive(:file_fetcher_for_directory) do |dir|
+          fetcher = double("FileFetcher")
+          dummy_file = double("DependencyFile")
+          allow(dummy_file).to receive_messages(name: "a.dummy", directory: dir)
+          allow(fetcher).to receive(:files).and_return([dummy_file])
+          fetcher
+        end
+      end
+
+      it "processes all directories" do
+        files = command.send(:files_from_multidirectories)
+
+        expect(files).not_to be_empty
+
+        tools_files = files.select { |f| f.directory == "/tools" }
+        root_files = files.select { |f| f.directory == "/" }
+
+        expect(tools_files).not_to be_empty
+        expect(tools_files.map(&:name)).to include("a.dummy")
+
+        expect(root_files).not_to be_empty
+        expect(root_files.map(&:name)).to include("a.dummy")
       end
     end
   end

@@ -1,4 +1,4 @@
-# typed: strict
+# typed: strong
 # frozen_string_literal: true
 
 require "sorbet-runtime"
@@ -95,7 +95,14 @@ module Dependabot
         dependency_group: dependency_group,
         pr_message_max_length: pr_message_max_length,
         pr_message_encoding: pr_message_encoding,
-        ignore_conditions: job.ignore_conditions,
+        ignore_conditions: job.ignore_conditions.map do |ic|
+          {
+            "dependency-name" => ic.dependency_name,
+            "version-requirement" => ic.version_requirement,
+            "source" => ic.source,
+            "updated-at" => ic.updated_at
+          }.compact
+        end,
         notices: notices
       ).message
 
@@ -105,11 +112,15 @@ module Dependabot
     sig { returns(String) }
     def humanized
       updated_dependencies.map do |dependency|
-        "#{dependency.name} ( from #{dependency.humanized_previous_version} to #{dependency.humanized_version} )"
+        if dependency.humanized_previous_version
+          "#{dependency.name} ( from #{dependency.humanized_previous_version} to #{dependency.humanized_version} )"
+        else
+          "#{dependency.name} ( to #{dependency.humanized_version} )"
+        end
       end.join(", ")
     end
 
-    sig { returns(T::Array[T::Hash[String, T.untyped]]) }
+    sig { returns(T::Array[T::Hash[String, T.nilable(T.any(String, T::Boolean))]]) }
     def updated_dependency_files_hash
       updated_dependency_files.map(&:to_h)
     end
@@ -173,10 +184,11 @@ module Dependabot
       if grouped_update?
         # We only want PRs for the same group that have the same versions
         job.existing_group_pull_requests.any? do |pr|
-          directories_in_use = pr["dependencies"].all? { |dep| dep["directory"] }
+          next false if pr.dependency_group_name != dependency_group&.name
 
-          pr["dependency-group-name"] == dependency_group&.name &&
-            Set.new(pr["dependencies"]) == updated_dependencies_set(should_consider_directory: directories_in_use)
+          dependencies = T.must(pr.dependencies)
+          directories_in_use = dependencies.all?(&:directory)
+          dependencies.to_set(&:to_h) == updated_dependencies_set(should_consider_directory: directories_in_use)
         end
       else
         job.existing_pull_requests.any?(new_pr)
@@ -195,7 +207,7 @@ module Dependabot
             "dependency-name" => dep.name,
             "dependency-version" => dep.version,
             "directory" => should_consider_directory ? dep.directory : nil,
-            "dependency-removed" => dep.removed? ? true : nil
+            "dependency-removed" => dep.removed? || nil
           }.compact
         end
       )
@@ -203,8 +215,10 @@ module Dependabot
 
     sig { returns(PullRequest) }
     def new_pr
-      @new_pr ||= T.let(PullRequest.create_from_updated_dependencies(updated_dependencies),
-                        T.nilable(Dependabot::PullRequest))
+      @new_pr ||= T.let(
+        PullRequest.create_from_updated_dependencies(updated_dependencies),
+        T.nilable(Dependabot::PullRequest)
+      )
     end
 
     sig { returns(T::Array[Dependabot::Dependency]) }

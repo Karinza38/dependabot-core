@@ -1,0 +1,713 @@
+# typed: false
+# frozen_string_literal: true
+
+require "spec_helper"
+require "dependabot/credential"
+require "dependabot/dependency"
+require "dependabot/ecosystem"
+require "dependabot/config"
+require "dependabot/errors"
+require "dependabot/config/update_config"
+require "dependabot/helm"
+require_common_spec "update_checkers/shared_examples_for_update_checkers"
+
+RSpec.describe Dependabot::Helm::UpdateChecker do
+  let(:repo_fixture_name) { "redis.json" }
+  let(:repo_tags) { fixture("repo", "search", repo_fixture_name) }
+  let(:repo_url) { "https://charts.bitnami.com/bitnami" }
+  let(:source) { { tag: version } }
+  let(:version) { "17.11.3" }
+  let(:dependency_type) { { type: :helm_chart } }
+  let(:dependency_name) { "redis" }
+  let(:file_name) { "Chart.yaml" }
+  let(:username) { "username" }
+  let(:password) { "token" }
+  let(:dependency) do
+    Dependabot::Dependency.new(
+      name: dependency_name,
+      version: version,
+      requirements: [{
+        requirement: nil,
+        groups: [],
+        file: file_name,
+        source: source,
+        metadata: dependency_type
+      }],
+      package_manager: "helm"
+    )
+  end
+  let(:credentials) do
+    [Dependabot::Credential.new(
+      {
+        "type" => "helm_registry",
+        "registry" => repo_url,
+        "username" => username,
+        "password" => password
+      }
+    )]
+  end
+  let(:raise_on_ignored) { false }
+  let(:ignored_versions) { [] }
+  let(:requirements_update_strategy) { nil }
+  let(:checker) do
+    described_class.new(
+      dependency: dependency,
+      dependency_files: [],
+      credentials: credentials,
+      ignored_versions: ignored_versions,
+      raise_on_ignored: raise_on_ignored,
+      requirements_update_strategy: requirements_update_strategy
+    )
+  end
+
+  before do
+    allow(Dependabot::Helm::Helpers).to receive(:search_releases)
+      .with(dependency_name)
+      .and_return(repo_tags)
+  end
+
+  it_behaves_like "an update checker"
+
+  describe "#latest_version" do
+    subject(:latest_version) { checker.latest_version }
+
+    it { is_expected.to eq(Dependabot::Helm::Version.new("20.11.3")) }
+
+    context "when an ignore condition excludes the latest versions" do
+      let(:ignored_versions) { [">= 20.0.0"] }
+
+      it { is_expected.to eq(Dependabot::Helm::Version.new("19.6.4")) }
+    end
+
+    context "when the ignore condition is an update-types major bound" do
+      # ignored_major_versions generates the "a" pre-release floor, so this is
+      # the form a user gets from `update-types: [version-update:semver-major]`
+      # rather than one they write by hand.
+      let(:ignored_versions) { [">= 19.a"] }
+
+      it { is_expected.to eq(Dependabot::Helm::Version.new("18.19.4")) }
+    end
+
+    context "when the ignore condition is an exact version" do
+      let(:ignored_versions) { ["20.11.3"] }
+
+      it { is_expected.to eq(Dependabot::Helm::Version.new("20.11.2")) }
+    end
+
+    context "when an update-types comma-AND range covers the newer majors" do
+      # ignored_minor_versions and ignored_patch_versions generate comma-AND
+      # ranges, so Helm::Requirement has to split on the comma rather than choke
+      # on it. Both bounds have to bite: 18 through 20 go, and the 17.x releases
+      # above the current version stay.
+      let(:ignored_versions) { [">= 18.a, < 21"] }
+
+      it { is_expected.to eq(Dependabot::Helm::Version.new("17.17.1")) }
+    end
+
+    context "when an update-types comma-AND range covers nothing present" do
+      let(:ignored_versions) { ["> 17.11.3, < 17.12"] }
+
+      # Guards against the range over-matching: a parse failure or a dropped
+      # upper bound would take the later majors with it.
+      it { is_expected.to eq(Dependabot::Helm::Version.new("20.11.3")) }
+    end
+
+    context "when every newer version is ignored and raise_on_ignored is set" do
+      let(:ignored_versions) { [">= 0"] }
+      let(:raise_on_ignored) { true }
+
+      it "raises AllVersionsIgnored" do
+        expect { latest_version }.to raise_error(Dependabot::AllVersionsIgnored)
+      end
+    end
+
+    context "when a newer version survives and raise_on_ignored is set" do
+      let(:ignored_versions) { [">= 20.0.0"] }
+      let(:raise_on_ignored) { true }
+
+      it { is_expected.to eq(Dependabot::Helm::Version.new("19.6.4")) }
+    end
+
+    context "when nothing newer exists and raise_on_ignored is set" do
+      let(:version) { "20.11.3" }
+      let(:raise_on_ignored) { true }
+
+      # "up to date" must stay distinguishable from "everything was ignored".
+      it { is_expected.to be_nil }
+    end
+
+    context "when a later source still has a version the first one ignored" do
+      # The helm CLI search runs first and falls through to index.yaml when it
+      # comes up empty. Its list can be narrower than the index's, so an ignore
+      # rule wiping out everything it saw must not end the search: index.yaml
+      # still has 20.11.3, which no rule here excludes.
+      let(:repo_tags) { [{ "name" => "redis", "version" => "18.0.0", "app_version" => "7.2.0" }].to_json }
+      let(:source) { { registry: repo_url, tag: version } }
+      let(:ignored_versions) { [">= 18.0.0, < 19.0.0"] }
+      let(:raise_on_ignored) { true }
+      let(:credentials) { [] }
+
+      before do
+        # A registry in the source makes the CLI search repo-qualified, so the
+        # outer stub's exact chart-name match no longer applies.
+        allow(Dependabot::Helm::Helpers).to receive(:search_releases)
+          .with(anything)
+          .and_return(repo_tags)
+
+        stub_request(:get, "#{repo_url}/index.yaml")
+          .to_return(status: 200, body: fixture("helm", "registry", "bitnami.yaml"))
+      end
+
+      it { is_expected.to eq(Dependabot::Helm::Version.new("20.11.3")) }
+    end
+
+    context "when dependency is a docker image" do
+      let(:dependency_type) { { type: :docker_image } }
+      let(:repo_fixture_name) { "ubuntu_no_latest.json" }
+      let(:dependency_name) { "ubuntu" }
+      let(:version) { "17.04" }
+      let(:repo_tags) { fixture("docker", "registry_tags", repo_fixture_name) }
+      let(:repo_url) { "https://registry.hub.docker.com/v2/library/ubuntu/" }
+
+      before do
+        auth_url = "https://auth.docker.io/token?service=registry.docker.io"
+        stub_request(:get, auth_url)
+          .and_return(status: 200, body: { token: "token" }.to_json)
+
+        stub_request(:get, repo_url + "tags/list")
+          .and_return(status: 200, body: repo_tags)
+
+        # The merged Docker UpdateChecker first issues a HEAD request per tag to
+        # detect single-platform images (single_platform_image?) before its
+        # digest-content check, and otherwise GETs the manifest to compare
+        # platform digests (same_image_contents?). ubuntu:#{version} is a
+        # single-platform image, so report a non-manifest-list media type for
+        # both requests, keeping those checks no-ops so version selection
+        # proceeds from the tags alone.
+        stub_request(:head, %r{#{Regexp.escape(repo_url)}manifests/.+})
+          .and_return(
+            status: 200,
+            headers: { "Content-Type" => "application/vnd.docker.distribution.manifest.v2+json" }
+          )
+        stub_request(:get, repo_url + "manifests/#{version}")
+          .and_return(
+            status: 200,
+            body: { mediaType: "application/vnd.docker.distribution.manifest.v2+json" }.to_json
+          )
+      end
+
+      it { is_expected.to eq(Dependabot::Helm::Version.new("17.10")) }
+
+      context "when the docker image is can't be updated" do
+        let(:version) { "latest" }
+
+        it { is_expected.to be_nil }
+      end
+    end
+
+    context "when oci is not in repo" do
+      before do
+        allow(checker).to receive(:fetch_releases_with_helm_cli)
+          .with(dependency_name, "oci---registry-sweet-security-helm", repo_url)
+          .and_return(nil)
+        allow(Dependabot::Helm::Helpers).to receive(:fetch_oci_tags)
+          .with("registry.sweet.security/helm/frontierchart")
+          .and_return(
+            "1.0.119807+c2277fddd003556d4982b86ef4e77fc84a41ed79\n1.0.124446+3123f85bdf6d8309d3d601938564a996f5cad238"
+          )
+      end
+
+      let(:credentials) { [] }
+      let(:version) { "1.0.119807+c2277fddd003556d4982b86ef4e77fc84a41ed79" }
+      let(:dependency_name) { "frontierchart" }
+      let(:repo_url) { "oci://registry.sweet.security/helm" }
+      let(:source) { { tag: version, registry: "oci://registry.sweet.security/helm" } }
+
+      it "returns the latest version" do
+        expect(checker.latest_version).to eq(
+          Dependabot::Helm::Version.new("1.0.124446+3123f85bdf6d8309d3d601938564a996f5cad238")
+        )
+      end
+
+      context "when tags include non-version tags like SHA256 hashes and metadata files" do
+        before do
+          allow(Dependabot::Helm::Helpers).to receive(:fetch_oci_tags)
+            .with("registry.sweet.security/helm/frontierchart")
+            .and_return(
+              "1.0.119807+c2277fddd003556d4982b86ef4e77fc84a41ed79\n" \
+              "1.0.124446+3123f85bdf6d8309d3d601938564a996f5cad238\n" \
+              "sha256-bbccb29e4f20037bc6c3319199138172c044d29c514431a11f0f2bfd9b694d6d\n" \
+              "sha256-bbccb29e4f20037bc6c3319199138172c044d29c514431a11f0f2bfd9b694d6d.att\n" \
+              "sha256-bbccb29e4f20037bc6c3319199138172c044d29c514431a11f0f2bfd9b694d6d.sig\n" \
+              "sha256-bbccb29e4f20037bc6c3319199138172c044d29c514431a11f0f2bfd9b694d6d.metadata\n" \
+              "1.1.0"
+            )
+        end
+
+        it "filters out non-version tags and returns the latest valid version" do
+          expect(checker.latest_version).to eq(
+            Dependabot::Helm::Version.new("1.1.0")
+          )
+        end
+      end
+    end
+  end
+
+  describe "#can_update?" do
+    subject { checker.can_update?(requirements_to_unlock: :own) }
+
+    context "when the dependency is outdated" do
+      let(:version) { "17.04" }
+
+      it { is_expected.to be_truthy }
+    end
+
+    context "when the dependency is up-to-date" do
+      let(:version) { "20.11.3" }
+
+      it { is_expected.to be_falsey }
+    end
+
+    context "when the version is numeric" do
+      let(:version) { "1234567890" }
+
+      it { is_expected.to be_falsey }
+    end
+
+    context "when a bare dependency-name ignore rule covers everything" do
+      # IgnoreCondition expands `dependency-name:` with no versions or
+      # update-types to ALL_VERSIONS, and Base short-circuits on
+      # `ignore_requirements.include?(requirement_class.new(">= 0"))`. Building
+      # that list from Helm::Requirement instead puts a Helm::Version up against
+      # a plain Gem::Version there, which Helm::Version#<=>'s sig rejects, so
+      # this guards that #ignore_requirements keeps returning the registered
+      # class. The filtering itself is covered under #latest_version.
+      let(:version) { "17.04" }
+      let(:ignored_versions) { [">= 0"] }
+
+      it { is_expected.to be_falsey }
+    end
+  end
+
+  describe "#updated_requirements" do
+    subject { checker.updated_requirements }
+
+    context "when specified with a tag in helm chart" do
+      it "updates the requirement" do
+        expect(checker.updated_requirements).to eq(
+          [{
+            groups: [],
+            file: "Chart.yaml",
+            metadata: { type: :helm_chart },
+            requirement: "20.11.3",
+            source: { tag: "17.11.3" }
+          }]
+        )
+      end
+
+      context "when specified with a tag in values" do
+        let(:file_name) { "values.yaml" }
+
+        it "updates the requirement" do
+          expect(checker.updated_requirements).to eq(
+            [{
+              groups: [],
+              file: "values.yaml",
+              metadata: { type: :helm_chart },
+              requirement: "20.11.3",
+              source: { tag: "17.11.3" }
+            }]
+          )
+        end
+      end
+    end
+
+    context "with a docker-image dependency" do
+      let(:dependency_type) { { type: :docker_image } }
+
+      before { allow(checker).to receive(:latest_version).and_return(Dependabot::Helm::Version.new("20.11.3")) }
+
+      it "overwrites the requirement with the exact latest version" do
+        expect(checker.updated_requirements.first[:requirement]).to eq("20.11.3")
+      end
+    end
+
+    context "when a requirement has no metadata type" do
+      let(:dependency_type) { {} }
+
+      before { allow(checker).to receive(:latest_version).and_return(Dependabot::Helm::Version.new("20.11.3")) }
+
+      it "leaves the requirement unchanged" do
+        expect(checker.updated_requirements.first[:requirement]).to be_nil
+      end
+    end
+  end
+
+  describe "versioning-strategy (range-preserving updates)" do
+    # The Chart.yaml constraint lives in dependency.version for helm chart deps.
+    let(:version) { "^1.0.0" }
+
+    before { allow(checker).to receive(:latest_version).and_return(latest) }
+
+    context "with increase-if-necessary" do
+      let(:requirements_update_strategy) do
+        Dependabot::RequirementsUpdateStrategy::BumpVersionsIfNecessary
+      end
+
+      context "when the latest version is already in range" do
+        let(:latest) { Dependabot::Helm::Version.new("1.0.5") }
+
+        it "does not report an update" do
+          expect(checker.can_update?(requirements_to_unlock: :own)).to be(false)
+        end
+      end
+
+      context "when the latest version is out of range" do
+        let(:latest) { Dependabot::Helm::Version.new("2.0.0") }
+
+        it "reports an update" do
+          expect(checker.can_update?(requirements_to_unlock: :own)).to be(true)
+        end
+
+        it "bumps the constraint to ^2.0.0" do
+          expect(checker.updated_requirements.first[:requirement]).to eq("^2.0.0")
+        end
+      end
+    end
+
+    context "with widen" do
+      let(:requirements_update_strategy) { Dependabot::RequirementsUpdateStrategy::WidenRanges }
+
+      context "when in range" do
+        let(:latest) { Dependabot::Helm::Version.new("1.0.5") }
+
+        it "does not report an update" do
+          expect(checker.can_update?(requirements_to_unlock: :own)).to be(false)
+        end
+      end
+    end
+
+    context "with the default strategy (increase)" do
+      let(:latest) { Dependabot::Helm::Version.new("1.0.5") }
+
+      it "bumps the caret floor" do
+        expect(checker.updated_requirements.first[:requirement]).to eq("^1.0.5")
+      end
+
+      it "reports an update even though it is in range" do
+        expect(checker.can_update?(requirements_to_unlock: :own)).to be(true)
+      end
+    end
+
+    context "with an explicit comparator-range constraint" do
+      # dependency.version holds the Chart.yaml constraint; a multi-comparator
+      # range can't parse as a single version, so the checker anchors on its
+      # lowest version instead of crashing.
+      let(:version) { ">=1.0.0 <2.0.0" }
+      let(:requirements_update_strategy) { Dependabot::RequirementsUpdateStrategy::WidenRanges }
+      let(:latest) { Dependabot::Helm::Version.new("2.5.0") }
+
+      it "does not raise and widens the range" do
+        expect { checker.can_update?(requirements_to_unlock: :own) }.not_to raise_error
+        expect(checker.updated_requirements.first[:requirement]).to eq(">=1.0.0 <3.0.0")
+      end
+    end
+
+    context "with the default strategy (increase) and an in-range comparator range" do
+      # Regression: the updater leaves a comparator range untouched when the
+      # latest version already satisfies it, so can_update? must not report an
+      # update (otherwise the file updater raises "Expected content to change!").
+      let(:version) { ">=1.0.0 <2.0.0" }
+      let(:latest) { Dependabot::Helm::Version.new("1.5.0") }
+
+      it "does not report an update" do
+        expect(checker.can_update?(requirements_to_unlock: :own)).to be(false)
+      end
+
+      it "leaves the requirement unchanged" do
+        expect(checker.updated_requirements.first[:requirement]).to eq(">=1.0.0 <2.0.0")
+      end
+    end
+
+    context "with the default strategy (increase) and an out-of-range comparator range" do
+      let(:version) { ">=1.0.0 <2.0.0" }
+      let(:latest) { Dependabot::Helm::Version.new("2.5.0") }
+
+      it "reports an update and widens the upper bound" do
+        expect(checker.can_update?(requirements_to_unlock: :own)).to be(true)
+        expect(checker.updated_requirements.first[:requirement]).to eq(">=1.0.0 <3.0.0")
+      end
+    end
+
+    context "with widen and an OR range where every alternative is out of range" do
+      # Regression: widen must actually widen (append an alternative). Reporting
+      # can_update? while leaving the constraint unchanged would crash the file
+      # updater with "Expected content to change!".
+      let(:version) { "^0.5.0 || ^1.0.0" }
+      let(:requirements_update_strategy) { Dependabot::RequirementsUpdateStrategy::WidenRanges }
+      let(:latest) { Dependabot::Helm::Version.new("3.0.0") }
+
+      it "reports an update and appends a new alternative" do
+        expect(checker.can_update?(requirements_to_unlock: :own)).to be(true)
+        expect(checker.updated_requirements.first[:requirement]).to eq("^0.5.0 || ^1.0.0 || ^3.0.0")
+      end
+    end
+
+    context "with widen and an OR range already satisfied" do
+      let(:version) { "^1.0.0 || ^2.0.0" }
+      let(:requirements_update_strategy) { Dependabot::RequirementsUpdateStrategy::WidenRanges }
+      let(:latest) { Dependabot::Helm::Version.new("1.5.0") }
+
+      it "does not report an update" do
+        expect(checker.can_update?(requirements_to_unlock: :own)).to be(false)
+      end
+    end
+
+    context "when the dependency carries several requirements (same chart, different constraints)" do
+      # DependencySet merges same-named occurrences into one dependency with
+      # multiple requirements; each must be updated by its own source[:tag],
+      # not the single combined dependency.version.
+      let(:dependency) do
+        Dependabot::Dependency.new(
+          name: "common",
+          version: "^1.0.0",
+          requirements: [
+            { requirement: nil, groups: [], file: "Chart.yaml",
+              source: { tag: "^1.0.0" }, metadata: { type: :helm_chart } },
+            { requirement: nil, groups: [], file: "Chart.yaml",
+              source: { tag: "1.2.0" }, metadata: { type: :helm_chart } }
+          ],
+          package_manager: "helm"
+        )
+      end
+      let(:latest) { Dependabot::Helm::Version.new("1.5.0") }
+
+      it "updates each requirement by its own authored constraint" do
+        expect(checker.can_update?(requirements_to_unlock: :own)).to be(true)
+        updated = checker.updated_requirements.map { |r| [r.dig(:source, :tag), r[:requirement]] }
+        expect(updated).to contain_exactly(["^1.0.0", "^1.5.0"], ["1.2.0", "1.5.0"])
+      end
+
+      context "when a lower occurrence needs an update the highest one does not" do
+        # Regression: the anchor is the lowest occurrence (1.0.0), not the
+        # combined dependency.version (^5.0.0). Otherwise latest 5.0.0 would gate
+        # out as "not newer" and the ^1.0.0 occurrence would never be widened.
+        let(:dependency) do
+          Dependabot::Dependency.new(
+            name: "common",
+            version: "^5.0.0",
+            requirements: [
+              { requirement: nil, groups: [], file: "Chart.yaml",
+                source: { tag: "^5.0.0" }, metadata: { type: :helm_chart } },
+              { requirement: nil, groups: [], file: "sub/Chart.yaml",
+                source: { tag: "^1.0.0" }, metadata: { type: :helm_chart } }
+            ],
+            package_manager: "helm"
+          )
+        end
+        let(:latest) { Dependabot::Helm::Version.new("5.0.0") }
+
+        it "still reports the update" do
+          expect(checker.can_update?(requirements_to_unlock: :own)).to be(true)
+        end
+      end
+    end
+
+    context "with an upper-only range whose latest equals the ceiling" do
+      # Regression: "<2.0.0" must anchor at 0, not at its ceiling. A latest of
+      # exactly 2.0.0 is outside the range, so widen should report and widen it.
+      let(:version) { "<2.0.0" }
+      let(:requirements_update_strategy) { Dependabot::RequirementsUpdateStrategy::WidenRanges }
+      let(:latest) { Dependabot::Helm::Version.new("2.0.0") }
+
+      it "reports an update and widens the upper bound" do
+        expect(checker.can_update?(requirements_to_unlock: :own)).to be(true)
+        expect(checker.updated_requirements.first[:requirement]).to eq("<3.0.0")
+      end
+    end
+
+    context "with a != exclusion combined with an upper bound" do
+      # Regression: the anchor must not treat the excluded operand (9.0.0) as a
+      # lower bound, or a new 2.0.0 would be filtered out before widening.
+      let(:version) { "!=9.0.0 <2.0.0" }
+      let(:requirements_update_strategy) { Dependabot::RequirementsUpdateStrategy::WidenRanges }
+      let(:latest) { Dependabot::Helm::Version.new("2.0.0") }
+
+      it "anchors below the exclusion and reports an update" do
+        expect(checker.can_update?(requirements_to_unlock: :own)).to be(true)
+      end
+    end
+  end
+
+  describe "#filter_valid_releases" do
+    let(:releases) do
+      [
+        { "version" => "17.0.0" },
+        { "version" => "17.7.1" }, # This version caused the original Sorbet error
+        { "version" => "18.0.0" },
+        { "version" => "19.0.0" },
+        { "version" => "20.0.0" }
+      ]
+    end
+
+    context "when the constraint is a range" do
+      let(:releases) { [{ "version" => "0.5.0" }, { "version" => "1.5.0" }, { "version" => "2.5.0" }] }
+
+      context "with a comma-AND lower bound not written first" do
+        # Regression: the anchor must read the >= lower bound (1.0.0), not be
+        # thrown off by the leading < operand, so 0.5.0 is filtered out.
+        let(:version) { "<2.0.0,>=1.0.0" }
+
+        it "filters versions below the range's lower bound" do
+          result = checker.send(:filter_valid_releases, releases)
+          expect(result.map { |r| r["version"] }).to contain_exactly("1.5.0", "2.5.0")
+        end
+      end
+
+      context "with an OR branch that has no lower bound" do
+        # Regression: an unbounded-below branch means the constraint permits
+        # arbitrarily low versions, so the anchor is 0 and nothing is filtered.
+        let(:version) { "<=2.0.0 || >=10.0.0" }
+
+        it "keeps all versions" do
+          result = checker.send(:filter_valid_releases, releases)
+          expect(result.map { |r| r["version"] }).to contain_exactly("0.5.0", "1.5.0", "2.5.0")
+        end
+      end
+
+      context "with an OR of exact pins" do
+        # Regression: an exact branch has a real floor (its version), even though
+        # min_version reports nil for "=", so the anchor is the lowest pin (1.0.0)
+        # and 0.5.0 is filtered out.
+        let(:version) { "1.0.0 || 2.0.0" }
+
+        it "anchors on the lowest pinned version" do
+          result = checker.send(:filter_valid_releases, releases)
+          expect(result.map { |r| r["version"] }).to contain_exactly("1.5.0", "2.5.0")
+        end
+      end
+    end
+  end
+
+  describe "#fetch_helm_chart_index" do
+    subject(:latest_chart_version) { checker.send(:fetch_latest_chart_version) }
+
+    let(:credentials) { [] }
+    let(:index_content) { fixture("helm", "registry", "bitnami.yaml") }
+    let(:source) { { registry: repo_url, tag: version } }
+
+    before do
+      allow(Dependabot::Helm::Helpers).to receive(:search_releases)
+        .with(anything)
+        .and_return("")
+
+      stub_request(:get, "#{repo_url}/index.yaml")
+        .to_return(
+          status: 200,
+          body: index_content
+        )
+    end
+
+    context "when helm CLI search fails" do
+      it "falls back to fetching from index.yaml" do
+        expect(Dependabot::Helm::Helpers).to receive(:search_releases)
+        expect(checker).to receive(:fetch_releases_from_index).and_call_original
+        expect(checker).to receive(:fetch_helm_chart_index).with("#{repo_url}/index.yaml").and_call_original
+
+        latest_chart_version
+      end
+
+      it "returns the latest version from the index" do
+        expect(latest_chart_version).to eq(Dependabot::Helm::Version.new("20.11.3"))
+      end
+
+      context "when the request returns a string" do
+        before do
+          stub_request(:get, "#{repo_url}/index.yaml")
+            .to_return(
+              status: 200,
+              body: "Not found"
+            )
+        end
+
+        it "returns nil" do
+          expect(latest_chart_version).to be_nil
+        end
+
+        it "logs an error" do
+          expect(Dependabot.logger).to receive(:error).with(/Error parsing Helm index/)
+          latest_chart_version
+        end
+      end
+    end
+
+    context "with an oci protocol" do
+      before do
+        allow(checker).to receive(:fetch_latest_oci_tag)
+          .with(dependency_name, repo_url)
+          .and_return(nil)
+      end
+
+      let(:repo_url) { "oci://charts.bitnami.com/bitnami" }
+
+      it "converts OCI URL to HTTPS when making the request" do
+        expect(Excon).to receive(:get)
+          .with(
+            "#{repo_url.gsub('oci', 'https')}/index.yaml",
+            idempotent: true,
+            middlewares: anything
+          )
+
+        latest_chart_version
+      end
+    end
+
+    describe "#fetch_tags_with_release_date_using_oci" do
+      let(:tags) { ["1.0.0", "1.1.0", "2.0.0+build.123", "latest"] }
+      let(:oci_response) do
+        {
+          "annotations" => {
+            "org.opencontainers.image.created" => "2024-01-15T10:00:00Z"
+          }
+        }.to_json
+      end
+
+      before do
+        allow(Dependabot::Helm::Helpers).to receive(:fetch_tags_with_release_date_using_oci)
+          .and_return(oci_response)
+      end
+
+      context "when OCI response is empty" do
+        let(:tags) { ["1.0.0", "1.1.0"] }
+
+        before do
+          allow(Dependabot::Helm::Helpers).to receive(:fetch_tags_with_release_date_using_oci)
+            .with(repo_url, "1.0.0").and_return("")
+          allow(Dependabot::Helm::Helpers).to receive(:fetch_tags_with_release_date_using_oci)
+            .with(repo_url, "1.1.0").and_return({ "annotations" => {} }.to_json)
+        end
+
+        it "skips tags with empty responses" do
+          result = checker.send(:fetch_tags_with_release_date_using_oci, tags, repo_url)
+
+          expect(result.length).to eq(1)
+          expect(result.first.tag).to eq("1.1.0")
+        end
+      end
+
+      it "fetches release dates for each tag" do
+        result = checker.send(:fetch_tags_with_release_date_using_oci, tags, repo_url)
+
+        expect(result).to be_an(Array)
+        expect(result.length).to eq(4)
+        # expect(result).to all(be_a(Dependabot::Helm::GitTagWithDetail))
+      end
+
+      it "extracts release date from OCI annotations" do
+        result = checker.send(:fetch_tags_with_release_date_using_oci, tags, repo_url)
+
+        expect(result.first.release_date).to eq("2024-01-15T10:00:00Z")
+      end
+    end
+  end
+end

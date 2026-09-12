@@ -1,4 +1,4 @@
-# typed: strict
+# typed: strong
 # frozen_string_literal: true
 
 require "dependabot/updater/operations/create_group_update_pull_request"
@@ -23,14 +23,12 @@ module Dependabot
 
         sig { params(job: Dependabot::Job).returns(T::Boolean) }
         def self.applies_to?(job:)
+          return true if job.multi_ecosystem_update?
           return false if job.updating_a_pull_request?
-          if Dependabot::Experiments.enabled?(:grouped_security_updates_disabled) && job.security_updates_only?
-            return false
-          end
 
           if job.security_updates_only?
             return true if job.dependencies && T.must(job.dependencies).count > 1
-            return true if job.dependency_groups.any? { |group| group["applies-to"] == "security-updates" }
+            return true if job.dependency_groups.any? { |group| group.applies_to == "security-updates" }
 
             return false
           end
@@ -61,8 +59,9 @@ module Dependabot
 
         sig { void }
         def perform
+          report_missing_job_dependencies
           run_grouped_dependency_updates if dependency_snapshot.groups.any?
-          run_ungrouped_dependency_updates
+          run_ungrouped_dependency_updates unless job.multi_ecosystem_update?
         end
 
         private
@@ -70,7 +69,7 @@ module Dependabot
         sig { returns(Dependabot::Job) }
         attr_reader :job
 
-        sig { returns(Dependabot::Service) }
+        sig { override.returns(Dependabot::Service) }
         attr_reader :service
 
         sig { returns(Dependabot::DependencySnapshot) }
@@ -87,8 +86,13 @@ module Dependabot
           # Preprocess to discover existing group PRs and add their dependencies to the handled list before processing
           # the rest of the groups. This prevents multiple PRs from being created for the same dependency.
           groups_without_pr = dependency_snapshot.groups.filter_map do |group|
-            if pr_exists_for_dependency_group?(group)
-              Dependabot.logger.info("Detected existing pull request for '#{group.name}'.")
+            existing_pr = find_existing_group_pr(group)
+            if existing_pr
+              pr_number = existing_pr.pr_number
+
+              Dependabot.logger.info(
+                "Detected existing pull request ##{pr_number} for the dependency group '#{group.name}'."
+              )
               Dependabot.logger.info(
                 "Deferring creation of a new pull request. The existing pull request will update in a separate job."
               )

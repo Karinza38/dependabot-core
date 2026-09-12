@@ -1,9 +1,10 @@
-# typed: strict
+# typed: strong
 # frozen_string_literal: true
 
 require "base64"
 require "sorbet-runtime"
 
+require "dependabot/fetched_files"
 require "dependabot/file_parsers"
 require "dependabot/notices_helpers"
 
@@ -19,26 +20,18 @@ module Dependabot
     include NoticesHelpers
 
     sig do
-      params(job: Dependabot::Job, job_definition: T::Hash[String, T.untyped]).returns(Dependabot::DependencySnapshot)
+      params(job: Dependabot::Job, fetched_files: Dependabot::FetchedFiles).returns(Dependabot::DependencySnapshot)
     end
-    def self.create_from_job_definition(job:, job_definition:)
-      decoded_dependency_files = job_definition.fetch("base64_dependency_files").map do |a|
-        file = Dependabot::DependencyFile.new(**a.transform_keys(&:to_sym))
-        unless file.binary? && !file.deleted?
-          file.content = Base64.decode64(T.must(file.content)).force_encoding("utf-8")
-        end
-        file
-      end
-
+    def self.create_from_job_definition(job:, fetched_files:)
       if job.source.directories
         # The job.source.directory may contain globs, so we use the directories from the fetched files
-        job.source.directories = decoded_dependency_files.flat_map(&:directory).uniq
+        job.source.directories = fetched_files.dependency_files.flat_map(&:directory).uniq
       end
 
       new(
         job: job,
-        base_commit_sha: job_definition.fetch("base_commit_sha"),
-        dependency_files: decoded_dependency_files
+        base_commit_sha: fetched_files.base_commit_sha,
+        dependency_files: fetched_files.dependency_files
       )
     end
 
@@ -84,7 +77,7 @@ module Dependabot
     sig { returns(T::Array[Dependabot::Dependency]) }
     def allowed_dependencies
       if job.security_updates_only?
-        dependencies.select { |d| T.must(job.dependencies).include?(d.name) }
+        job_dependencies
       else
         dependencies.select { |d| job.allowed_update?(d) }
       end
@@ -119,31 +112,65 @@ module Dependabot
       @dependency_group_engine.find_group(name: T.must(job.dependency_group_to_refresh))
     end
 
-    sig { params(group: Dependabot::DependencyGroup).void }
-    def mark_group_handled(group)
+    sig do
+      params(
+        group: Dependabot::DependencyGroup,
+        excluding_dependencies: T::Hash[String, T::Set[String]]
+      )
+        .void
+    end
+    def mark_group_handled(group, excluding_dependencies = {})
+      Dependabot.logger.info("Marking group '#{group.name}' as handled.")
+
+      # When grouping by dependency name, we need to mark dependencies as handled
+      # across ALL directories to prevent duplicate individual PRs
+      group_by_name = group.group_by_dependency_name?
+
       directories.each do |directory|
         @current_directory = directory
 
         # add the existing dependencies in the group so individual updates don't try to update them
-        add_handled_dependencies(dependencies_in_existing_pr_for_group(group).filter_map { |d| d["dependency-name"] })
+        dependencies_in_existing_prs = dependencies_in_existing_pr_for_group(group)
+
+        dependencies_in_existing_prs = dependencies_in_existing_prs.filter do |dep|
+          # When grouping by name, include deps from all directories; otherwise filter by current directory
+          group_by_name || !dep.directory || dep.directory == directory
+        end
+
         # also add dependencies that might be in the group, as a rebase would add them;
         # this avoids individual PR creation that immediately is superseded by a group PR supersede
-        add_handled_dependencies(group.dependencies.map(&:name))
+        current_dependencies = group.dependencies.map(&:name).reject do |dep|
+          excluding_dependencies[directory]&.include?(dep)
+        end
+
+        add_handled_dependencies(
+          current_dependencies.concat(
+            dependencies_in_existing_prs.filter_map(&:name)
+          )
+        )
       end
     end
 
     sig { params(dependency_names: T.any(String, T::Array[String])).void }
     def add_handled_dependencies(dependency_names)
       assert_current_directory_set!
-      set = @handled_dependencies[@current_directory] || Set.new
-      set += Array(dependency_names)
-      @handled_dependencies[@current_directory] = set
+      names = Array(dependency_names)
+      Dependabot.logger.info("Adding dependencies as handled: (#{names.join(', ')}).")
+      @handled_dependencies[@current_directory] ||= Set.new
+      @handled_dependencies[@current_directory]&.merge(names)
     end
 
     sig { returns(T::Set[String]) }
     def handled_dependencies
       assert_current_directory_set!
       T.must(@handled_dependencies[@current_directory])
+    end
+
+    # Handled dependencies across every directory, for job-scoped decisions that must not
+    # depend on whichever directory happens to be current.
+    sig { returns(T::Set[String]) }
+    def all_handled_dependencies
+      @handled_dependencies.values.reduce(Set.new) { |all, names| all.merge(names) }
     end
 
     sig { params(dir: String).void }
@@ -164,6 +191,15 @@ module Dependabot
 
       # Otherwise return dependencies that haven't been handled during the group update portion.
       allowed_dependencies.reject { |dep| handled_dependencies.include?(dep.name) }
+    end
+
+    sig { params(group: Dependabot::DependencyGroup).returns(T::Array[Job::ExistingGroupPullRequest::Dependency]) }
+    def dependencies_in_existing_pr_for_group(group)
+      existing = job.existing_group_pull_requests.find do |pr|
+        pr.dependency_group_name == group.name
+      end
+
+      (existing&.dependencies || []).select(&:name)
     end
 
     private
@@ -189,8 +225,10 @@ module Dependabot
         @dependencies[dir] = parse_files!
       end
 
-      @dependency_group_engine = T.let(DependencyGroupEngine.from_job_config(job: job),
-                                       Dependabot::DependencyGroupEngine)
+      @dependency_group_engine = T.let(
+        DependencyGroupEngine.from_job_config(job: job),
+        Dependabot::DependencyGroupEngine
+      )
       directories.each do |dir|
         @current_directory = dir
         @dependency_group_engine.assign_to_groups!(dependencies: allowed_dependencies)
@@ -245,6 +283,8 @@ module Dependabot
       ecosystem = parser.ecosystem
       # Raise an error if the package manager version is unsupported
       ecosystem&.raise_if_unsupported!
+      # Raise an error if the language version is unsupported
+      ecosystem&.language&.raise_if_unsupported!
 
       @ecosystem[@current_directory] = ecosystem
 
@@ -255,23 +295,26 @@ module Dependabot
       # add deprecation notices for the package manager
       add_deprecation_notice(
         notices: notices_for_current_directory,
-        package_manager: ecosystem&.package_manager
+        version_manager: ecosystem&.package_manager
       )
+
+      if ecosystem&.language
+        # add deprecation notices for the language
+        add_deprecation_notice(
+          notices: notices_for_current_directory,
+          version_manager: ecosystem.language,
+          version_manager_type: :language
+        )
+      end
+
       @notices[@current_directory] = notices_for_current_directory
 
       parser
     end
 
-    sig { params(group: Dependabot::DependencyGroup).returns(T::Array[T::Hash[String, String]]) }
-    def dependencies_in_existing_pr_for_group(group)
-      job.existing_group_pull_requests.find do |pr|
-        pr["dependency-group-name"] == group.name
-      end&.fetch("dependencies", []) || []
-    end
-
     sig { void }
     def assert_current_directory_set!
-      if @current_directory == "" && directories.count == 1
+      if @current_directory == "" && directories.one?
         @current_directory = T.must(directories.first)
         return
       end

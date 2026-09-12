@@ -1,4 +1,4 @@
-# typed: true
+# typed: strict
 # frozen_string_literal: true
 
 $LOAD_PATH.unshift(__dir__ + "/../lib")
@@ -9,6 +9,7 @@ require "dependabot/api_client"
 require "dependabot/environment"
 require "dependabot/service"
 require "dependabot/setup"
+require "dependabot/file_fetcher_command"
 require "dependabot/update_files_command"
 require "debug" if ENV["DEBUG"]
 
@@ -36,14 +37,15 @@ trap("TERM") do
 end
 
 begin
-  RubyVM::YJIT.enable if Dependabot::Environment.job_id.to_i.even?
+  fetcher = Dependabot::FileFetcherCommand.new
+  fetcher.run
 
   if flamegraph
     Flamegraph.generate("/tmp/dependabot-flamegraph.html") do
-      Dependabot::UpdateFilesCommand.new.run
+      Dependabot::UpdateFilesCommand.new(fetcher.files).run
     end
   else
-    Dependabot::UpdateFilesCommand.new.run
+    Dependabot::UpdateFilesCommand.new(fetcher.files).run
   end
 rescue Dependabot::RunFailure
   exit 1

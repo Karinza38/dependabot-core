@@ -1,16 +1,15 @@
 using System.Collections.Immutable;
 
-using NuGet.Frameworks;
 using NuGet.Versioning;
 
 namespace NuGetUpdater.Core.Analyze;
 
 internal static class DependencyFinder
 {
-    public static async Task<ImmutableDictionary<NuGetFramework, ImmutableArray<Dependency>>> GetDependenciesAsync(
+    public static async Task<ImmutableDictionary<string, ImmutableArray<Dependency>>> GetDependenciesAsync(
         string repoRoot,
         string projectPath,
-        IEnumerable<NuGetFramework> frameworks,
+        IEnumerable<string> frameworks,
         ImmutableHashSet<string> packageIds,
         NuGetVersion version,
         NuGetContext nugetContext,
@@ -22,20 +21,20 @@ internal static class DependencyFinder
             .Select(id => new Dependency(id, versionString, DependencyType.Unknown))
             .ToImmutableArray();
 
-        var result = ImmutableDictionary.CreateBuilder<NuGetFramework, ImmutableArray<Dependency>>();
+        var result = ImmutableDictionary.CreateBuilder<string, ImmutableArray<Dependency>>();
         foreach (var framework in frameworks)
         {
             var dependencies = await MSBuildHelper.GetAllPackageDependenciesAsync(
                 repoRoot,
                 projectPath,
-                framework.ToString(),
+                framework,
                 packages,
                 logger);
             var updatedDependencies = new List<Dependency>();
             foreach (var dependency in dependencies)
             {
                 var infoUrl = await nugetContext.GetPackageInfoUrlAsync(dependency.Name, dependency.Version!, cancellationToken);
-                var updatedDependency = dependency with { IsTransitive = false, InfoUrl = infoUrl };
+                var updatedDependency = dependency with { IsTopLevel = true, InfoUrl = infoUrl };
                 updatedDependencies.Add(updatedDependency);
             }
 

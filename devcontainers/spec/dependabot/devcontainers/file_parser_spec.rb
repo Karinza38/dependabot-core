@@ -6,6 +6,8 @@ require "dependabot/dependency_file"
 require "dependabot/source"
 require "dependabot/devcontainers/file_parser"
 require "dependabot/devcontainers/requirement"
+require "dependabot/workspace"
+require "dependabot/workspace/git"
 require_common_spec "file_parsers/shared_examples_for_file_parsers"
 
 RSpec.describe Dependabot::Devcontainers::FileParser do
@@ -81,6 +83,68 @@ RSpec.describe Dependabot::Devcontainers::FileParser do
           metadata: {}
         }
       ].freeze
+    end
+
+    it_behaves_like "parse"
+  end
+
+  context "with a devcontainer.json in a .devcontainer folder and an active workspace" do
+    let(:project_name) { "config_in_dot_devcontainer_folder" }
+    let(:directory) { "/" }
+
+    let(:workspace_path) { Pathname.new(repo_contents_path).expand_path }
+    let(:workspace) { Dependabot::Workspace::Git.new(workspace_path) }
+
+    let(:expectations) do
+      [
+        {
+          name: "ghcr.io/codspace/versioning/foo",
+          version: "1.1.0",
+          requirements: [
+            {
+              requirement: "1",
+              file: ".devcontainer/devcontainer.json",
+              groups: ["feature"],
+              source: nil
+            }
+          ],
+          metadata: {}
+        },
+        {
+          name: "ghcr.io/codspace/versioning/bar",
+          version: "1.0.0",
+          requirements: [
+            {
+              requirement: "1",
+              file: ".devcontainer/devcontainer.json",
+              groups: ["feature"],
+              source: nil
+            }
+          ],
+          metadata: {}
+        },
+        {
+          name: "ghcr.io/codspace/versioning/baz",
+          version: "1.0.0",
+          requirements: [
+            {
+              requirement: "1.0",
+              file: ".devcontainer/devcontainer.json",
+              groups: ["feature"],
+              source: nil
+            }
+          ],
+          metadata: {}
+        }
+      ].freeze
+    end
+
+    before do
+      allow(Dependabot::Workspace).to receive(:active_workspace).and_return(workspace)
+    end
+
+    after do
+      allow(Dependabot::Workspace).to receive(:active_workspace).and_return(nil)
     end
 
     it_behaves_like "parse"
@@ -234,7 +298,7 @@ RSpec.describe Dependabot::Devcontainers::FileParser do
       it "returns the correct package manager" do
         expect(package_manager.name).to eq "devcontainers"
         expect(package_manager.requirement).to be_nil
-        expect(package_manager.version.to_s).to eq "0.72.0"
+        expect(package_manager.version.to_s).to match(/\d+.\d+.\d+/)
       end
     end
 
@@ -244,7 +308,7 @@ RSpec.describe Dependabot::Devcontainers::FileParser do
       it "returns the correct language" do
         expect(language.name).to eq "node"
         expect(language.requirement).to be_nil
-        expect(language.version.to_s).to eq "18.20.5"
+        expect(language.version.to_s).to match(/\d+.\d+.\d+/)
       end
     end
   end

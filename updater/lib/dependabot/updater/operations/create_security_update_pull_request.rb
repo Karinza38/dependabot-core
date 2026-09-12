@@ -1,4 +1,4 @@
-# typed: strict
+# typed: strong
 # frozen_string_literal: true
 
 require "dependabot/updater/security_update_helpers"
@@ -76,14 +76,19 @@ module Dependabot
 
         sig { returns(Dependabot::Job) }
         attr_reader :job
-        sig { returns(Dependabot::Service) }
+
+        sig { override.returns(Dependabot::Service) }
         attr_reader :service
+
         sig { returns(Dependabot::DependencySnapshot) }
         attr_reader :dependency_snapshot
+
         sig { returns(Dependabot::Updater::ErrorHandler) }
         attr_reader :error_handler
+
         sig { returns(T::Array[PullRequest]) }
         attr_reader :created_pull_requests
+
         # A list of notices that will be used in PR messages and/or sent to the dependabot github alerts.
         sig { returns(T::Array[Dependabot::Notice]) }
         attr_reader :notices
@@ -113,6 +118,9 @@ module Dependabot
           checker = update_checker_for(dependency)
 
           log_checking_for_update(dependency)
+          record_blocked_version_ignored(
+            job: job, dependency: dependency, operation: BlockedVersionsOperation::SECURITY_UPDATE
+          )
 
           Dependabot.logger.info("Latest version is #{checker.latest_version}")
 
@@ -134,6 +142,13 @@ module Dependabot
           # compatible with the current environment (e.g. python version) or
           # version (uses a different version suffix for gradle/maven)
           return record_security_update_not_found(checker) if checker.up_to_date?
+
+          # if checker.excluded?
+          #   return Dependabot.logger.info(
+          #     "Skipping update for #{dependency.name} #{dependency.version} " \
+          #     "(excluded by config)"
+          #   )
+          # end
 
           if pr_exists_for_latest_version?(checker)
             Dependabot.logger.info(
@@ -158,7 +173,18 @@ module Dependabot
           #   https://github.com/github/dependabot-api/issues/905
           return record_security_update_not_possible_error(checker) if updated_deps.none? { |d| job.security_fix?(d) }
 
-          if (existing_pr = existing_pull_request(updated_deps))
+          # DependencyChange will ensure directories are set on the updated dependencies if needed. This means it
+          # needs to run before checking if an existing PR exists to consider the directory in the comparison.
+          dependency_change = Dependabot::DependencyChangeBuilder.create_from(
+            job: job,
+            dependency_files: dependency_snapshot.dependency_files,
+            updated_dependencies: updated_deps,
+            change_source: checker.dependency,
+            # Sending notices to the pr message builder to be used in the PR message if show_in_pr is true
+            notices: @notices
+          )
+
+          if (existing_pr = existing_pull_request(dependency_change.updated_dependencies))
             # Create a update job error to prevent dependabot-api from creating a
             # update_not_possible error, this is likely caused by a update job retry
             # so should be invisible to users (as the first job completed with a pull
@@ -178,15 +204,6 @@ module Dependabot
             )
           end
 
-          dependency_change = Dependabot::DependencyChangeBuilder.create_from(
-            job: job,
-            dependency_files: dependency_snapshot.dependency_files,
-            updated_dependencies: updated_deps,
-            change_source: checker.dependency,
-            # Sending notices to the pr message builder to be used in the PR message if show_in_pr is true
-            notices: @notices
-          )
-
           # Send warning alerts to the API if any warning notices are present.
           # Note that only notices with notice.show_alert set to true will be sent.
           record_warning_notices(notices) if notices.any?
@@ -202,9 +219,11 @@ module Dependabot
         # rubocop:enable Metrics/PerceivedComplexity
         sig { params(dependency: Dependabot::Dependency).returns(Dependabot::Dependency) }
         def vulnerable_version(dependency)
-          return dependency if dependency.metadata[:all_versions].count == 1
+          all_versions = dependency.metadata_array(:all_versions)
+          return dependency unless all_versions
+          return dependency if all_versions.one?
 
-          vulnerable_dependency = dependency.metadata[:all_versions].find do |dep|
+          vulnerable_dependency = dependency.metadata_dependencies(:all_versions)&.find do |dep|
             checker = update_checker_for(dep)
             checker.version_class.correct?(dep.version) && checker.vulnerable?
           end
@@ -226,6 +245,7 @@ module Dependabot
             security_advisories: job.security_advisories_for(dependency),
             raise_on_ignored: true, # always true for security updates
             requirements_update_strategy: job.requirements_update_strategy,
+            # exclude_paths: job.exclude_paths,
             options: job.experiments
           )
         end
@@ -261,9 +281,15 @@ module Dependabot
           latest_version = checker.latest_version&.to_s
           return false if latest_version.nil?
 
-          job.existing_pull_requests
-             .any? { |pr| pr.contains_dependency?(checker.dependency.name, latest_version) } ||
-            created_pull_requests.any? { |pr| pr.contains_dependency?(checker.dependency.name, latest_version) }
+          return true if job.existing_pull_requests.any? do |pr|
+            pr.contains_dependency?(checker.dependency.name, latest_version, T.must(job.source.directory))
+          end
+
+          return true if created_pull_requests.any? do |pr|
+            pr.contains_dependency?(checker.dependency.name, latest_version, T.must(job.source.directory))
+          end
+
+          false
         end
 
         sig do
@@ -293,8 +319,10 @@ module Dependabot
 
         sig { params(dependency_change: Dependabot::DependencyChange).void }
         def create_pull_request(dependency_change)
-          Dependabot.logger.info("Submitting #{dependency_change.updated_dependencies.map(&:name).join(', ')} " \
-                                 "pull request for creation")
+          Dependabot.logger.info(
+            "Submitting #{dependency_change.updated_dependencies.map(&:name).join(', ')} " \
+            "pull request for creation"
+          )
 
           service.create_pull_request(dependency_change, dependency_snapshot.base_commit_sha)
 

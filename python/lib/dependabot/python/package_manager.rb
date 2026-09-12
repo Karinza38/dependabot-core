@@ -31,11 +31,11 @@ module Dependabot
       end
       def initialize(raw_version, requirement = nil)
         super(
-          NAME,
-          Version.new(raw_version),
-          SUPPORTED_VERSIONS,
-          DEPRECATED_VERSIONS,
-          requirement,
+          name: NAME,
+          version: Version.new(raw_version),
+          deprecated_versions: DEPRECATED_VERSIONS,
+          supported_versions: SUPPORTED_VERSIONS,
+          requirement: requirement,
        )
       end
 
@@ -57,9 +57,19 @@ module Dependabot
 
       LOCKFILE_NAME = "poetry.lock"
 
-      SUPPORTED_VERSIONS = T.let([].freeze, T::Array[Dependabot::Version])
+      POETRY_V1 = "1"
+      POETRY_V2 = "2"
 
-      DEPRECATED_VERSIONS = T.let([].freeze, T::Array[Dependabot::Version])
+      # Keep versions in ascending order
+      SUPPORTED_VERSIONS = T.let(
+        [
+          Version.new(POETRY_V1),
+          Version.new(POETRY_V2)
+        ].freeze,
+        T::Array[Dependabot::Version]
+      )
+
+      DEPRECATED_VERSIONS = T.let([Version.new(POETRY_V1)].freeze, T::Array[Dependabot::Version])
 
       sig do
         params(
@@ -68,23 +78,31 @@ module Dependabot
         ).void
       end
       def initialize(raw_version, requirement = nil)
+        version = Version.new(raw_version)
         super(
-          NAME,
-          Version.new(raw_version),
-          SUPPORTED_VERSIONS,
-          DEPRECATED_VERSIONS,
-          requirement,
+          name: NAME,
+          detected_version: Version.new(T.must(version.segments.first).to_s),
+          version: version,
+          deprecated_versions: DEPRECATED_VERSIONS,
+          supported_versions: SUPPORTED_VERSIONS,
+          requirement: requirement,
        )
       end
 
-      sig { override.returns(T::Boolean) }
-      def deprecated?
-        false
-      end
+      # Poetry supports requires-poetry constraints in pyproject.toml;
+      # other Python package managers don't have an equivalent mechanism.
+      sig { override.void }
+      def raise_if_unsupported!
+        super
+        return unless requirement
+        return unless version
+        return if T.cast(T.must(requirement).satisfied_by?(T.must(version)), T::Boolean)
 
-      sig { override.returns(T::Boolean) }
-      def unsupported?
-        false
+        raise Dependabot::ToolVersionNotSupported.new(
+          NAME,
+          version.to_s,
+          requirement.to_s
+        )
       end
     end
 
@@ -92,6 +110,7 @@ module Dependabot
       extend T::Sig
 
       NAME = "pip-compile"
+      MANIFEST_FILENAME = ".in"
 
       SUPPORTED_VERSIONS = T.let([].freeze, T::Array[Dependabot::Version])
 
@@ -105,11 +124,11 @@ module Dependabot
       end
       def initialize(raw_version, requirement = nil)
         super(
-          NAME,
-          Version.new(raw_version),
-          SUPPORTED_VERSIONS,
-          DEPRECATED_VERSIONS,
-          requirement,
+          name: NAME,
+          version: Version.new(raw_version),
+          deprecated_versions: DEPRECATED_VERSIONS,
+          supported_versions: SUPPORTED_VERSIONS,
+          requirement: requirement,
        )
       end
 
@@ -144,11 +163,11 @@ module Dependabot
       end
       def initialize(raw_version, requirement = nil)
         super(
-          NAME,
-          Version.new(raw_version),
-          SUPPORTED_VERSIONS,
-          DEPRECATED_VERSIONS,
-          requirement,
+          name: NAME,
+          version: Version.new(raw_version),
+          deprecated_versions: DEPRECATED_VERSIONS,
+          supported_versions: SUPPORTED_VERSIONS,
+          requirement: requirement,
        )
       end
 

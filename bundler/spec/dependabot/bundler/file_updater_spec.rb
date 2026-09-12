@@ -54,50 +54,6 @@ RSpec.describe Dependabot::Bundler::FileUpdater do
 
   it_behaves_like "a dependency file updater"
 
-  describe "#updated_files_regex" do
-    subject(:updated_files_regex) { described_class.updated_files_regex }
-
-    it "is not empty" do
-      expect(updated_files_regex).not_to be_empty
-    end
-
-    context "when files match the regex patterns" do
-      it "returns true for files that should be updated" do
-        matching_files = [
-          "Gemfile",
-          "Gemfile.lock",
-          "gems.rb",
-          "gems.locked",
-          "some_project.gemspec",
-          "vendor/cache/business-1.5.0.gem",
-          "backend/Gemfile",
-          "backend/Gemfile.lock",
-          "backend/gems.rb",
-          "backend/gems.locked"
-        ]
-
-        matching_files.each do |file_name|
-          expect(updated_files_regex).to(be_any { |regex| file_name.match?(regex) })
-        end
-      end
-
-      it "returns false for files that should not be updated" do
-        non_matching_files = [
-          "README.md",
-          ".github/workflow/main.yml",
-          "some_random_file.rb",
-          "requirements.txt",
-          "package-lock.json",
-          "package.json"
-        ]
-
-        non_matching_files.each do |file_name|
-          expect(updated_files_regex).not_to(be_any { |regex| file_name.match?(regex) })
-        end
-      end
-    end
-  end
-
   describe "#updated_dependency_files" do
     subject(:updated_files) { updater.updated_dependency_files }
 
@@ -749,8 +705,10 @@ RSpec.describe Dependabot::Bundler::FileUpdater do
           let(:project_name) { "git_source_reordered" }
 
           it "doesn't update the order of the git dependencies" do
-            old_lock = bundler_project_dependency_file("git_source_reordered",
-                                                       filename: "Gemfile.lock").content.split(/^/)
+            old_lock = bundler_project_dependency_file(
+              "git_source_reordered",
+              filename: "Gemfile.lock"
+            ).content.split(/^/)
             new_lock = file.content.split(/^/)
 
             %w(business prius uk_phone_numbers).each do |dep|
@@ -1506,6 +1464,8 @@ RSpec.describe Dependabot::Bundler::FileUpdater do
       end
 
       it "returns the latest version" do
+        # guard-bundler requires bundler < 3, incompatible with Bundler 4+
+        skip "Requires Bundler 2.x (guard-bundler constraint: < 3)" if PackageManagerHelper.helper_running_bundler_v4?
         expect(updated_gemfile.content).to include("\"guard-bundler\", \"~> 2.2.1\"")
       end
     end
@@ -1575,6 +1535,38 @@ RSpec.describe Dependabot::Bundler::FileUpdater do
         end
       end
 
+      context "when an unchanged dependency is missing from the vendor cache" do
+        # statesman is in the lockfile but not present in vendor/cache (e.g. a
+        # repo that doesn't vendor every platform). The all-platforms re-cache
+        # re-fetches it, but since statesman isn't part of this update it should
+        # not be added to the PR. Otherwise a single-dependency update balloons
+        # to include every gem the cache happens to be missing.
+        let(:project_name) { "vendored_gems_partial_cache" }
+
+        before do
+          stub_request(:get, "https://rubygems.org/gems/statesman-1.2.1.gem")
+            .to_return(
+              status: 200,
+              body: fixture("ruby", "gems", "statesman-1.2.1.gem")
+            )
+        end
+
+        it "only vendors the updated dependency" do
+          expect(updater.updated_dependency_files.map(&:name))
+            .to contain_exactly(
+              "vendor/cache/business-1.4.0.gem",
+              "vendor/cache/business-1.5.0.gem",
+              "Gemfile",
+              "Gemfile.lock"
+            )
+        end
+
+        it "does not re-vendor the unchanged dependency" do
+          expect(updater.updated_dependency_files.map(&:name))
+            .not_to include("vendor/cache/statesman-1.2.1.gem")
+        end
+      end
+
       context "with a git dependency" do
         let(:project_name) { "vendored_git" }
 
@@ -1613,8 +1605,8 @@ RSpec.describe Dependabot::Bundler::FileUpdater do
           }]
         end
 
-        removed = "vendor/cache/dependabot-test-ruby-package-81073f9462f2"
-        added = "vendor/cache/dependabot-test-ruby-package-1c6331732c41"
+        let(:removed) { "vendor/cache/dependabot-test-ruby-package-81073f9462f2" }
+        let(:added) { "vendor/cache/dependabot-test-ruby-package-1c6331732c41" }
 
         it "vendors the new dependency" do
           expect(updater.updated_dependency_files.map(&:name))

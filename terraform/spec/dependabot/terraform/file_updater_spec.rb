@@ -27,53 +27,6 @@ RSpec.describe Dependabot::Terraform::FileUpdater do
 
   it_behaves_like "a dependency file updater"
 
-  describe "#updated_files_regex" do
-    subject(:updated_files_regex) { described_class.updated_files_regex }
-
-    it "is not empty" do
-      expect(updated_files_regex).not_to be_empty
-    end
-
-    context "when files match the regex patterns" do
-      it "returns true for files that should be updated" do
-        matching_files = [
-          "main.tf",
-          "variables.tf",
-          "outputs.tf",
-          "config.hcl",
-          "nested/directory/main.tf",
-          "nested/directory/config.hcl",
-          "terraform/main.tf",
-          "submodules/terraform/config.hcl",
-          "hashicorp/consul/aws/main.tf",
-          "hashicorp/consul/aws/config.hcl",
-          "terraform-aws-modules/iam/aws/main.tf",
-          "terraform-aws-modules/iam/aws/config.hcl"
-        ]
-
-        matching_files.each do |file_name|
-          expect(updated_files_regex).to(be_any { |regex| file_name.match?(regex) })
-        end
-      end
-
-      it "returns false for files that should not be updated" do
-        non_matching_files = [
-          "README.md",
-          ".github/workflow/main.yml",
-          "some_random_file.rb",
-          "package-lock.json",
-          "package.json",
-          "Gemfile",
-          "Gemfile.lock"
-        ]
-
-        non_matching_files.each do |file_name|
-          expect(updated_files_regex).not_to(be_any { |regex| file_name.match?(regex) })
-        end
-      end
-    end
-  end
-
   describe "#updated_dependency_files" do
     subject(:updated_dependency_files) { updater.updated_dependency_files }
 
@@ -447,6 +400,53 @@ RSpec.describe Dependabot::Terraform::FileUpdater do
             <<~DEP
               module "duplicate_label" {
                 source     = "git::https://github.com/cloudposse/terraform-null-label.git?ref=tags/0.3.7"
+            DEP
+          )
+        end
+      end
+
+      context "with string-keyed source details" do
+        let(:project_name) { "git_tags_012" }
+        let(:dependencies) do
+          [
+            Dependabot::Dependency.new(
+              name: "origin_label",
+              version: "0.4.1",
+              previous_version: "0.3.7",
+              requirements: [{
+                requirement: nil,
+                groups: [],
+                file: "main.tf",
+                source: {
+                  "type" => "git",
+                  "url" => "https://github.com/cloudposse/terraform-null-label.git",
+                  "branch" => nil,
+                  "ref" => "tags/0.4.1"
+                }
+              }],
+              previous_requirements: [{
+                requirement: nil,
+                groups: [],
+                file: "main.tf",
+                source: {
+                  "type" => "git",
+                  "url" => "https://github.com/cloudposse/terraform-null-label.git",
+                  "branch" => nil,
+                  "ref" => "tags/0.3.7"
+                }
+              }],
+              package_manager: "terraform"
+            )
+          ]
+        end
+
+        it "updates the requirement" do
+          updated_file = updated_dependency_files.find { |file| file.name == "main.tf" }
+
+          expect(updated_file.content).to include(
+            <<~DEP
+              module "origin_label" {
+                source     = "git::https://github.com/cloudposse/terraform-null-label.git?ref=tags/0.4.1"
             DEP
           )
         end
@@ -984,6 +984,58 @@ RSpec.describe Dependabot::Terraform::FileUpdater do
       end
     end
 
+    context "when using a lockfile with a private/unresolvable provider" do
+      let(:project_name) { "lockfile_with_private_provider" }
+      let(:dependencies) do
+        [
+          Dependabot::Dependency.new(
+            name: "hashicorp/aws",
+            version: "3.42.0",
+            previous_version: "3.37.0",
+            requirements: [{
+              requirement: "3.42.0",
+              groups: [],
+              file: "versions.tf",
+              source: {
+                type: "provider",
+                registry_hostname: "registry.terraform.io",
+                module_identifier: "hashicorp/aws"
+              }
+            }],
+            previous_requirements: [{
+              requirement: "3.37.0",
+              groups: [],
+              file: "versions.tf",
+              source: {
+                type: "provider",
+                registry_hostname: "registry.terraform.io",
+                module_identifier: "hashicorp/aws"
+              }
+            }],
+            package_manager: "terraform"
+          )
+        ]
+      end
+
+      it "updates the target provider in the lockfile despite the unresolvable provider" do
+        actual_lockfile = updated_dependency_files.find { |file| file.name == ".terraform.lock.hcl" }
+
+        expect(actual_lockfile.content).to include(
+          <<~DEP
+            provider "registry.terraform.io/hashicorp/aws" {
+              version     = "3.45.0"
+              constraints = ">= 3.42.0, < 3.46.0"
+          DEP
+        )
+      end
+
+      it "does not add the private provider to the lockfile" do
+        actual_lockfile = updated_dependency_files.find { |file| file.name == ".terraform.lock.hcl" }
+
+        expect(actual_lockfile.content).not_to include("acme-corp/nonexistent")
+      end
+    end
+
     context "when using versions.tf with a lockfile with multiple platforms present" do
       let(:project_name) { "lockfile_multiple_platforms" }
       let(:dependencies) do
@@ -1504,7 +1556,7 @@ RSpec.describe Dependabot::Terraform::FileUpdater do
       let(:dependencies) do
         [
           Dependabot::Dependency.new(
-            name: "Mongey/confluentcloud",
+            name: "mongey/confluentcloud",
             version: "0.0.11",
             previous_version: "0.0.6",
             requirements: [{
@@ -1514,7 +1566,7 @@ RSpec.describe Dependabot::Terraform::FileUpdater do
               source: {
                 type: "provider",
                 registry_hostname: "registry.terraform.io",
-                module_identifier: "Mongey/confluentcloud"
+                module_identifier: "mongey/confluentcloud"
               }
             }],
             previous_requirements: [{
@@ -1524,7 +1576,7 @@ RSpec.describe Dependabot::Terraform::FileUpdater do
               source: {
                 type: "provider",
                 registry_hostname: "registry.terraform.io",
-                module_identifier: "Mongey/confluentcloud"
+                module_identifier: "mongey/confluentcloud"
               }
             }],
             package_manager: "terraform"
@@ -1542,6 +1594,13 @@ RSpec.describe Dependabot::Terraform::FileUpdater do
           DEP
         )
       end
+
+      it "updates the manifest version constraint" do
+        manifest = updated_dependency_files.find { |file| file.name == "providers.tf" }
+
+        expect(manifest.content).to include(">= 0.0.11, < 0.0.12")
+        expect(manifest.content).not_to include(">= 0.0.6, < 0.0.12")
+      end
     end
 
     describe "when updating a provider with multiple local path modules" do
@@ -1549,7 +1608,7 @@ RSpec.describe Dependabot::Terraform::FileUpdater do
       let(:dependencies) do
         [
           Dependabot::Dependency.new(
-            name: "Mongey/confluentcloud",
+            name: "mongey/confluentcloud",
             version: "0.0.10",
             previous_version: "0.0.6",
             requirements: [{
@@ -1559,7 +1618,7 @@ RSpec.describe Dependabot::Terraform::FileUpdater do
               source: {
                 type: "provider",
                 registry_hostname: "registry.terraform.io",
-                module_identifier: "Mongey/confluentcloud"
+                module_identifier: "mongey/confluentcloud"
               }
             }, {
               requirement: "0.0.10",
@@ -1568,7 +1627,7 @@ RSpec.describe Dependabot::Terraform::FileUpdater do
               source: {
                 type: "provider",
                 registry_hostname: "registry.terraform.io",
-                module_identifier: "Mongey/confluentcloud"
+                module_identifier: "mongey/confluentcloud"
               }
             }, {
               requirement: "0.0.10",
@@ -1577,7 +1636,7 @@ RSpec.describe Dependabot::Terraform::FileUpdater do
               source: {
                 type: "provider",
                 registry_hostname: "registry.terraform.io",
-                module_identifier: "Mongey/confluentcloud"
+                module_identifier: "mongey/confluentcloud"
               }
             }],
             previous_requirements: [{
@@ -1587,7 +1646,7 @@ RSpec.describe Dependabot::Terraform::FileUpdater do
               source: {
                 type: "provider",
                 registry_hostname: "registry.terraform.io",
-                module_identifier: "Mongey/confluentcloud"
+                module_identifier: "mongey/confluentcloud"
               }
             }, {
               requirement: "0.0.6",
@@ -1596,7 +1655,7 @@ RSpec.describe Dependabot::Terraform::FileUpdater do
               source: {
                 type: "provider",
                 registry_hostname: "registry.terraform.io",
-                module_identifier: "Mongey/confluentcloud"
+                module_identifier: "mongey/confluentcloud"
               }
             }, {
               requirement: "0.0.6",
@@ -1605,7 +1664,7 @@ RSpec.describe Dependabot::Terraform::FileUpdater do
               source: {
                 type: "provider",
                 registry_hostname: "registry.terraform.io",
-                module_identifier: "Mongey/confluentcloud"
+                module_identifier: "mongey/confluentcloud"
               }
             }],
             package_manager: "terraform"
@@ -1708,6 +1767,160 @@ RSpec.describe Dependabot::Terraform::FileUpdater do
 
       specify { expect(updated_dependency_files).to all(be_a(Dependabot::DependencyFile)) }
       specify { expect(updated_dependency_files.length).to eq(1) }
+    end
+
+    describe "#error_handler" do
+      subject(:error_handler) { Dependabot::Terraform::FileUpdaterErrorHandler.new }
+
+      let(:error) { instance_double(Dependabot::SharedHelpers::HelperSubprocessFailed, message: error_message) }
+
+      context "when the error message contains no resolvable releases" do
+        let(:error_message) do
+          "[31m[31m╷[0m[0m
+          [31m│[0m [0m[1m[31mError: [0m[0m[1mCould not retrieve providers for locking[0m
+          [31m│[0m [0m
+          [31m│[0m [0m[0mTerraform failed to fetch the requested providers for linux_amd64 in order
+          [31m│[0m [0mto calculate their checksums: some providers could not be installed:
+          [31m│[0m [0m- registry.terraform.io/firehydrant/firehydrant: no available releases
+          [31m│[0m [0mmatch the given constraints 0.13.4, 0.13.5.
+          [31m╵[0m[0m
+          [0m[0m"
+        end
+
+        it "raises a DependencyFileNotResolvable error with the correct message" do
+          expect do
+            error_handler.handle_helper_subprocess_failed_error(error)
+          end.to raise_error(Dependabot::DependencyFileNotResolvable)
+        end
+      end
+    end
+  end
+
+  describe "#update_registry_declaration" do
+    let(:new_req) do
+      Dependabot::DependencyRequirement.create(
+        {
+          requirement: "~> 6.6.0",
+          groups: [],
+          file: "main.tf",
+          source: {
+            type: "provider",
+            registry_hostname: "registry.terraform.io",
+            module_identifier: "integrations/github"
+          }
+        }
+      )
+    end
+
+    let(:old_req) do
+      Dependabot::DependencyRequirement.create(
+        {
+          requirement: "~> 4.28.0",
+          groups: [],
+          file: "main.tf",
+          source: {
+            type: "provider",
+            registry_hostname: "registry.terraform.io",
+            module_identifier: "integrations/github"
+          }
+        }
+      )
+    end
+
+    let(:updated_content) do
+      <<~TERRAFORM
+        terraform {
+          required_providers {
+            aws = {
+              version = "~> 5.0, != 5.86.0"
+              source  = "hashicorp/aws"
+            }
+            http = {
+              version = "~> 3.0"
+              source  = "hashicorp/http"
+            }
+            github = {
+              version = "~> 4.28.0"
+              source  = "integrations/github"
+            }
+            random = {
+              version = "~> 3.6"
+              source  = "hashicorp/random"
+            }
+          }
+          required_version = "~> 1.10"
+        }
+      TERRAFORM
+    end
+
+    let(:expected_content) do
+      <<~TERRAFORM
+        terraform {
+          required_providers {
+            aws = {
+              version = "~> 5.0, != 5.86.0"
+              source  = "hashicorp/aws"
+            }
+            http = {
+              version = "~> 3.0"
+              source  = "hashicorp/http"
+            }
+            github = {
+              version = "~> 6.6.0"
+              source  = "integrations/github"
+            }
+            random = {
+              version = "~> 3.6"
+              source  = "hashicorp/random"
+            }
+          }
+          required_version = "~> 1.10"
+        }
+      TERRAFORM
+    end
+
+    let(:dependencies) do
+      [
+        Dependabot::Dependency.new(
+          name: "integrations/github",
+          version: "6.6.0",
+          previous_version: "4.28.0",
+          requirements: [{
+            requirement: "~> 6.6.0",
+            groups: [],
+            file: "main.tf",
+            source: {
+              type: "provider",
+              registry_hostname: "registry.terraform.io",
+              module_identifier: "integrations/github"
+            }
+          }],
+          previous_requirements: [{
+            requirement: "~> 4.28.0",
+            groups: [],
+            file: "main.tf",
+            source: {
+              type: "provider",
+              registry_hostname: "registry.terraform.io",
+              module_identifier: "integrations/github"
+            }
+          }],
+          package_manager: "terraform"
+        )
+      ]
+    end
+
+    it "updates the registry declaration with the new requirement" do
+      file_updater = described_class.new(
+        dependency_files: [Dependabot::DependencyFile.new(name: "main.tf", content: updated_content)],
+        dependencies: dependencies,
+        credentials: []
+      )
+      content = updated_content.dup
+      file_updater.send(:update_registry_declaration, new_req, old_req, content)
+      expect(content).to include('version = "~> 6.6.0"') # New version is present
+      expect(content).not_to include('version = "~> 4.28.0"') # Old version is gone
+      expect(content).to eq(expected_content) # Overall structure matches expected content
     end
   end
 end

@@ -7,6 +7,9 @@ require "sorbet-runtime"
 require "dependabot/requirements_update_strategy"
 require "dependabot/security_advisory"
 require "dependabot/utils"
+require "dependabot/package/release_cooldown_options"
+require "dependabot/file_filtering"
+require "dependabot/update_checkers/vulnerability_audit"
 
 module Dependabot
   module UpdateCheckers
@@ -41,7 +44,10 @@ module Dependabot
       sig { returns(T.nilable(Dependabot::DependencyGroup)) }
       attr_reader :dependency_group
 
-      sig { returns(T::Hash[Symbol, T.untyped]) }
+      sig { returns(T.nilable(Dependabot::Package::ReleaseCooldownOptions)) }
+      attr_reader :update_cooldown
+
+      sig { returns(T::Hash[Symbol, T.anything]) }
       attr_reader :options
 
       sig do
@@ -55,15 +61,24 @@ module Dependabot
           security_advisories: T::Array[Dependabot::SecurityAdvisory],
           requirements_update_strategy: T.nilable(Dependabot::RequirementsUpdateStrategy),
           dependency_group: T.nilable(Dependabot::DependencyGroup),
-          options: T::Hash[Symbol, T.untyped]
+          update_cooldown: T.nilable(Dependabot::Package::ReleaseCooldownOptions),
+          options: T::Hash[Symbol, T.anything]
         )
           .void
       end
-      def initialize(dependency:, dependency_files:, credentials:,
-                     repo_contents_path: nil, ignored_versions: [],
-                     raise_on_ignored: false, security_advisories: [],
-                     requirements_update_strategy: nil, dependency_group: nil,
-                     options: {})
+      def initialize(
+        dependency:,
+        dependency_files:,
+        credentials:,
+        repo_contents_path: nil,
+        ignored_versions: [],
+        raise_on_ignored: false,
+        security_advisories: [],
+        requirements_update_strategy: nil,
+        dependency_group: nil,
+        update_cooldown: nil,
+        options: {}
+      )
         @dependency = dependency
         @dependency_files = dependency_files
         @repo_contents_path = repo_contents_path
@@ -73,6 +88,7 @@ module Dependabot
         @raise_on_ignored = raise_on_ignored
         @security_advisories = security_advisories
         @dependency_group = dependency_group
+        @update_cooldown = update_cooldown
         @options = options
       end
 
@@ -136,38 +152,41 @@ module Dependabot
 
       # Lowest available security fix version not checking resolvability
       # @return [Dependabot::<package manager>::Version, #to_s] version class
-      sig { overridable.returns(T.nilable(Dependabot::Version)) }
+      sig { overridable.returns(T.nilable(Gem::Version)) }
       def lowest_security_fix_version
         raise NotImplementedError, "#{self.class} must implement #lowest_security_fix_version"
       end
 
-      sig { overridable.returns(T.nilable(Dependabot::Version)) }
+      sig { overridable.returns(T.nilable(Gem::Version)) }
       def lowest_resolvable_security_fix_version
         raise NotImplementedError, "#{self.class} must implement #lowest_resolvable_security_fix_version"
       end
 
-      sig { overridable.returns(T.nilable(T.any(String, Dependabot::Version))) }
+      sig { overridable.returns(T.nilable(T.any(String, Gem::Version))) }
       def latest_resolvable_version_with_no_unlock
         raise NotImplementedError, "#{self.class} must implement #latest_resolvable_version_with_no_unlock"
       end
 
       # Finds any dependencies in the lockfile that have a subdependency on the
       # given dependency that do not satisfy the target_version.
-      # @return [Array<Hash{String => String}]
+      # @return [Array<Hash{String => Object}]
       #   name [String] the blocking dependencies name
       #   version [String] the version of the blocking dependency
       #   requirement [String] the requirement on the target_dependency
-      sig { overridable.returns(T::Array[T::Hash[String, String]]) }
+      sig { overridable.returns(T::Array[Dependabot::UpdateCheckers::Conflict]) }
       def conflicting_dependencies
         [] # return an empty array for ecosystems that don't support this yet
       end
 
-      sig { params(_updated_version: String).returns(T.nilable(String)) }
+      sig do
+        params(_updated_version: T.any(String, Gem::Version))
+          .returns(T.nilable(T.any(String, Gem::Version)))
+      end
       def latest_resolvable_previous_version(_updated_version)
         dependency.version
       end
 
-      sig { overridable.returns(T::Array[T::Hash[Symbol, T.untyped]]) }
+      sig { overridable.returns(T::Array[Dependabot::DependencyRequirement]) }
       def updated_requirements
         raise NotImplementedError
       end
@@ -211,6 +230,20 @@ module Dependabot
 
       private
 
+      # Wraps an array of raw requirement hashes (e.g. the output of an
+      # ecosystem RequirementsUpdater) into typed DependencyRequirement
+      # objects, so updated_requirements overrides can satisfy the typed
+      # return contract. Entries that are already DependencyRequirement
+      # instances are returned as-is; plain hashes are wrapped. Re-wrapping
+      # would produce a value-equal copy, so skipping it avoids needless
+      # allocations.
+      sig { params(requirements: T::Array[T::Hash[Symbol, T.anything]]).returns(T::Array[Dependabot::DependencyRequirement]) }
+      def wrap_requirements(requirements)
+        requirements.map do |requirement|
+          requirement.is_a?(Dependabot::DependencyRequirement) ? requirement : Dependabot::DependencyRequirement.create(requirement)
+        end
+      end
+
       sig { returns(T::Array[Dependabot::SecurityAdvisory]) }
       def active_advisories
         security_advisories.select { |a| a.vulnerable?(T.must(current_version)) }
@@ -224,7 +257,7 @@ module Dependabot
       sig { returns(Dependabot::Dependency) }
       def updated_dependency_without_unlock
         version = latest_resolvable_version_with_no_unlock.to_s
-        previous_version = latest_resolvable_previous_version(version)
+        previous_version = latest_resolvable_previous_version(version)&.to_s
 
         Dependency.new(
           name: dependency.name,
@@ -241,7 +274,7 @@ module Dependabot
       sig { returns(Dependabot::Dependency) }
       def updated_dependency_with_own_req_unlock
         version = preferred_resolvable_version.to_s
-        previous_version = latest_resolvable_previous_version(version)
+        previous_version = latest_resolvable_previous_version(version)&.to_s
 
         Dependency.new(
           name: dependency.name,
@@ -350,14 +383,12 @@ module Dependabot
           return false
         end
 
-        updated_requirements.none? { |r| r[:requirement] == :unfixable }
+        updated_requirements.none? { |r| r.requirement == :unfixable }
       end
 
       sig { returns(T::Boolean) }
       def requirements_up_to_date?
-        if can_compare_requirements?
-          return (T.must(version_from_requirements) >= version_class.new(latest_version.to_s))
-        end
+        return T.must(version_from_requirements) >= version_class.new(latest_version.to_s) if can_compare_requirements?
 
         changed_requirements.none?
       end
@@ -379,7 +410,7 @@ module Dependabot
           version_class.correct?(latest_version.to_s)) || false
       end
 
-      sig { returns(T::Array[T::Hash[Symbol, T.untyped]]) }
+      sig { returns(T::Array[Dependabot::DependencyRequirement]) }
       def changed_requirements
         (updated_requirements - dependency.requirements)
       end
@@ -388,7 +419,7 @@ module Dependabot
       def version_from_requirements
         @version_from_requirements ||=
           T.let(
-            dependency.requirements.filter_map { |r| r.fetch(:requirement) }
+            dependency.requirements.filter_map(&:requirement_string)
                       .flat_map { |req_str| requirement_class.requirements_array(req_str) }
                       .flat_map(&:requirements)
                       .reject { |req_array| req_array.first.start_with?("<") }
@@ -402,7 +433,7 @@ module Dependabot
       def requirements_can_update?
         return false if changed_requirements.none?
 
-        changed_requirements.none? { |r| r[:requirement] == :unfixable }
+        changed_requirements.none? { |r| r.requirement == :unfixable }
       end
     end
   end

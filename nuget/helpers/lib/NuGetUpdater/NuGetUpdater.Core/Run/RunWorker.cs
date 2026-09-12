@@ -1,17 +1,23 @@
 using System.Collections.Immutable;
-using System.Net;
-using System.Text;
+using System.IO.Enumeration;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using System.Xml.Linq;
+
+using NuGet.Versioning;
 
 using NuGetUpdater.Core.Analyze;
 using NuGetUpdater.Core.Discover;
 using NuGetUpdater.Core.Run.ApiModel;
+using NuGetUpdater.Core.Run.UpdateHandlers;
+using NuGetUpdater.Core.Updater;
+using NuGetUpdater.Core.Utilities;
 
 namespace NuGetUpdater.Core.Run;
 
 public class RunWorker
 {
+    private readonly string _jobId;
     private readonly IApiHandler _apiHandler;
     private readonly ILogger _logger;
     private readonly IDiscoveryWorker _discoveryWorker;
@@ -22,11 +28,12 @@ public class RunWorker
     {
         PropertyNamingPolicy = JsonNamingPolicy.KebabCaseLower,
         WriteIndented = true,
-        Converters = { new JsonStringEnumConverter(), new RequirementConverter() },
+        Converters = { new JsonStringEnumConverter(), new PullRequestConverter(), new RequirementConverter(), new VersionConverter() },
     };
 
-    public RunWorker(IApiHandler apiHandler, IDiscoveryWorker discoverWorker, IAnalyzeWorker analyzeWorker, IUpdaterWorker updateWorker, ILogger logger)
+    public RunWorker(string jobId, IApiHandler apiHandler, IDiscoveryWorker discoverWorker, IAnalyzeWorker analyzeWorker, IUpdaterWorker updateWorker, ILogger logger)
     {
+        _jobId = jobId;
         _apiHandler = apiHandler;
         _logger = logger;
         _discoveryWorker = discoverWorker;
@@ -34,297 +41,237 @@ public class RunWorker
         _updaterWorker = updateWorker;
     }
 
-    public async Task RunAsync(FileInfo jobFilePath, DirectoryInfo repoContentsPath, string baseCommitSha, FileInfo outputFilePath)
+    public async Task<int> RunAsync(FileInfo jobFilePath, DirectoryInfo repoContentsPath, DirectoryInfo? caseInsensitiveRepoContentsPath, string baseCommitSha)
     {
         var jobFileContent = await File.ReadAllTextAsync(jobFilePath.FullName);
-        var jobWrapper = Deserialize(jobFileContent);
-        var result = await RunAsync(jobWrapper.Job, repoContentsPath, baseCommitSha);
-        var resultJson = JsonSerializer.Serialize(result, SerializerOptions);
-        await File.WriteAllTextAsync(outputFilePath.FullName, resultJson);
+        var jobWrapper = Deserialize(jobFileContent, _logger);
+        var experimentsManager = ExperimentsManager.GetExperimentsManager(jobWrapper.Job.Experiments);
+        var result = await RunAsync(jobWrapper.Job, repoContentsPath, caseInsensitiveRepoContentsPath, baseCommitSha, experimentsManager);
+        return result;
     }
 
-    public Task<RunResult> RunAsync(Job job, DirectoryInfo repoContentsPath, string baseCommitSha)
+    public async Task<int> RunAsync(Job job, DirectoryInfo repoContentsPath, DirectoryInfo? caseInsensitiveRepoContentsPath, string baseCommitSha, ExperimentsManager experimentsManager)
     {
-        return RunWithErrorHandlingAsync(job, repoContentsPath, baseCommitSha);
-    }
-
-    private async Task<RunResult> RunWithErrorHandlingAsync(Job job, DirectoryInfo repoContentsPath, string baseCommitSha)
-    {
-        JobErrorBase? error = null;
-        string[] lastUsedPackageSourceUrls = []; // used for error reporting below
-        var runResult = new RunResult()
+        if (experimentsManager.FindRootDirectory)
         {
-            Base64DependencyFiles = [],
-            BaseCommitSha = baseCommitSha,
-        };
+            _logger.Info("FindRootDirectory experiment is enabled; resolving root directories...");
+            MSBuildHelper.RegisterMSBuild(repoContentsPath.FullName, repoContentsPath.FullName, _logger);
+            job = await ResolveRootDirectoriesAsync(job, repoContentsPath.FullName);
+        }
+
+        var result = await RunScenarioHandlersWithErrorHandlingAsync(job, repoContentsPath, caseInsensitiveRepoContentsPath, baseCommitSha, experimentsManager);
+        return result;
+    }
+
+    internal async Task<Job> ResolveRootDirectoriesAsync(Job job, string repoRootPath)
+    {
+        var originalDirectories = job.GetAllDirectories(repoRootPath);
+        var rootDirectories = await EntryPointFinder.FindRootDirectoriesAsync(originalDirectories, repoRootPath, _logger);
+        if (rootDirectories.SequenceEqual(originalDirectories))
+        {
+            return job;
+        }
+
+        _logger.Info($"  Updated job directories from [{string.Join(", ", originalDirectories)}] to [{string.Join(", ", rootDirectories)}]");
+        var updatedSource = job.Source with { Directory = null, Directories = rootDirectories.ToArray() };
+        return job with { Source = updatedSource };
+    }
+
+    private static readonly ImmutableArray<IUpdateHandler> UpdateHandlers =
+    [
+        GroupUpdateAllVersionsHandler.Instance,
+        RefreshGroupUpdatePullRequestHandler.Instance,
+        CreateSecurityUpdatePullRequestHandler.Instance,
+        RefreshSecurityUpdatePullRequestHandler.Instance,
+        RefreshVersionUpdatePullRequestHandler.Instance,
+    ];
+
+    public static IUpdateHandler GetUpdateHandler(Job job) =>
+        UpdateHandlers.FirstOrDefault(h => h.CanHandle(job)) ?? throw new InvalidOperationException("Unable to find appropriate update handler.");
+
+    private async Task<int> RunScenarioHandlersWithErrorHandlingAsync(Job job, DirectoryInfo repoContentsPath, DirectoryInfo? caseInsensitiveRepoContentsPath, string baseCommitSha, ExperimentsManager experimentsManager)
+    {
+        int result = 0;
+        JobErrorBase? error = null;
 
         try
         {
-            MSBuildHelper.RegisterMSBuild(repoContentsPath.FullName, repoContentsPath.FullName);
-
-            var experimentsManager = ExperimentsManager.GetExperimentsManager(job.Experiments);
-            var allDependencyFiles = new Dictionary<string, DependencyFile>();
-            foreach (var directory in job.GetAllDirectories())
-            {
-                var localPath = PathHelper.JoinPath(repoContentsPath.FullName, directory);
-                lastUsedPackageSourceUrls = NuGetContext.GetPackageSourceUrls(localPath);
-                var result = await RunForDirectory(job, repoContentsPath, directory, baseCommitSha, experimentsManager);
-                foreach (var dependencyFile in result.Base64DependencyFiles)
-                {
-                    var uniqueKey = Path.GetFullPath(Path.Join(dependencyFile.Directory, dependencyFile.Name)).NormalizePathToUnix().EnsurePrefix("/");
-                    allDependencyFiles[uniqueKey] = dependencyFile;
-                }
-            }
-
-            runResult = new RunResult()
-            {
-                Base64DependencyFiles = allDependencyFiles.Values.ToArray(),
-                BaseCommitSha = baseCommitSha,
-            };
-        }
-        catch (HttpRequestException ex)
-        when (ex.StatusCode == HttpStatusCode.Unauthorized || ex.StatusCode == HttpStatusCode.Forbidden)
-        {
-            error = new PrivateSourceAuthenticationFailure(lastUsedPackageSourceUrls);
-        }
-        catch (MissingFileException ex)
-        {
-            error = new DependencyFileNotFound(ex.FilePath);
-        }
-        catch (UpdateNotPossibleException ex)
-        {
-            error = new UpdateNotPossible(ex.Dependencies);
+            // Register MSBuild up front so that the `Microsoft.Build` assembly is loadable for
+            // the rest of the job.  This is required even on the error-handling path:
+            // `JobErrorBase.ErrorFromException` references `Microsoft.Build` exception types, so
+            // if a failure occurs before MSBuild is registered, JIT-compiling the error handler
+            // would itself throw `FileNotFoundException` for `Microsoft.Build` and mask the real
+            // error.
+            MSBuildHelper.RegisterMSBuild(repoContentsPath.FullName, repoContentsPath.FullName, _logger);
+            await PatchNuGetConfigFilesAsync(repoContentsPath);
+            var handler = GetUpdateHandler(job);
+            _logger.Info($"Starting update job of type {handler.TagName}");
+            await handler.HandleAsync(job, repoContentsPath, caseInsensitiveRepoContentsPath, baseCommitSha, _discoveryWorker, _analyzeWorker, _updaterWorker, _apiHandler, experimentsManager, _logger);
         }
         catch (Exception ex)
         {
-            error = new UnknownError(ex.ToString());
+            error = JobErrorBase.ErrorFromException(ex, _jobId, repoContentsPath.FullName);
         }
 
         if (error is not null)
         {
-            await _apiHandler.RecordUpdateJobError(error);
+            await _apiHandler.RecordUpdateJobError(error, _logger);
+            result = 1;
         }
 
         await _apiHandler.MarkAsProcessed(new(baseCommitSha));
-
-        return runResult;
-    }
-
-    private async Task<RunResult> RunForDirectory(Job job, DirectoryInfo repoContentsPath, string repoDirectory, string baseCommitSha, ExperimentsManager experimentsManager)
-    {
-        var discoveryResult = await _discoveryWorker.RunAsync(repoContentsPath.FullName, repoDirectory);
-
-        _logger.Info("Discovery JSON content:");
-        _logger.Info(JsonSerializer.Serialize(discoveryResult, DiscoveryWorker.SerializerOptions));
-
-        // report dependencies
-        var discoveredUpdatedDependencies = GetUpdatedDependencyListFromDiscovery(discoveryResult, repoContentsPath.FullName);
-        await _apiHandler.UpdateDependencyList(discoveredUpdatedDependencies);
-
-        // TODO: pull out relevant dependencies, then check each for updates and track the changes
-        // TODO: for each top-level dependency, _or_ specific dependency (if security, use transitive)
-        var originalDependencyFileContents = new Dictionary<string, string>();
-        var allowedUpdates = job.AllowedUpdates ?? [];
-        var actualUpdatedDependencies = new List<ReportedDependency>();
-        if (allowedUpdates.Any(a => a.UpdateType == "all"))
-        {
-            await _apiHandler.IncrementMetric(new()
-            {
-                Metric = "updater.started",
-                Tags = { ["operation"] = "group_update_all_versions" },
-            });
-
-            // track original contents for later handling
-            async Task TrackOriginalContentsAsync(string directory, string fileName)
-            {
-                var repoFullPath = Path.Join(directory, fileName).FullyNormalizedRootedPath();
-                var localFullPath = Path.Join(repoContentsPath.FullName, repoFullPath);
-                var content = await File.ReadAllTextAsync(localFullPath);
-                originalDependencyFileContents[repoFullPath] = content;
-            }
-
-            foreach (var project in discoveryResult.Projects)
-            {
-                var projectDirectory = Path.GetDirectoryName(project.FilePath);
-                await TrackOriginalContentsAsync(discoveryResult.Path, project.FilePath);
-                foreach (var extraFile in project.ImportedFiles.Concat(project.AdditionalFiles))
-                {
-                    var extraFilePath = Path.Join(projectDirectory, extraFile);
-                    await TrackOriginalContentsAsync(discoveryResult.Path, extraFilePath);
-                }
-                // TODO: include global.json, etc.
-            }
-
-            // do update
-            _logger.Info($"Running update in directory {repoDirectory}");
-            foreach (var project in discoveryResult.Projects)
-            {
-                foreach (var dependency in project.Dependencies.Where(d => !d.IsTransitive))
-                {
-                    if (dependency.Name == "Microsoft.NET.Sdk")
-                    {
-                        // this can't be updated
-                        // TODO: pull this out of discovery?
-                        continue;
-                    }
-
-                    if (dependency.Version is null)
-                    {
-                        // if we don't know the version, there's nothing we can do
-                        continue;
-                    }
-
-                    var ignoredVersions = GetIgnoredRequirementsForDependency(job, dependency.Name);
-                    var dependencyInfo = new DependencyInfo()
-                    {
-                        Name = dependency.Name,
-                        Version = dependency.Version!,
-                        IsVulnerable = false,
-                        IgnoredVersions = ignoredVersions,
-                        Vulnerabilities = [],
-                    };
-                    var analysisResult = await _analyzeWorker.RunAsync(repoContentsPath.FullName, discoveryResult, dependencyInfo);
-                    // TODO: log analysisResult
-                    if (analysisResult.CanUpdate)
-                    {
-                        var dependencyLocation = Path.Join(discoveryResult.Path, project.FilePath).FullyNormalizedRootedPath();
-
-                        // TODO: this is inefficient, but not likely causing a bottleneck
-                        var previousDependency = discoveredUpdatedDependencies.Dependencies
-                            .Single(d => d.Name == dependency.Name && d.Requirements.Single().File == dependencyLocation);
-                        var updatedDependency = new ReportedDependency()
-                        {
-                            Name = dependency.Name,
-                            Version = analysisResult.UpdatedVersion,
-                            Requirements =
-                            [
-                                new ReportedRequirement()
-                                {
-                                    File = dependencyLocation,
-                                    Requirement = analysisResult.UpdatedVersion,
-                                    Groups = previousDependency.Requirements.Single().Groups,
-                                    Source = new RequirementSource()
-                                    {
-                                        SourceUrl = analysisResult.UpdatedDependencies.FirstOrDefault(d => d.Name == dependency.Name)?.InfoUrl,
-                                    },
-                                }
-                            ],
-                            PreviousVersion = dependency.Version,
-                            PreviousRequirements = previousDependency.Requirements,
-                        };
-
-                        var dependencyFilePath = Path.Join(discoveryResult.Path, project.FilePath).FullyNormalizedRootedPath();
-                        var updateResult = await _updaterWorker.RunAsync(repoContentsPath.FullName, dependencyFilePath, dependency.Name, dependency.Version!, analysisResult.UpdatedVersion, isTransitive: false);
-                        // TODO: need to report if anything was actually updated
-                        if (updateResult.ErrorType is null || updateResult.ErrorType == ErrorType.None)
-                        {
-                            if (dependencyLocation != dependencyFilePath)
-                            {
-                                updatedDependency.Requirements.All(r => r.File == dependencyFilePath);
-                            }
-
-                            actualUpdatedDependencies.Add(updatedDependency);
-                        }
-                    }
-                }
-            }
-
-            // create PR - we need to manually check file contents; we can't easily use `git status` in tests
-            var updatedDependencyFiles = new Dictionary<string, DependencyFile>();
-            async Task AddUpdatedFileIfDifferentAsync(string directory, string fileName)
-            {
-                var repoFullPath = Path.Join(directory, fileName).FullyNormalizedRootedPath();
-                var localFullPath = Path.GetFullPath(Path.Join(repoContentsPath.FullName, repoFullPath));
-                var originalContent = originalDependencyFileContents[repoFullPath];
-                var updatedContent = await File.ReadAllTextAsync(localFullPath);
-                if (updatedContent != originalContent)
-                {
-                    updatedDependencyFiles[localFullPath] = new DependencyFile()
-                    {
-                        Name = Path.GetFileName(repoFullPath),
-                        Directory = Path.GetDirectoryName(repoFullPath)!.NormalizePathToUnix(),
-                        Content = updatedContent,
-                    };
-                }
-            }
-
-            foreach (var project in discoveryResult.Projects)
-            {
-                await AddUpdatedFileIfDifferentAsync(discoveryResult.Path, project.FilePath);
-                var projectDirectory = Path.GetDirectoryName(project.FilePath);
-                foreach (var extraFile in project.ImportedFiles.Concat(project.AdditionalFiles))
-                {
-                    var extraFilePath = Path.Join(projectDirectory, extraFile);
-                    await AddUpdatedFileIfDifferentAsync(discoveryResult.Path, extraFilePath);
-                }
-                // TODO: handle global.json, etc.
-            }
-
-            if (updatedDependencyFiles.Count > 0)
-            {
-                var updatedDependencyFileList = updatedDependencyFiles
-                    .OrderBy(kvp => kvp.Key)
-                    .Select(kvp => kvp.Value)
-                    .ToArray();
-                var createPullRequest = new CreatePullRequest()
-                {
-                    Dependencies = actualUpdatedDependencies.ToArray(),
-                    UpdatedDependencyFiles = updatedDependencyFileList,
-                    BaseCommitSha = baseCommitSha,
-                    CommitMessage = "TODO: message",
-                    PrTitle = "TODO: title",
-                    PrBody = "TODO: body",
-                };
-                await _apiHandler.CreatePullRequest(createPullRequest);
-                // TODO: log updated dependencies to console
-            }
-            else
-            {
-                // TODO: log or throw if nothing was updated, but was expected to be
-            }
-        }
-        else
-        {
-            // TODO: throw if no updates performed
-        }
-
-        var result = new RunResult()
-        {
-            Base64DependencyFiles = originalDependencyFileContents.OrderBy(kvp => kvp.Key).Select(kvp =>
-            {
-                var fullPath = kvp.Key.FullyNormalizedRootedPath();
-                return new DependencyFile()
-                {
-                    Name = Path.GetFileName(fullPath),
-                    Content = Convert.ToBase64String(Encoding.UTF8.GetBytes(kvp.Value)),
-                    Directory = Path.GetDirectoryName(fullPath)!.NormalizePathToUnix(),
-                };
-            }).ToArray(),
-            BaseCommitSha = baseCommitSha,
-        };
         return result;
     }
 
-    internal static ImmutableArray<Requirement> GetIgnoredRequirementsForDependency(Job job, string dependencyName)
+    internal static ImmutableArray<UpdateOperationBase> PatchInOldVersions(ImmutableArray<UpdateOperationBase> updateOperations, ProjectDiscoveryResult? projectDiscovery)
     {
-        var ignoreConditions = job.IgnoreConditions
-            .Where(c => c.DependencyName.Equals(dependencyName, StringComparison.OrdinalIgnoreCase))
-            .ToArray();
-        if (ignoreConditions.Length == 1 && ignoreConditions[0].VersionRequirement is null)
+        if (projectDiscovery is null)
         {
-            // if only one match with no version requirement, ignore all versions
-            return [Requirement.Parse("> 0.0.0")];
+            return updateOperations;
         }
 
-        var ignoredVersions = ignoreConditions
+        var originalPackageVersions = projectDiscovery
+            .Dependencies
+            .ToDictionary(d => d.Name, d => d.Version is null ? null : NuGetVersion.Parse(d.Version), StringComparer.OrdinalIgnoreCase);
+        var patchedUpdateOperations = updateOperations
+            .Select(uo => uo with { OldVersion = originalPackageVersions.GetValueOrDefault(uo.DependencyName) })
+            .ToImmutableArray();
+        return patchedUpdateOperations;
+    }
+
+    internal static IEnumerable<(string ProjectPath, Dependency Dependency)> GetUpdateOperations(WorkspaceDiscoveryResult discovery)
+    {
+        // discovery is grouped by project/file then dependency, but we want to pivot and return a list of update operations sorted by dependency name then file path
+
+        var updateOrder = new Dictionary<string, Dictionary<string, Dictionary<string, Dependency>>>(StringComparer.OrdinalIgnoreCase);
+        //                     <dependency name,        <file path, specific dependencies>>
+
+        // collect
+        void CollectDependenciesForFile(string filePath, IEnumerable<Dependency> dependencies)
+        {
+            foreach (var dependency in dependencies)
+            {
+                var dependencyGroup = updateOrder.GetOrAdd(dependency.Name, () => new Dictionary<string, Dictionary<string, Dependency>>(PathComparer.Instance));
+                var dependenciesForFile = dependencyGroup.GetOrAdd(filePath, () => new Dictionary<string, Dependency>(StringComparer.OrdinalIgnoreCase));
+                dependenciesForFile[dependency.Name] = dependency;
+            }
+        }
+        foreach (var project in discovery.Projects)
+        {
+            var projectPath = Path.Join(discovery.Path, project.FilePath).FullyNormalizedRootedPath();
+            CollectDependenciesForFile(projectPath, project.Dependencies);
+        }
+
+        if (discovery.GlobalJson is not null)
+        {
+            var globalJsonPath = Path.Join(discovery.Path, discovery.GlobalJson.FilePath).FullyNormalizedRootedPath();
+            CollectDependenciesForFile(globalJsonPath, discovery.GlobalJson.Dependencies);
+        }
+
+        if (discovery.DotNetToolsJson is not null)
+        {
+            var dotnetToolsJsonPath = Path.Join(discovery.Path, discovery.DotNetToolsJson.FilePath).FullyNormalizedRootedPath();
+            CollectDependenciesForFile(dotnetToolsJsonPath, discovery.DotNetToolsJson.Dependencies);
+        }
+
+        // return
+        foreach (var dependencyName in updateOrder.Keys.OrderBy(k => k, StringComparer.OrdinalIgnoreCase))
+        {
+            var fileDependencies = updateOrder[dependencyName];
+            foreach (var filePath in fileDependencies.Keys.OrderBy(p => p, PathComparer.Instance))
+            {
+                var dependencies = fileDependencies[filePath];
+                var dependency = dependencies[dependencyName];
+                yield return (filePath, dependency);
+            }
+        }
+    }
+
+    internal static DependencyInfo GetDependencyInfo(Job job, Dependency dependency, IEnumerable<GroupMatcher> groupMatchers, bool allowCooldown)
+    {
+        var dependencyVersion = NuGetVersion.Parse(dependency.Version!);
+        var securityAdvisories = job.SecurityAdvisories.Where(s => s.DependencyName.Equals(dependency.Name, StringComparison.OrdinalIgnoreCase)).ToArray();
+        var isVulnerable = securityAdvisories.Any(s => (s.AffectedVersions ?? []).Any(v => v.IsSatisfiedBy(dependencyVersion)));
+        var ignoredVersions = job.IgnoreConditions
+            .Where(c => FileSystemName.MatchesSimpleExpression(c.DependencyName, dependency.Name))
             .Select(c => c.VersionRequirement)
             .Where(r => r is not null)
             .Cast<Requirement>()
             .ToImmutableArray();
-        return ignoredVersions;
+        var vulnerabilities = securityAdvisories.Select(s => new SecurityVulnerability()
+        {
+            DependencyName = dependency.Name,
+            PackageManager = "nuget",
+            VulnerableVersions = s.AffectedVersions ?? [],
+            SafeVersions = s.SafeVersions.ToImmutableArray(),
+        }).ToImmutableArray();
+        var ignoredUpdateTypes = job.IgnoreConditions
+            .Where(c => FileSystemName.MatchesSimpleExpression(c.DependencyName, dependency.Name))
+            .SelectMany(c => c.UpdateTypes ?? [])
+            .ToHashSet();
+
+        // if an update type isn't explicitly allowed by a group matcher, add it to the ignored set
+        foreach (var groupMatcher in groupMatchers)
+        {
+            if (groupMatcher.IsMatch(dependency.Name))
+            {
+                // group update types defaults to everything, so if it's not allowed then it's to be ignored
+                var allowedUpdateTypes = new HashSet<GroupUpdateType>(groupMatcher.UpdateTypes);
+                if (!allowedUpdateTypes.Contains(GroupUpdateType.Major))
+                {
+                    ignoredUpdateTypes.Add(ConditionUpdateType.SemVerMajor);
+                }
+                if (!allowedUpdateTypes.Contains(GroupUpdateType.Minor))
+                {
+                    ignoredUpdateTypes.Add(ConditionUpdateType.SemVerMinor);
+                }
+                if (!allowedUpdateTypes.Contains(GroupUpdateType.Patch))
+                {
+                    ignoredUpdateTypes.Add(ConditionUpdateType.SemVerPatch);
+                }
+            }
+        }
+
+        // while it would be nice to lift the cooldown options into the IgnoredUpdateTypes field, we don't know the
+        // publish date of the packages, so we have to pass along the whole object for the version finder to sort out
+        var includeCooldown = allowCooldown &&
+            job.Cooldown is not null &&
+            job.Cooldown.AppliesToPackage(dependency.Name);
+        var dependencyInfo = new DependencyInfo()
+        {
+            Name = dependency.Name,
+            Version = dependencyVersion.ToString(),
+            IsVulnerable = isVulnerable,
+            IgnoredVersions = ignoredVersions,
+            Vulnerabilities = vulnerabilities,
+            IgnoredUpdateTypes = [.. ignoredUpdateTypes.OrderBy(t => t)],
+            Cooldown = includeCooldown ? job.Cooldown : null,
+        };
+        return dependencyInfo;
     }
 
-    internal static UpdatedDependencyList GetUpdatedDependencyListFromDiscovery(WorkspaceDiscoveryResult discoveryResult, string pathToContents)
+    internal static string EnsureCorrectFileCasing(string repoRelativePath, string repoRoot, ILogger logger)
+    {
+        var fullPath = Path.Join(repoRoot, repoRelativePath);
+        var resolvedNames = PathHelper.ResolveCaseInsensitivePathsInsideRepoRoot(fullPath, repoRoot);
+        if (resolvedNames is null)
+        {
+            logger.Info($"Unable to resolve correct case for file [{repoRelativePath}]; returning original.");
+            return repoRelativePath;
+        }
+
+        if (resolvedNames.Count != 1)
+        {
+            logger.Info($"Expected exactly 1 normalized file path for [{repoRelativePath}], instead found {resolvedNames.Count}: {string.Join(", ", resolvedNames)}");
+            return repoRelativePath;
+        }
+
+        var resolvedName = resolvedNames[0];
+        var relativeResolvedName = Path.GetRelativePath(repoRoot, resolvedName).FullyNormalizedRootedPath();
+        return relativeResolvedName;
+    }
+
+    internal static UpdatedDependencyList GetUpdatedDependencyListFromDiscovery(WorkspaceDiscoveryResult discoveryResult, string repoRoot, ILogger logger, HashSet<string> initiallyExistingFiles)
     {
         string GetFullRepoPath(string path)
         {
@@ -332,12 +279,17 @@ public class RunWorker
             return Path.Join(discoveryResult.Path, path).FullyNormalizedRootedPath();
         }
 
+        bool IsInitiallyPresent(string filePath)
+        {
+            return !ModifiedFilesTracker.IsFileNotInitiallyPresent(Path.Join(discoveryResult.Path, filePath).NormalizePathToUnix(), initiallyExistingFiles);
+        }
+
         var auxiliaryFiles = new List<string>();
-        if (discoveryResult.GlobalJson is not null)
+        if (discoveryResult.GlobalJson is not null && IsInitiallyPresent(discoveryResult.GlobalJson.FilePath))
         {
             auxiliaryFiles.Add(GetFullRepoPath(discoveryResult.GlobalJson.FilePath));
         }
-        if (discoveryResult.DotNetToolsJson is not null)
+        if (discoveryResult.DotNetToolsJson is not null && IsInitiallyPresent(discoveryResult.DotNetToolsJson.FilePath))
         {
             auxiliaryFiles.Add(GetFullRepoPath(discoveryResult.DotNetToolsJson.FilePath));
         }
@@ -348,43 +300,94 @@ public class RunWorker
             foreach (var extraFile in project.ImportedFiles.Concat(project.AdditionalFiles))
             {
                 var extraFileFullPath = Path.Join(projectDirectory, extraFile);
+                if (!IsInitiallyPresent(extraFileFullPath))
+                {
+                    continue;
+                }
+
                 var extraFileRepoPath = GetFullRepoPath(extraFileFullPath);
                 auxiliaryFiles.Add(extraFileRepoPath);
             }
         }
 
+        var allDependenciesWithFilePath = discoveryResult.Projects
+            .Where(p => IsInitiallyPresent(p.FilePath))
+            .SelectMany(p =>
+            {
+                return p.Dependencies
+                    .Where(d => d.Version is not null)
+                    .Select(d =>
+                        (p.FilePath, new ReportedDependency()
+                        {
+                            Name = d.Name,
+                            Requirements = [new ReportedRequirement()
+                                {
+                                    File = GetFullRepoPath(p.FilePath),
+                                    Requirement = d.Version!,
+                                    Groups = ["dependencies"],
+                                }],
+                            Version = d.Version,
+                        }));
+            }).ToList();
+
+        var nonProjectDependencySet = new (string?, IEnumerable<Dependency>)[]
+        {
+            (discoveryResult.GlobalJson is not null && IsInitiallyPresent(discoveryResult.GlobalJson.FilePath) ? discoveryResult.GlobalJson.FilePath : null, discoveryResult.GlobalJson?.Dependencies ?? []),
+            (discoveryResult.DotNetToolsJson is not null && IsInitiallyPresent(discoveryResult.DotNetToolsJson.FilePath) ? discoveryResult.DotNetToolsJson.FilePath : null, discoveryResult.DotNetToolsJson?.Dependencies ?? []),
+        };
+
+        foreach (var (filePath, dependencies) in nonProjectDependencySet)
+        {
+            if (filePath is null)
+            {
+                continue;
+            }
+
+            allDependenciesWithFilePath.AddRange(dependencies
+                .Where(d => d.Version is not null)
+                .Select(d =>
+                    (filePath, new ReportedDependency()
+                    {
+                        Name = d.Name,
+                        Requirements = [new ReportedRequirement()
+                            {
+                                File = GetFullRepoPath(filePath),
+                                Requirement = d.Version!,
+                                Groups = ["dependencies"],
+                            }],
+                        Version = d.Version,
+                    })));
+        }
+
+        var sortedDependencies = allDependenciesWithFilePath
+            .OrderBy(pair => Path.Join(discoveryResult.Path, pair.FilePath).FullyNormalizedRootedPath(), PathComparer.Instance)
+            .ThenBy(pair => pair.Item2.Name, StringComparer.OrdinalIgnoreCase)
+            .Select(pair => pair.Item2)
+            .ToArray();
+
         var dependencyFiles = discoveryResult.Projects
+            .Where(p => IsInitiallyPresent(p.FilePath))
             .Select(p => GetFullRepoPath(p.FilePath))
             .Concat(auxiliaryFiles)
+            .Select(p => EnsureCorrectFileCasing(p, repoRoot, logger))
             .Distinct()
             .OrderBy(p => p)
             .ToArray();
+
         var updatedDependencyList = new UpdatedDependencyList()
         {
-            Dependencies = discoveryResult.Projects.SelectMany(p =>
-            {
-                return p.Dependencies.Where(d => d.Version is not null).Select(d =>
-                    new ReportedDependency()
-                    {
-                        Name = d.Name,
-                        Requirements = d.IsTransitive ? [] : [new ReportedRequirement()
-                        {
-                            File = GetFullRepoPath(p.FilePath),
-                            Requirement = d.Version!,
-                            Groups = ["dependencies"],
-                        }],
-                        Version = d.Version,
-                    }
-                );
-            }).ToArray(),
+            Dependencies = sortedDependencies,
             DependencyFiles = dependencyFiles,
         };
         return updatedDependencyList;
     }
 
-    public static JobFile Deserialize(string json)
+    public static JobFile Deserialize(string json) => Deserialize(json, new ConsoleLogger());
+
+    public static JobFile Deserialize(string json, ILogger logger)
     {
-        var jobFile = JsonSerializer.Deserialize<JobFile>(json, SerializerOptions);
+        var options = GetDeserializerOptions(logger);
+        var jobFile = JsonSerializer.Deserialize<JobFile>(json, options);
         if (jobFile is null)
         {
             throw new InvalidOperationException("Unable to deserialize job wrapper.");
@@ -396,5 +399,84 @@ public class RunWorker
         }
 
         return jobFile;
+    }
+
+    internal static JsonSerializerOptions GetDeserializerOptions(ILogger logger)
+    {
+        var options = new JsonSerializerOptions(SerializerOptions);
+        options.Converters.Insert(0, new JobCommandConverter(logger));
+        return options;
+    }
+
+    internal static string AddInsecureConnectionsAttribute(string nugetConfigContents)
+    {
+        try
+        {
+            var doc = XDocument.Parse(nugetConfigContents, LoadOptions.PreserveWhitespace);
+            var ns = doc.Root?.Name.Namespace ?? XNamespace.None;
+            var packageSources = doc.Root?.Element(ns + "packageSources");
+            if (packageSources is null)
+            {
+                return nugetConfigContents;
+            }
+
+            foreach (var addElement in packageSources.Elements(ns + "add"))
+            {
+                if (addElement.Attribute("allowInsecureConnections") is not null)
+                {
+                    continue;
+                }
+
+                var valueAttr = addElement.Attribute("value");
+                if (valueAttr is null)
+                {
+                    continue;
+                }
+
+                if (valueAttr.Value.StartsWith("http://", StringComparison.OrdinalIgnoreCase))
+                {
+                    addElement.SetAttributeValue("allowInsecureConnections", "true");
+                }
+            }
+
+            var result = doc.ToString(SaveOptions.DisableFormatting);
+            if (doc.Declaration is not null)
+            {
+                result = doc.Declaration.ToString() + result;
+            }
+
+            return result;
+        }
+        catch
+        {
+            return nugetConfigContents;
+        }
+    }
+
+    /// <summary>
+    /// Scans the repo for all NuGet.Config files (case-insensitive) and adds
+    /// <c>allowInsecureConnections="true"</c> to any package source using an <c>http://</c> URL.
+    /// This allows NuGet to restore from insecure feeds without requiring the attribute to be
+    /// present in the original config file.
+    /// </summary>
+    private static async Task PatchNuGetConfigFilesAsync(DirectoryInfo repoContentsPath)
+    {
+        var options = new EnumerationOptions
+        {
+            RecurseSubdirectories = true,
+            MatchCasing = MatchCasing.CaseInsensitive,
+            IgnoreInaccessible = true,
+        };
+        var configFiles = Directory.EnumerateFiles(repoContentsPath.FullName, "nuget.config", options);
+
+        foreach (var configFile in configFiles)
+        {
+            var contents = await File.ReadAllTextAsync(configFile);
+            var patched = AddInsecureConnectionsAttribute(contents);
+            if (patched != contents)
+            {
+                await File.WriteAllTextAsync(configFile, patched);
+            }
+        }
     }
 }

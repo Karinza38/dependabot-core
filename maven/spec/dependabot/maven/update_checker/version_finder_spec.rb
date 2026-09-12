@@ -1,4 +1,4 @@
-# typed: false
+# typed: strict
 # frozen_string_literal: true
 
 require "spec_helper"
@@ -15,7 +15,8 @@ RSpec.describe Dependabot::Maven::UpdateChecker::VersionFinder do
       credentials: credentials,
       ignored_versions: ignored_versions,
       raise_on_ignored: raise_on_ignored,
-      security_advisories: security_advisories
+      security_advisories: security_advisories,
+      cooldown_options: cooldown_options
     )
   end
   let(:version_class) { Dependabot::Maven::Version }
@@ -23,6 +24,7 @@ RSpec.describe Dependabot::Maven::UpdateChecker::VersionFinder do
   let(:ignored_versions) { [] }
   let(:raise_on_ignored) { false }
   let(:security_advisories) { [] }
+  let(:cooldown_options) { nil }
 
   let(:dependency) do
     Dependabot::Dependency.new(
@@ -57,11 +59,18 @@ RSpec.describe Dependabot::Maven::UpdateChecker::VersionFinder do
     "https://repo.maven.apache.org/maven2/" \
       "com/google/guava/guava/maven-metadata.xml"
   end
+  let(:maven_central_base_url_with_slash) do
+    "https://repo.maven.apache.org/maven2/" \
+      "com/google/guava/guava/"
+  end
   let(:maven_central_metadata_url_mockk) do
     "https://repo.maven.apache.org/maven2/io/mockk/mockk/maven-metadata.xml"
   end
   let(:maven_central_releases) do
     fixture("maven_central_metadata", "with_release.xml")
+  end
+  let(:maven_central_release_base) do
+    fixture("maven_central_metadata", "with_release.html")
   end
   let(:maven_central_releases_mockk) do
     fixture("maven_central_metadata", "mockk_with_release.xml")
@@ -78,12 +87,25 @@ RSpec.describe Dependabot::Maven::UpdateChecker::VersionFinder do
   before do
     stub_request(:get, maven_central_metadata_url)
       .to_return(status: 200, body: maven_central_releases)
+    stub_request(:get, maven_central_base_url_with_slash)
+      .to_return(status: 200, body: maven_central_release_base)
     stub_request(:head, maven_central_version_files_url)
       .to_return(status: 200)
     stub_request(:get, maven_central_metadata_url_mockk)
       .to_return(status: 200, body: maven_central_releases_mockk)
     stub_request(:head, mockk_maven_central_version_files_url)
       .to_return(status: 200)
+  end
+
+  describe "class extension behavior" do
+    it "inherits from SharedVersionFinder" do
+      expect(described_class < Dependabot::Maven::Shared::SharedVersionFinder).to be true
+    end
+
+    it "matches_dependency_version_type? is reused from the shared class" do
+      method_owner = described_class.instance_method(:matches_dependency_version_type?).owner
+      expect(method_owner).to eq(Dependabot::Maven::Shared::SharedVersionFinder)
+    end
   end
 
   describe "#latest_version_details when the dependency has a classifier" do
@@ -125,6 +147,8 @@ RSpec.describe Dependabot::Maven::UpdateChecker::VersionFinder do
 
       before do
         stub_request(:head, maven_central_version_files_url)
+          .to_return(status: 404)
+        stub_request(:head, maven_central_version_files_url.sub(/\.jar$/, ".pom"))
           .to_return(status: 404)
         stub_request(:head, old_maven_central_version_files_url)
           .to_return(status: 200)
@@ -341,12 +365,14 @@ RSpec.describe Dependabot::Maven::UpdateChecker::VersionFinder do
 
     context "with a repository from credentials" do
       let(:credentials) do
-        [Dependabot::Credential.new({
-          "type" => "maven_repository",
-          "url" => "https://private.registry.org/repo/",
-          "username" => "dependabot",
-          "password" => "dependabotPassword"
-        })]
+        [Dependabot::Credential.new(
+          {
+            "type" => "maven_repository",
+            "url" => "https://private.registry.org/repo/",
+            "username" => "dependabot",
+            "password" => "dependabotPassword"
+          }
+        )]
       end
 
       let(:private_registry_metadata_url) do
@@ -365,22 +391,26 @@ RSpec.describe Dependabot::Maven::UpdateChecker::VersionFinder do
       its([:version]) { is_expected.to eq(version_class.new("23.6-jre")) }
 
       its([:source_url]) do
-        is_expected.to eq("https://private.registry.org/repo")
+        is_expected.to eq("https://repo.maven.apache.org/maven2")
       end
 
       context "when gitlab maven repository is used" do
         let(:credentials) do
           [
-            Dependabot::Credential.new({
-              "type" => "maven_repository",
-              "url" => "https://private.registry.org/api/v4/groups/-/packages/maven/"
-            }),
-            Dependabot::Credential.new({
-              "type" => "git_source",
-              "host" => "private.registry.org",
-              "username" => "x-access-token",
-              "password" => "customToken"
-            })
+            Dependabot::Credential.new(
+              {
+                "type" => "maven_repository",
+                "url" => "https://private.registry.org/api/v4/groups/-/packages/maven/"
+              }
+            ),
+            Dependabot::Credential.new(
+              {
+                "type" => "git_source",
+                "host" => "private.registry.org",
+                "username" => "x-access-token",
+                "password" => "customToken"
+              }
+            )
           ]
         end
 
@@ -406,12 +436,59 @@ RSpec.describe Dependabot::Maven::UpdateChecker::VersionFinder do
         end
       end
 
+      context "when the dependency exists in more than one repository, it should check all the repositories" do
+        let(:credentials) do
+          [
+            Dependabot::Credential.new(
+              {
+                "type" => "maven_repository",
+                "url" => "https://repo.jenkins-ci.org/releases/"
+              }
+            )
+          ]
+        end
+
+        let(:jenkins_releases) do
+          fixture("maven_central_metadata", "with_release_older_version.xml")
+        end
+
+        let(:maven_central_releases) do
+          fixture("maven_central_metadata", "with_release.xml")
+        end
+
+        before do
+          # The Jenkins repo returns an older version
+          stub_request(:get, "https://repo.jenkins-ci.org/releases/com/google/guava/guava/maven-metadata.xml")
+            .to_return(status: 200, body: jenkins_releases)
+          stub_request(:head, "https://repo.jenkins-ci.org/releases/com/google/guava/guava/10.0/guava-10.0-jre.jar")
+            .to_return(status: 200)
+          stub_request(:head, "https://repo.jenkins-ci.org/releases/com/google/guava/guava/23.6-jre/guava-23.6-jre.jar")
+            .to_return(status: 404)
+          stub_request(:head, "https://repo.jenkins-ci.org/releases/com/google/guava/guava/23.6-jre/guava-23.6-jre.pom")
+            .to_return(status: 404)
+
+          # In central, we have a newer version
+          stub_request(:get, "https://repo.maven.apache.org/maven2/com/google/guava/guava/maven-metadata.xml")
+            .to_return(status: 200, body: maven_central_releases)
+          stub_request(:head, "https://repo.maven.apache.org/maven2/com/google/guava/guava/23.6-jre/guava-23.6-jre.jar")
+            .to_return(status: 200)
+        end
+
+        its([:version]) { is_expected.to eq(version_class.new("23.6-jre")) }
+
+        its([:source_url]) do
+          is_expected.to eq("https://repo.maven.apache.org/maven2")
+        end
+      end
+
       context "when there is no auth details" do
         let(:credentials) do
-          [Dependabot::Credential.new({
-            "type" => "maven_repository",
-            "url" => "https://private.registry.org/repo/"
-          })]
+          [Dependabot::Credential.new(
+            {
+              "type" => "maven_repository",
+              "url" => "https://private.registry.org/repo/"
+            }
+          )]
         end
 
         before do
@@ -422,7 +499,7 @@ RSpec.describe Dependabot::Maven::UpdateChecker::VersionFinder do
         its([:version]) { is_expected.to eq(version_class.new("23.6-jre")) }
 
         its([:source_url]) do
-          is_expected.to eq("https://private.registry.org/repo")
+          is_expected.to eq("https://repo.maven.apache.org/maven2")
         end
 
         context "when credentials are required" do
@@ -447,32 +524,42 @@ RSpec.describe Dependabot::Maven::UpdateChecker::VersionFinder do
     context "with multiple repositories from credentials" do
       let(:credentials) do
         [
-          Dependabot::Credential.new({
-            "type" => "maven_repository",
-            "url" => "https://private.registry.org/repo/",
-            "username" => "dependabot",
-            "password" => "dependabotPassword"
-          }),
-          Dependabot::Credential.new({
-            "type" => "maven_repository",
-            "url" => "https://private.registry.org/repo/"
-          }),
-          Dependabot::Credential.new({
-            "type" => "maven_repository",
-            "url" => "https://private.registry.org/repo2/",
-            "username" => "dependabot2",
-            "password" => "dependabotPassword2"
-          }),
-          Dependabot::Credential.new({
-            "type" => "maven_repository",
-            "url" => "https://private.registry.org/api/v4/groups/-/packages/maven/"
-          }),
-          Dependabot::Credential.new({
-            "type" => "git_source",
-            "host" => "private.registry.org",
-            "username" => "x-access-token",
-            "password" => "customToken"
-          })
+          Dependabot::Credential.new(
+            {
+              "type" => "maven_repository",
+              "url" => "https://private.registry.org/repo/",
+              "username" => "dependabot",
+              "password" => "dependabotPassword"
+            }
+          ),
+          Dependabot::Credential.new(
+            {
+              "type" => "maven_repository",
+              "url" => "https://private.registry.org/repo/"
+            }
+          ),
+          Dependabot::Credential.new(
+            {
+              "type" => "maven_repository",
+              "url" => "https://private.registry.org/repo2/",
+              "username" => "dependabot2",
+              "password" => "dependabotPassword2"
+            }
+          ),
+          Dependabot::Credential.new(
+            {
+              "type" => "maven_repository",
+              "url" => "https://private.registry.org/api/v4/groups/-/packages/maven/"
+            }
+          ),
+          Dependabot::Credential.new(
+            {
+              "type" => "git_source",
+              "host" => "private.registry.org",
+              "username" => "x-access-token",
+              "password" => "customToken"
+            }
+          )
         ]
       end
 
@@ -519,8 +606,20 @@ RSpec.describe Dependabot::Maven::UpdateChecker::VersionFinder do
 
       it "raises a helpful error" do
         expect { latest_version_details }.to raise_error(Dependabot::DependencyFileNotResolvable) do |error|
-          expect(error.message).to start_with("bad URI(is not URI?): \"http://host:port/content/groups/public")
+          expect(error.message).to start_with("bad URI (is not URI?): \"http://host:port/content/groups/public")
         end
+      end
+    end
+
+    context "with an invalid repository url specified" do
+      let(:dependency_files) { project_dependency_files("invalid_repository_url") }
+
+      before do
+        stub_request(:get, maven_central_metadata_url).to_raise(Excon::Error::Timeout)
+      end
+
+      it "raises a helpful error" do
+        expect { latest_version_details }.to raise_error(Dependabot::RegistryError)
       end
     end
 
@@ -537,9 +636,13 @@ RSpec.describe Dependabot::Maven::UpdateChecker::VersionFinder do
           "com/google/guava/guava/23.6-jre/guava-23.6-jre.jar"
       end
 
-      let(:jboss_metadata_url) do
+      let(:jboss_base_url) do
         "http://repository.jboss.org/maven2/" \
-          "com/google/guava/guava/maven-metadata.xml"
+          "com/google/guava/guava"
+      end
+
+      let(:jboss_metadata_url) do
+        "#{jboss_base_url}/maven-metadata.xml"
       end
 
       let(:jboss_plugins_metadata_url) do
@@ -567,6 +670,11 @@ RSpec.describe Dependabot::Maven::UpdateChecker::VersionFinder do
             status: 200,
             body: fixture("maven_central_metadata", "with_release.xml")
           )
+        stub_request(:get, jboss_base_url)
+          .to_return(
+            status: 200,
+            body: fixture("maven_central_metadata", "with_release.html")
+          )
         stub_request(:get, jboss_plugins_metadata_url)
           .to_return(status: 404, body: "")
         stub_request(:head, maven_central_version_files_url)
@@ -583,6 +691,232 @@ RSpec.describe Dependabot::Maven::UpdateChecker::VersionFinder do
 
       its([:source_url]) do
         is_expected.to eq("http://repository.jboss.org/maven2")
+      end
+    end
+
+    context "with cooldown options" do
+      let(:cooldown_options) do
+        Dependabot::Package::ReleaseCooldownOptions.new(
+          default_days: 20 # Now is 2017-12-14 , 23.5-jre release date: 2017-11-22
+        )
+      end
+
+      let(:pom_fixture_name) { "custom_repositories_pom.xml" }
+
+      let(:scala_tools_metadata_url) do
+        "http://scala-tools.org/repo-releases/" \
+          "com/google/guava/guava/maven-metadata.xml"
+      end
+
+      let(:scala_tools_version_files_url) do
+        "http://scala-tools.org/repo-releases/" \
+          "com/google/guava/guava/23.5-jre/guava-23.5-jre.jar"
+      end
+
+      let(:jboss_base_url) do
+        "http://repository.jboss.org/maven2/" \
+          "com/google/guava/guava"
+      end
+
+      let(:jboss_metadata_url) do
+        "#{jboss_base_url}/maven-metadata.xml"
+      end
+
+      let(:jboss_plugins_metadata_url) do
+        "http://plugin-repository.jboss.org/maven2/" \
+          "com/google/guava/guava/maven-metadata.xml"
+      end
+
+      let(:jboss_plugins_version_files_url) do
+        "http://plugin-repository.jboss.org/maven2/" \
+          "com/google/guava/guava/23.5-jre/guava-23.5-jre.jar"
+      end
+
+      let(:jboss_version_files_url) do
+        "http://repository.jboss.org/maven2/" \
+          "com/google/guava/guava/23.5-jre/guava-23.5-jre.jar"
+      end
+
+      before do
+        # Time: @released_at=2017-11-09
+        allow(Time).to receive(:now).and_return(Time.local(2017, 12, 14, 0, 0, 0))
+
+        # Mocking the HTTP requests for the different repositories
+        stub_request(:get, maven_central_metadata_url)
+          .to_return(status: 404, body: "")
+        stub_request(:get, scala_tools_metadata_url)
+          .to_raise(Excon::Error::Timeout)
+        stub_request(:get, jboss_metadata_url)
+          .to_return(
+            status: 200,
+            body: fixture("maven_central_metadata", "with_release.xml")
+          )
+        stub_request(:get, "#{jboss_base_url}/")
+          .to_return(
+            status: 200,
+            body: fixture("maven_central_metadata", "with_release.html")
+          )
+        stub_request(:get, jboss_plugins_metadata_url)
+          .to_return(status: 404, body: "")
+        stub_request(:head, maven_central_version_files_url)
+          .to_return(status: 404)
+        stub_request(:head, scala_tools_version_files_url)
+          .to_return(status: 404)
+        stub_request(:head, jboss_plugins_version_files_url)
+          .to_return(status: 404)
+        stub_request(:head, jboss_version_files_url)
+          .to_return(status: 200)
+      end
+
+      its([:version]) { is_expected.to eq(version_class.new("23.5-jre")) }
+
+      its([:source_url]) do
+        is_expected.to eq("http://repository.jboss.org/maven2")
+      end
+    end
+
+    context "with cooldown options and a repository without directory listings" do
+      let(:dependency_version) { "1.0.0" }
+      let(:cooldown_options) do
+        Dependabot::Package::ReleaseCooldownOptions.new(default_days: 14)
+      end
+      let(:maven_metadata) do
+        <<~XML
+          <metadata>
+            <groupId>com.google.guava</groupId>
+            <artifactId>guava</artifactId>
+            <versioning>
+              <latest>1.2.0</latest>
+              <release>1.2.0</release>
+              <versions>
+                <version>1.0.0</version>
+                <version>1.1.0</version>
+                <version>1.2.0</version>
+              </versions>
+            </versioning>
+          </metadata>
+        XML
+      end
+      let(:version_1_2_pom_url) do
+        "https://repo.maven.apache.org/maven2/com/google/guava/guava/1.2.0/guava-1.2.0.pom"
+      end
+      let(:version_1_1_pom_url) do
+        "https://repo.maven.apache.org/maven2/com/google/guava/guava/1.1.0/guava-1.1.0.pom"
+      end
+      let(:version_1_0_pom_url) do
+        "https://repo.maven.apache.org/maven2/com/google/guava/guava/1.0.0/guava-1.0.0.pom"
+      end
+      let(:version_1_1_jar_url) do
+        "https://repo.maven.apache.org/maven2/com/google/guava/guava/1.1.0/guava-1.1.0.jar"
+      end
+      let(:version_1_2_jar_url) do
+        "https://repo.maven.apache.org/maven2/com/google/guava/guava/1.2.0/guava-1.2.0.jar"
+      end
+      let(:version_1_0_jar_url) do
+        "https://repo.maven.apache.org/maven2/com/google/guava/guava/1.0.0/guava-1.0.0.jar"
+      end
+
+      before do
+        allow(Time).to receive(:now).and_return(Time.utc(2026, 8, 17))
+        stub_request(:get, maven_central_metadata_url).to_return(status: 200, body: maven_metadata)
+        stub_request(:get, maven_central_base_url_with_slash).to_return(status: 404)
+        stub_request(:head, version_1_2_pom_url).to_return(
+          status: 200,
+          headers: { "Last-Modified" => "Mon, 10 Aug 2026 10:08:43 GMT" }
+        )
+        stub_request(:head, version_1_1_pom_url).to_return(
+          status: 200,
+          headers: { "Last-Modified" => "Wed, 01 Jul 2026 10:08:43 GMT" }
+        )
+        stub_request(:head, version_1_1_jar_url).to_return(status: 200)
+      end
+
+      it "selects the newest release outside the cooldown window" do
+        expect(latest_version_details[:version]).to eq(version_class.new("1.1.0"))
+      end
+
+      it "loads fallback metadata lazily" do
+        latest_version_details
+
+        expect(a_request(:head, version_1_2_pom_url)).to have_been_made.once
+        expect(a_request(:head, version_1_1_pom_url)).to have_been_made.once
+        expect(a_request(:head, version_1_0_pom_url)).not_to have_been_made
+      end
+
+      context "when the fallback cannot resolve a release date" do
+        before do
+          stub_request(:head, version_1_2_pom_url).to_return(status: 200, headers: {})
+          stub_request(:head, version_1_2_jar_url).to_return(status: 200)
+        end
+
+        it "selects the release and marks the unavailable cooldown date" do
+          expect(latest_version_details[:version]).to eq(version_class.new("1.2.0"))
+          expect(dependency.metadata[:cooldown_date_unavailable]).to be(true)
+        end
+      end
+
+      context "when the dependency is not included in the cooldown configuration" do
+        let(:cooldown_options) do
+          Dependabot::Package::ReleaseCooldownOptions.new(default_days: 14, include: ["org.example:*"])
+        end
+
+        before do
+          stub_request(:head, version_1_2_jar_url).to_return(status: 200)
+        end
+
+        it "selects the newest release without issuing fallback requests" do
+          expect(latest_version_details[:version]).to eq(version_class.new("1.2.0"))
+          expect(dependency.metadata[:cooldown_date_unavailable]).not_to be(true)
+          expect(a_request(:head, version_1_2_pom_url)).not_to have_been_made
+          expect(a_request(:head, version_1_1_pom_url)).not_to have_been_made
+          expect(a_request(:head, version_1_0_pom_url)).not_to have_been_made
+        end
+      end
+
+      context "when the newest eligible release is not actually published" do
+        before do
+          stub_request(:head, version_1_1_pom_url).to_return(status: 404)
+          stub_request(:head, version_1_1_jar_url).to_return(status: 404)
+          stub_request(:head, version_1_0_pom_url).to_return(
+            status: 200,
+            headers: { "Last-Modified" => "Wed, 01 Jul 2026 10:08:43 GMT" }
+          )
+          stub_request(:head, version_1_0_jar_url).to_return(status: 200)
+        end
+
+        it "continues to the next released version" do
+          expect(latest_version_details[:version]).to eq(version_class.new("1.0.0"))
+        end
+      end
+
+      context "when every release is inside the cooldown window" do
+        before do
+          stub_request(:head, version_1_1_pom_url).to_return(
+            status: 200,
+            headers: { "Last-Modified" => "Mon, 10 Aug 2026 10:08:43 GMT" }
+          )
+          stub_request(:head, version_1_0_pom_url).to_return(
+            status: 200,
+            headers: { "Last-Modified" => "Mon, 10 Aug 2026 10:08:43 GMT" }
+          )
+          stub_request(:head, version_1_0_jar_url).to_return(status: 200)
+        end
+
+        it "falls back to the current version" do
+          expect(latest_version_details[:version]).to eq(version_class.new("1.0.0"))
+        end
+      end
+    end
+
+    context "when the release has a nil version" do
+      before do
+        allow(finder).to receive(:fetch_latest_release).and_return(
+          instance_double(Dependabot::Package::PackageRelease, version: nil, url: "https://repo.maven.apache.org/maven2")
+        )
+      end
+
+      it "returns nil" do
+        expect(latest_version_details).to be_nil
       end
     end
   end
@@ -628,6 +962,8 @@ RSpec.describe Dependabot::Maven::UpdateChecker::VersionFinder do
       before do
         stub_request(:head, maven_central_version_files_url)
           .to_return(status: 404)
+        stub_request(:head, maven_central_version_files_url.sub(/\.jar$/, ".pom"))
+          .to_return(status: 404)
         stub_request(:head, next_maven_central_version_files_url)
           .to_return(status: 200)
       end
@@ -646,7 +982,9 @@ RSpec.describe Dependabot::Maven::UpdateChecker::VersionFinder do
         let(:raise_on_ignored) { true }
 
         it "raises an error" do
-          expect { lowest_security_fix_version_details }.to raise_error(Dependabot::AllVersionsIgnored)
+          expect { lowest_security_fix_version_details }.to raise_error(
+            Dependabot::AllVersionsIgnored
+          )
         end
       end
     end
@@ -662,29 +1000,41 @@ RSpec.describe Dependabot::Maven::UpdateChecker::VersionFinder do
         end
       end
     end
+
+    context "when the release has a nil version" do
+      before do
+        allow(finder).to receive(:fetch_lowest_security_fix_release).and_return(
+          instance_double(Dependabot::Package::PackageRelease, version: nil, url: "https://repo.maven.apache.org/maven2")
+        )
+      end
+
+      it "returns nil" do
+        expect(lowest_security_fix_version_details).to be_nil
+      end
+    end
   end
 
-  describe "#versions" do
-    subject(:versions) { finder.versions }
+  describe "#releases" do
+    subject(:releases) { finder.releases }
 
     its(:count) { is_expected.to eq(70) }
 
-    describe "the first version" do
-      subject { versions.first }
+    describe "the first release" do
+      subject { releases.first }
 
-      its([:version]) { is_expected.to eq(version_class.new("r03")) }
+      its(:version) { is_expected.to eq(version_class.new("r03")) }
 
-      its([:source_url]) do
+      its(:url) do
         is_expected.to eq("https://repo.maven.apache.org/maven2")
       end
     end
 
-    describe "the last version" do
-      subject { versions.last }
+    describe "the last release" do
+      subject { releases.last }
 
-      its([:version]) { is_expected.to eq(version_class.new("23.7-rc1-jre")) }
+      its(:version) { is_expected.to eq(version_class.new("23.7-rc1-jre")) }
 
-      its([:source_url]) do
+      its(:url) do
         is_expected.to eq("https://repo.maven.apache.org/maven2")
       end
     end
@@ -727,22 +1077,22 @@ RSpec.describe Dependabot::Maven::UpdateChecker::VersionFinder do
           .to_return(status: 404, body: "")
       end
 
-      describe "the first version" do
-        subject { versions.first }
+      describe "the first release" do
+        subject { releases.first }
 
-        its([:version]) { is_expected.to eq(version_class.new("r03")) }
+        its(:version) { is_expected.to eq(version_class.new("r03")) }
 
-        its([:source_url]) do
+        its(:url) do
           is_expected.to eq("http://repository.jboss.org/maven2")
         end
       end
 
-      describe "the last version" do
-        subject { versions.last }
+      describe "the last release" do
+        subject { releases.last }
 
-        its([:version]) { is_expected.to eq(version_class.new("23.7-rc1-jre")) }
+        its(:version) { is_expected.to eq(version_class.new("23.7-rc1-jre")) }
 
-        its([:source_url]) do
+        its(:url) do
           is_expected.to eq("http://repository.jboss.org/maven2")
         end
       end
@@ -760,22 +1110,22 @@ RSpec.describe Dependabot::Maven::UpdateChecker::VersionFinder do
 
         its(:count) { is_expected.to eq(17) }
 
-        describe "the first version" do
-          subject { versions.first }
+        describe "the first release" do
+          subject { releases.first }
 
-          its([:version]) { is_expected.to eq(version_class.new("r01")) }
+          its(:version) { is_expected.to eq(version_class.new("r01")) }
 
-          its([:source_url]) do
+          its(:url) do
             is_expected.to eq("https://repo.maven.apache.org/maven2")
           end
         end
 
-        describe "the last version" do
-          subject { versions.last }
+        describe "the last release" do
+          subject { releases.last }
 
-          its([:version]) { is_expected.to eq(version_class.new("20040616")) }
+          its(:version) { is_expected.to eq(version_class.new("20040616")) }
 
-          its([:source_url]) do
+          its(:url) do
             is_expected.to eq("https://repo.maven.apache.org/maven2")
           end
         end

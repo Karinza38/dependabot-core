@@ -60,12 +60,14 @@ RSpec.describe Dependabot::Python::FileUpdater::PipCompileFileUpdater do
     }]
   end
   let(:credentials) do
-    [Dependabot::Credential.new({
-      "type" => "git_source",
-      "host" => "github.com",
-      "username" => "x-access-token",
-      "password" => "token"
-    })]
+    [Dependabot::Credential.new(
+      {
+        "type" => "git_source",
+        "host" => "github.com",
+        "username" => "x-access-token",
+        "password" => "token"
+      }
+    )]
   end
   let(:tmp_path) { Dependabot::Utils::BUMP_TMP_DIR_PATH }
 
@@ -99,6 +101,33 @@ RSpec.describe Dependabot::Python::FileUpdater::PipCompileFileUpdater do
           .to include("pbr==4.0.2\n    # via mock")
         expect(updated_files.first.content).to include("# This file is autogen")
         expect(updated_files.first.content).not_to include("--hash=sha")
+      end
+    end
+
+    context "with multiple output files from a single input file" do
+      let(:dependency_files) { [manifest_file, generated_file, generated_file2] }
+      let(:generated_file) do
+        Dependabot::DependencyFile.new(
+          name: "requirements/test.txt",
+          content: fixture("requirements", "pip_compile_multi_output_first.txt")
+        )
+      end
+      let(:generated_file2) do
+        Dependabot::DependencyFile.new(
+          name: "requirements/test-alt.txt",
+          content: fixture("requirements", "pip_compile_multi_output_second.txt")
+        )
+      end
+
+      it "updates both requirements.txt files" do
+        expect(updated_files.count).to eq(2)
+        updated_filenames = updated_files.map(&:name)
+        expect(updated_filenames).to include("requirements/test.txt")
+        expect(updated_filenames).to include("requirements/test-alt.txt")
+        updated_files.each do |file|
+          expect(file.content).to include("attrs==18.1.0")
+          expect(file.content).to include("# This file is autogen")
+        end
       end
     end
 
@@ -502,7 +531,7 @@ RSpec.describe Dependabot::Python::FileUpdater::PipCompileFileUpdater do
       it "raises an error indicating the dependencies are not resolvable", :slow do
         expect { updated_files }.to raise_error(Dependabot::DependencyFileNotResolvable) do |err|
           expect(err.message).to include(
-            "There are incompatible versions in the resolved dependencies:\n  pyyaml==6.0.1"
+            "There are incompatible versions in the resolved dependencies"
           )
         end
       end
@@ -531,10 +560,10 @@ RSpec.describe Dependabot::Python::FileUpdater::PipCompileFileUpdater do
       let(:dependency_version) { "5.2.7" }
       let(:dependency_previous_version) { "5.2.6" }
 
-      it "adds pycurl as dependency" do
+      it "adds boto3 as dependency" do
         expect(updated_files.count).to eq(1)
         expect(updated_files.first.content).to include("--resolver=backtracking")
-        expect(updated_files.first.content).to include("pycurl")
+        expect(updated_files.first.content).to include("boto3")
       end
     end
 
@@ -545,10 +574,10 @@ RSpec.describe Dependabot::Python::FileUpdater::PipCompileFileUpdater do
       let(:dependency_version) { "5.2.7" }
       let(:dependency_previous_version) { "5.2.6" }
 
-      it "do not include pycurl" do
+      it "do not include boto3" do
         expect(updated_files.count).to eq(1)
         expect(updated_files.first.content).to include("--resolver=legacy")
-        expect(updated_files.first.content).not_to include("pycurl")
+        expect(updated_files.first.content).not_to include("boto3")
       end
     end
   end
@@ -609,11 +638,13 @@ RSpec.describe Dependabot::Python::FileUpdater::PipCompileFileUpdater do
       end
 
       before do
-        allow(Dependabot::SharedHelpers).to receive(:run_helper_subprocess).with({
-          args: %w(package_name 1.0.0 sha256),
-          command: "pyenv exec python3 /opt/python/run.py",
-          function: "get_dependency_hash"
-        }).and_raise(
+        allow(Dependabot::SharedHelpers).to receive(:run_helper_subprocess).with(
+          {
+            args: %w(package_name 1.0.0 sha256),
+            command: "pyenv exec python3 /opt/python/run.py",
+            function: "get_dependency_hash"
+          }
+        ).and_raise(
           Dependabot::SharedHelpers::HelperSubprocessFailed.new(
             message: "Error message", error_context: {}, error_class: "PackageNotFoundError"
           )
@@ -630,6 +661,223 @@ RSpec.describe Dependabot::Python::FileUpdater::PipCompileFileUpdater do
       it "returns returns two hashes" do
         result = updater.send(:package_hashes_for, name: name, version: version, algorithm: algorithm)
         expect(result).to eq(["--hash=sha256:123abc"])
+      end
+    end
+
+    context "when index_url is a relative path" do
+      let(:updater) do
+        described_class.new(
+          dependencies: [],
+          dependency_files: [],
+          credentials: [],
+          index_urls: ["/pypi"]
+        )
+      end
+
+      before do
+        allow(Dependabot::SharedHelpers).to receive(:run_helper_subprocess).with(
+          {
+            args: %w(package_name 1.0.0 sha256 https://pypi.org),
+            command: "pyenv exec python3 /opt/python/run.py",
+            function: "get_dependency_hash"
+          }
+        ).and_return([{ "hash" => "abc123" }])
+      end
+
+      it "replaces relative index_url with https://pypi.org and returns hash" do
+        result = updater.send(:package_hashes_for, name: "package_name", version: "1.0.0", algorithm: "sha256")
+        expect(result).to eq(["--hash=sha256:abc123"])
+      end
+    end
+  end
+
+  describe "#updated_dependency_files command options" do
+    let(:language_version_manager) do
+      instance_double(
+        Dependabot::Python::LanguageVersionManager,
+        install_required_python: nil,
+        python_major_minor: "3.10"
+      )
+    end
+    let(:abort_error) do
+      Dependabot::SharedHelpers::HelperSubprocessFailed.new(
+        message: "stop after command assertion",
+        error_context: {},
+        error_class: "CommandAssertion"
+      )
+    end
+
+    before do
+      allow(updater).to receive(:language_version_manager).and_return(language_version_manager)
+    end
+
+    context "when an index returns nil hashes but a later index succeeds" do
+      let(:updater) do
+        described_class.new(
+          dependency_files: dependency_files,
+          dependencies: [dependency],
+          credentials: credentials,
+          index_urls: [nil, "http://example.com"]
+        )
+      end
+      let(:generated_file) do
+        Dependabot::DependencyFile.new(
+          name: "requirements/test.txt",
+          content: <<~TXT
+            #
+            # This file is autogenerated by pip-compile
+            #
+            attrs==17.3.0 \\
+                --hash=sha256:1c7960ccfd6a005cd9f7ba884e6316b5e430a3f1a6c37c5f87d8b43f83b54ec9 \\
+                --hash=sha256:a17a9573a6f475c99b551c0e0a812707ddda1ec9653bed04c13841404ed6f450
+          TXT
+        )
+      end
+      let(:compiled_content) do
+        <<~TXT
+          #
+          # This file is autogenerated by pip-compile
+          #
+          attrs==18.1.0 \\
+              --hash=sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
+        TXT
+      end
+
+      before do
+        allow(Dependabot::SharedHelpers).to receive(:run_shell_command) do |cmd, **_kwargs|
+          next "" unless cmd.start_with?("pyenv exec pip-compile")
+
+          File.write("requirements/test.txt", compiled_content)
+          ""
+        end
+
+        allow(Dependabot::SharedHelpers).to receive(:run_helper_subprocess)
+          .and_return(nil, [{ "hash" => "456def" }])
+      end
+
+      it "keeps the hashes returned by the working index in the generated file" do
+        expect(updater.updated_dependency_files.first.content).to include("--hash=sha256:456def")
+      end
+    end
+
+    context "when every index returns nil hashes" do
+      let(:updater) do
+        described_class.new(
+          dependency_files: dependency_files,
+          dependencies: [dependency],
+          credentials: credentials,
+          index_urls: [nil, "http://example.com"]
+        )
+      end
+      let(:generated_file) do
+        Dependabot::DependencyFile.new(
+          name: "requirements/test.txt",
+          content: <<~TXT
+            #
+            # This file is autogenerated by pip-compile
+            #
+            attrs==17.3.0 \\
+                --hash=sha256:1c7960ccfd6a005cd9f7ba884e6316b5e430a3f1a6c37c5f87d8b43f83b54ec9 \\
+                --hash=sha256:a17a9573a6f475c99b551c0e0a812707ddda1ec9653bed04c13841404ed6f450
+          TXT
+        )
+      end
+      let(:compiled_content) do
+        <<~TXT
+          #
+          # This file is autogenerated by pip-compile
+          #
+          attrs==18.1.0 \\
+              --hash=sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
+        TXT
+      end
+
+      before do
+        allow(Dependabot::SharedHelpers).to receive(:run_shell_command) do |cmd, **_kwargs|
+          next "" unless cmd.start_with?("pyenv exec pip-compile")
+
+          File.write("requirements/test.txt", compiled_content)
+          ""
+        end
+
+        allow(Dependabot::SharedHelpers).to receive(:run_helper_subprocess).and_return(nil)
+      end
+
+      it "raises DependencyFileNotResolvable instead of returning an empty hash list" do
+        expect { updater.updated_dependency_files }
+          .to raise_error(Dependabot::DependencyFileNotResolvable)
+      end
+    end
+
+    context "when lockfile header includes --unsafe-package" do
+      let(:generated_file) do
+        Dependabot::DependencyFile.new(
+          name: "requirements/test.txt",
+          content: <<~TXT
+            #
+            # This file is autogenerated by pip-compile
+            # To update, run:
+            #
+            #    pip-compile --output-file=requirements/test.txt --unsafe-package=aiohttp requirements/test.in
+            #
+            attrs==17.3.0
+          TXT
+        )
+      end
+
+      it "passes --unsafe-package to pip-compile" do
+        allow(Dependabot::SharedHelpers).to receive(:run_shell_command) do |cmd, **_kwargs|
+          next "" unless cmd.start_with?("pyenv exec pip-compile")
+
+          expect(cmd).to match(/--unsafe-package\\?=aiohttp/)
+          raise abort_error
+        end
+
+        expect { updater.updated_dependency_files }
+          .to raise_error(Dependabot::SharedHelpers::HelperSubprocessFailed, "stop after command assertion")
+      end
+    end
+
+    context "when .pip-tools.toml includes unsafe-package" do
+      let(:dependency_files) { [manifest_file, generated_file, pip_tools_config] }
+      let(:generated_file) do
+        Dependabot::DependencyFile.new(
+          name: "requirements/test.txt",
+          content: <<~TXT
+            #
+            # This file is autogenerated by pip-compile
+            # To update, run:
+            #
+            #    pip-compile --output-file=requirements/test.txt requirements/test.in
+            #
+            attrs==17.3.0
+          TXT
+        )
+      end
+      let(:pip_tools_config) do
+        Dependabot::DependencyFile.new(
+          name: ".pip-tools.toml",
+          content: <<~TOML
+            [pip-tools]
+            resolver = "backtracking"
+            strip-extras = true
+            unsafe-package = ["aiohttp"]
+          TOML
+        )
+      end
+
+      it "passes options derived from .pip-tools.toml to pip-compile" do
+        allow(Dependabot::SharedHelpers).to receive(:run_shell_command) do |cmd, **_kwargs|
+          next "" unless cmd.start_with?("pyenv exec pip-compile")
+
+          expect(cmd).to include("--strip-extras")
+          expect(cmd).to match(/--resolver\\?=backtracking/)
+          expect(cmd).to match(/--unsafe-package\\?=aiohttp/)
+          raise abort_error
+        end
+
+        expect { updater.updated_dependency_files }
+          .to raise_error(Dependabot::SharedHelpers::HelperSubprocessFailed, "stop after command assertion")
       end
     end
   end

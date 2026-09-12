@@ -5,6 +5,7 @@ require "spec_helper"
 require "dependabot/dependency"
 require "dependabot/dependency_file"
 require "dependabot/go_modules/file_updater/go_mod_updater"
+require "dependabot/go_modules/file_parser"
 
 RSpec.describe Dependabot::GoModules::FileUpdater::GoModUpdater do
   let(:updater) do
@@ -14,7 +15,7 @@ RSpec.describe Dependabot::GoModules::FileUpdater::GoModUpdater do
       credentials: credentials,
       repo_contents_path: repo_contents_path,
       directory: directory,
-      options: { tidy: tidy, vendor: false, goprivate: goprivate }
+      options: { tidy: tidy, vendor: false }
     )
   end
 
@@ -23,7 +24,6 @@ RSpec.describe Dependabot::GoModules::FileUpdater::GoModUpdater do
   let(:go_mod_content) { fixture("projects", project_name, "go.mod") }
   let(:tidy) { true }
   let(:directory) { "/" }
-  let(:goprivate) { "*" }
   let(:dependency_files) { [] }
 
   let(:credentials) { [] }
@@ -39,8 +39,23 @@ RSpec.describe Dependabot::GoModules::FileUpdater::GoModUpdater do
     )
   end
 
+  after do
+    ENV.delete("GOPRIVATE")
+  end
+
+  before do
+    ENV["GOPRIVATE"] = "*"
+  end
+
   describe "#updated_go_mod_content" do
     subject(:updated_go_mod_content) { updater.updated_go_mod_content }
+
+    shared_context "with go get command failure stubbed" do
+      before do
+        allow(Open3).to receive(:capture3).and_call_original
+        allow(Open3).to receive(:capture3).with(go_get_command).and_return(["", stderr, exit_status])
+      end
+    end
 
     context "when dealing with a grouped update" do
       let(:dependency_name) { "rsc.io/quote" }
@@ -121,28 +136,36 @@ RSpec.describe Dependabot::GoModules::FileUpdater::GoModUpdater do
         end
 
         context "with an unrestricted goprivate" do
-          let(:goprivate) { "" }
+          before { ENV["GOPRIVATE"] = "" }
 
           it { is_expected.to include(%(rsc.io/quote v1.5.2\n)) }
         end
 
         context "with an org specific goprivate" do
-          let(:goprivate) { "rsc.io/*" }
+          before { ENV["GOPRIVATE"] = "rsc.io/*" }
 
           it { is_expected.to include(%(rsc.io/quote v1.5.2\n)) }
-        end
-
-        context "when dealing with a go 1.11 go.mod" do
-          let(:project_name) { "go_1.11" }
-
-          it { is_expected.not_to include("go 1.") }
-          it { is_expected.to include("module github.com/dependabot/vgotest\n\nrequire") }
         end
 
         context "when dealing with a go 1.12 go.mod" do
           let(:project_name) { "simple" }
 
           it { is_expected.to include("go 1.12") }
+        end
+
+        context "when dealing with a go 1.22 go.mod that will get a toolchain update" do
+          let(:project_name) { "go_1.22" }
+          let(:dependency_name) { "golang.org/x/text" }
+          let(:dependency_version) { "v0.24.0" }
+          let(:dependency_previous_version) { "v0.21.0" }
+
+          it { is_expected.to eq(<<~GOMOD) }
+            module github.com/dependabot/vgotest
+
+            go 1.23.0
+
+            require golang.org/x/text v0.24.0
+          GOMOD
         end
 
         context "when dealing with a go 1.13 go.mod" do
@@ -251,6 +274,28 @@ RSpec.describe Dependabot::GoModules::FileUpdater::GoModUpdater do
               .not_to include(%(rsc.io/quote v1.4.0 h1:))
             expect(updated_go_mod_content)
               .not_to include(%(rsc.io/quote v1.4.0/go.mod h1:))
+          end
+
+          context "when `go mod tidy` fails" do
+            before do
+              allow(Open3).to receive(:capture3).and_wrap_original do |original, *args|
+                if args == ["go mod tidy"]
+                  ["", "missing go.sum entry for go.mod file", instance_double(Process::Status, success?: false)]
+                else
+                  original.call(*args)
+                end
+              end
+            end
+
+            it "surfaces the real error instead of silently continuing" do
+              expect { updated_go_mod_content }
+                .to raise_error(Dependabot::DependencyFileNotResolvable)
+            end
+
+            it "does not fall back to `go mod tidy -e`" do
+              expect { updated_go_mod_content }.to raise_error(Dependabot::DependabotError)
+              expect(Open3).not_to have_received(:capture3).with("go mod tidy -e")
+            end
           end
 
           describe "a non-existent dependency with a pseudo-version" do
@@ -390,6 +435,7 @@ RSpec.describe Dependabot::GoModules::FileUpdater::GoModUpdater do
       let(:requirements) { [] }
       let(:previous_requirements) { [] }
       let(:exit_status) { double(status: 128, success?: false) }
+      let(:go_get_command) { "go get github.com/spf13/viper@v1.7.1" }
       let(:stderr) do
         <<~ERROR
           go: github.com/spf13/viper@v1.7.1 requires
@@ -399,18 +445,81 @@ RSpec.describe Dependabot::GoModules::FileUpdater::GoModUpdater do
         ERROR
       end
 
-      before do
-        allow(Open3).to receive(:capture3).and_call_original
-        allow(Open3).to receive(:capture3).with(anything,
-                                                "go get github.com/spf13/viper@v1.7.1").and_return(["", stderr,
-                                                                                                    exit_status])
-      end
+      include_context "with go get command failure stubbed"
 
       it {
         expect do
           updated_go_mod_content
         end.to raise_error(Dependabot::DependencyFileNotResolvable, /The remote end hung up/)
       }
+    end
+
+    shared_examples "path dependency replacement go.mod missing" do |version:, dependency_path:|
+      let(:dependency_name) { "github.com/example/repo" }
+      let(:dependency_version) { version }
+      let(:dependency_previous_version) { version }
+      let(:requirements) { [] }
+      let(:previous_requirements) { [] }
+      let(:exit_status) { double(status: 1, success?: false) }
+      let(:go_get_command) { "go get github.com/example/repo@#{version}" }
+      let(:stderr) do
+        <<~ERROR
+          go: github.com/example/repo@#{version} (replaced by #{dependency_path}): reading #{dependency_path}/go.mod: open /local-repo/go.mod: no such file or directory
+        ERROR
+      end
+
+      include_context "with go get command failure stubbed"
+
+      it "raises a PathDependenciesNotReachable error" do
+        matcher = raise_error(Dependabot::PathDependenciesNotReachable) do |error|
+          expect(error.dependencies).to eq([dependency_path])
+        end
+
+        expect do
+          updated_go_mod_content
+        end.to matcher
+      end
+    end
+
+    context "when go get fails due to a missing local replacement go.mod" do
+      it_behaves_like "path dependency replacement go.mod missing",
+                      version: "v1.2.3",
+                      dependency_path: "./local-repo"
+    end
+
+    context "when go get fails due to a missing parent-directory replacement go.mod" do
+      it_behaves_like "path dependency replacement go.mod missing",
+                      version: "v1.2.4",
+                      dependency_path: "../local-repo"
+    end
+
+    context "when go get fails with an insecure protocol repository error" do
+      let(:dependency_name) { "gerrit.mmt.com/Platform-Comm-Identifier-Go.git" }
+      let(:dependency_version) { "v0.0.0-20220124100240-6f5253e97566" }
+      let(:dependency_previous_version) { "v0.0.0-20220124100240-6f5253e97566" }
+      let(:requirements) { [] }
+      let(:previous_requirements) { [] }
+      let(:exit_status) { double(status: 1, success?: false) }
+      let(:go_get_command) do
+        "go get gerrit.mmt.com/Platform-Comm-Identifier-Go.git@v0.0.0-20220124100240-6f5253e97566"
+      end
+      let(:stderr) do
+        <<~ERROR
+          go: gerrit.mmt.com/Platform-Comm-Identifier-Go.git@v0.0.0-20220124100240-6f5253e97566: no secure protocol found for repository
+        ERROR
+      end
+
+      include_context "with go get command failure stubbed"
+
+      it "raises a GitDependenciesNotReachable error" do
+        matcher = raise_error(Dependabot::GitDependenciesNotReachable) do |error|
+          expect(error.dependency_urls).to eq(["gerrit.mmt.com/Platform-Comm-Identifier-Go.git"])
+        end
+
+        expect do
+          updated_go_mod_content
+        end.to matcher
+      end
     end
 
     context "when dealing with an explicit indirect dependency" do
@@ -562,35 +671,6 @@ RSpec.describe Dependabot::GoModules::FileUpdater::GoModUpdater do
       end
     end
 
-    context "when module major version doesn't match (v0)" do
-      let(:project_name) { "module_major_version_mismatch_v0" }
-      let(:dependency_name) do
-        "github.com/jenkins-x/jx-api"
-      end
-      let(:dependency_version) { "v0.0.25" }
-      let(:dependency_previous_version) { "v0.0.24" }
-      let(:requirements) do
-        [{
-          file: "go.mod",
-          requirement: "v0.0.25",
-          groups: [],
-          source: {
-            type: "default",
-            source: "github.com/jenkins-x/jx-api"
-          }
-        }]
-      end
-      let(:previous_requirements) { [] }
-
-      it "raises the correct error" do
-        error_class = Dependabot::DependencyFileNotResolvable
-        expect { updater.updated_go_sum_content }
-          .to raise_error(error_class) do |error|
-          expect(error.message).to include("go.mod has post-v0 module path")
-        end
-      end
-    end
-
     context "when dealing with a invalid pseudo version" do
       let(:project_name) { "invalid_pseudo_version" }
       let(:dependency_name) do
@@ -685,7 +765,9 @@ RSpec.describe Dependabot::GoModules::FileUpdater::GoModUpdater do
       end
 
       context "with an unrestricted goprivate" do
-        let(:goprivate) { "" }
+        before do
+          ENV["GOPRIVATE"] = ""
+        end
 
         it "raises the correct error" do
           expect { updater.updated_go_sum_content }
@@ -694,7 +776,9 @@ RSpec.describe Dependabot::GoModules::FileUpdater::GoModUpdater do
       end
 
       context "with an org specific goprivate" do
-        let(:goprivate) { "github.com/dependabot-fixtures/*" }
+        before do
+          ENV["GOPRIVATE"] = "github.com/dependabot-fixtures/*"
+        end
 
         it "raises the correct error" do
           expect { updater.updated_go_sum_content }
@@ -943,13 +1027,13 @@ RSpec.describe Dependabot::GoModules::FileUpdater::GoModUpdater do
   end
 
   describe "#handle_subprocess_error" do
-    context "when dealing with an error caused by running out of disk space" do
-      let(:dependency_name) { "rsc.io/quote" }
-      let(:dependency_version) { "v1.5.2" }
-      let(:dependency_previous_version) { "v1.4.0" }
-      let(:requirements) { previous_requirements }
-      let(:previous_requirements) { [] }
+    let(:dependency_name) { "rsc.io/quote" }
+    let(:dependency_version) { "v1.5.2" }
+    let(:dependency_previous_version) { "v1.4.0" }
+    let(:requirements) { previous_requirements }
+    let(:previous_requirements) { [] }
 
+    context "when dealing with an error caused by running out of disk space" do
       it "detects 'input/output error'" do
         stderr = <<~ERROR
           rsc.io/sampler imports
@@ -981,6 +1065,101 @@ RSpec.describe Dependabot::GoModules::FileUpdater::GoModUpdater do
         expect { updater.send(:handle_subprocess_error, stderr) }.to raise_error(Dependabot::OutOfDisk) do |error|
           expect(error.message).to include("write error. Out of diskspace")
         end
+      end
+    end
+
+    context "with an ambiguous package error" do
+      it "detects 'ambiguous package'" do
+        stderr = <<~ERROR
+          go: downloading google.golang.org/grpc v1.70.0
+          go: github.com/terraform-linters/tflint imports
+                  github.com/terraform-linters/tflint/cmd imports
+                  github.com/terraform-linters/tflint-ruleset-terraform/rules imports
+                  github.com/hashicorp/go-getter imports
+                  cloud.google.com/go/storage imports
+                  google.golang.org: ambiguous import: found package google.golang.org/grpc/stats/otl in multiple modules:
+                  google.golang.org/grpc v1.69.2 (/home/dependabot/go/pkg/mod/stats/opentelemetry)
+        ERROR
+
+        expect do
+          updater.send(:handle_subprocess_error, stderr)
+        end.to raise_error(Dependabot::DependencyFileNotResolvable)
+      end
+    end
+
+    context "with a dependency that requires a higher go version" do
+      it "detects 'ToolVersionNotSupported'" do
+        stderr = <<~ERROR
+          go: downloading google.golang.org/grpc v1.67.3
+          go: downloading google.golang.org/grpc v1.70.0
+          go: google.golang.org/grpc/stats/otl@v0.0.0-87961b3 requires go >= 1.22.7 (running go 1.22.5; CUAIN=local+auto)
+        ERROR
+
+        expect do
+          updater.send(:handle_subprocess_error, stderr)
+        end.to raise_error(Dependabot::ToolVersionNotSupported)
+      end
+    end
+
+    context "with a package import error" do
+      let(:stderr) do
+        <<~ERROR
+          go: sbom-signing-api imports
+          sbom-signing-api/routes imports
+          sbom-signing-api/docs: package sbom-signing-api/docs is not in std (/opt/go/src/sbom-signing-api/docs)
+        ERROR
+      end
+
+      it "raises the correct error" do
+        expect do
+          updater.send(:handle_subprocess_error, stderr)
+        end.to raise_error(Dependabot::DependencyFileNotResolvable)
+      end
+    end
+
+    context "with a missing go.sum entry error" do
+      let(:stderr) do
+        <<~ERROR
+          go mod download github.com/vmware/[FILTERED_REPO]
+          go: github.com/osbuild/[FILTERED_REPO]/internal/boot/vmwaretest imports
+          github.com/vmware/[FILTERED_REPO]/govc/importx: github.com/vmware/[FILTERED_REPO]@v0.38.0: missing go.sum entry for go.mod file; to add it:
+          go mod download github.com/vmware/[FILTERED_REPO]
+        ERROR
+      end
+
+      it "raises the correct error" do
+        expect do
+          updater.send(:handle_subprocess_error, stderr)
+        end.to raise_error(Dependabot::DependencyFileNotResolvable)
+      end
+    end
+
+    context "when a module does not contain a package" do
+      let(:stderr) do
+        <<~ERROR
+          go: downloading github.com/bandprotocol/[FILTERED_REPO] v0.0.1
+          go: module github.com/bandprotocol/[FILTERED_REPO]@v0.0.1 found, but does not contain package github.com/bandprotocol/[FILTERED_REPO]/[FILTERED_REPO]-api/client/go-client
+        ERROR
+      end
+
+      it "raises the correct error" do
+        expect do
+          updater.send(:handle_subprocess_error, stderr)
+        end.to raise_error(Dependabot::DependencyFileNotResolvable)
+      end
+    end
+
+    context "with a go.mod parsing error" do
+      let(:stderr) do
+        <<~ERROR
+          go: error loading go.mod: go.mod:7: unknown godebug 'tlskyber'
+        ERROR
+      end
+
+      it "raises the correct error" do
+        expect do
+          updater.send(:handle_subprocess_error, stderr)
+        end.to raise_error(Dependabot::DependencyFileNotParseable)
       end
     end
   end

@@ -1,10 +1,12 @@
-# typed: strict
+# typed: strong
 # frozen_string_literal: true
 
 require "sorbet-runtime"
 
 require "dependabot/file_fetchers"
 require "dependabot/file_fetchers/base"
+require "dependabot/experiments"
+require "dependabot/github_actions/constants"
 
 module Dependabot
   module GithubActions
@@ -12,11 +14,9 @@ module Dependabot
       extend T::Sig
       extend T::Helpers
 
-      FILENAME_PATTERN = /\.ya?ml$/
-
       sig { override.params(filenames: T::Array[String]).returns(T::Boolean) }
       def self.required_files_in?(filenames)
-        filenames.any? { |f| f.match?(FILENAME_PATTERN) }
+        filenames.any? { |f| f.match?(MANIFEST_FILE_PATTERN) }
       end
 
       sig { override.returns(String) }
@@ -30,11 +30,12 @@ module Dependabot
             source: Dependabot::Source,
             credentials: T::Array[Dependabot::Credential],
             repo_contents_path: T.nilable(String),
-            options: T::Hash[String, String]
+            options: T::Hash[Symbol, Object],
+            update_config: T.nilable(Dependabot::Config::UpdateConfig)
           )
           .void
       end
-      def initialize(source:, credentials:, repo_contents_path: nil, options: {})
+      def initialize(source:, credentials:, repo_contents_path: nil, options: {}, update_config: nil)
         @workflow_files = T.let([], T::Array[DependencyFile])
         super
       end
@@ -44,14 +45,21 @@ module Dependabot
         fetched_files = []
         fetched_files += correctly_encoded_workflow_files
 
-        return fetched_files if fetched_files.any?
+        if fetched_files.any?
+          # The lockfile is additive: it is only fetched alongside workflow files
+          # and never activates the ecosystem on its own. Relocking also requires
+          # every workflow to be materialized, so retain the workflow-only path if
+          # an invalidly encoded workflow had to be omitted.
+          fetched_files += [actions_lockfile].compact if incorrectly_encoded_workflow_files.empty?
+          return fetched_files
+        end
 
         if incorrectly_encoded_workflow_files.none?
           expected_paths =
             if directory == "/"
-              File.join(directory, "action.yml") + " or /.github/workflows/<anything>.yml"
+              File.join(directory, MANIFEST_FILE_YML) + " or /#{CONFIG_YMLS}"
             else
-              File.join(directory, "<anything>.yml")
+              File.join(directory, ANYTHING_YML)
             end
 
           raise(
@@ -68,6 +76,17 @@ module Dependabot
 
       private
 
+      # Fetches the canonical `.github/workflows/actions.lock` when the update covers
+      # repository workflows. Composite-action directories cannot own a lockfile.
+      sig { returns(T.nilable(DependencyFile)) }
+      def actions_lockfile
+        return unless Dependabot::Experiments.enabled?(:github_actions_lockfile)
+        return unless source.hostname == GITHUB_COM
+        return fetch_file_if_present(LOCKFILE_PATH) if directory == "/"
+
+        fetch_file_if_present(LOCKFILE_NAME) if directory.delete_prefix("/") == WORKFLOW_DIRECTORY
+      end
+
       sig { returns(T::Array[DependencyFile]) }
       def workflow_files
         return @workflow_files unless @workflow_files.empty?
@@ -75,16 +94,19 @@ module Dependabot
         # In the special case where the root directory is defined we also scan
         # the .github/workflows/ folder.
         if directory == "/"
-          @workflow_files += [fetch_file_if_present("action.yml"), fetch_file_if_present("action.yaml")].compact
+          @workflow_files += [
+            fetch_file_if_present(MANIFEST_FILE_YML),
+            fetch_file_if_present(MANIFEST_FILE_YAML)
+          ].compact
 
-          workflows_dir = ".github/workflows"
+          workflows_dir = WORKFLOW_DIRECTORY
         else
           workflows_dir = "."
         end
 
         @workflow_files +=
           repo_contents(dir: workflows_dir, raise_errors: false)
-          .select { |f| f.type == "file" && f.name.match?(FILENAME_PATTERN) }
+          .select { |f| f.type == "file" && f.name.match?(MANIFEST_FILE_PATTERN) }
           .map { |f| fetch_file_from_host("#{workflows_dir}/#{f.name}") }
       end
 

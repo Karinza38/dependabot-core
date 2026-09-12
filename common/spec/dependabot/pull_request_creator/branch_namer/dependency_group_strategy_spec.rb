@@ -126,6 +126,19 @@ RSpec.describe Dependabot::PullRequestCreator::BranchNamer::DependencyGroupStrat
 
         expect(forward_namer.new_branch_name).to eql(backward_namer.new_branch_name)
       end
+
+      it "does not raise if files is empty" do
+        expect do
+          described_class.new(
+            dependencies: [dependency],
+            files: [],
+            target_branch: target_branch,
+            separator: separator,
+            dependency_group: dependency_group,
+            includes_security_fixes: includes_security_fixes
+          ).new_branch_name
+        end.not_to raise_error
+      end
     end
 
     context "with a grouped security update" do
@@ -227,6 +240,53 @@ RSpec.describe Dependabot::PullRequestCreator::BranchNamer::DependencyGroupStrat
 
       it "returns the name of the dependency group prefixed correctly" do
         expect(namer.new_branch_name).to start_with("dependabot_bundler_rails-app_develop_my-dependency-group")
+      end
+    end
+
+    context "when the group name contains a slash (dynamic subgroup)" do
+      let(:directory) { "/" }
+      let(:target_branch) { "" }
+      let(:separator) { "/" }
+      let(:dependency_group) do
+        Dependabot::DependencyGroup.new(name: "monorepo-deps/lodash", rules: { patterns: ["lodash"] })
+      end
+
+      it "preserves the slash in the branch name as a path separator" do
+        expect(namer.new_branch_name).to start_with("dependabot/bundler/monorepo-deps/lodash")
+      end
+
+      it "generates a valid git branch name" do
+        # Git branch names can contain slashes as path separators
+        expect(namer.new_branch_name).to match(%r{^dependabot/bundler/monorepo-deps/lodash-[a-f0-9]+$})
+      end
+    end
+
+    context "when the group name contains a scoped package name with @" do
+      let(:directory) { "/" }
+      let(:target_branch) { "" }
+      let(:separator) { "/" }
+      let(:dependency_group) do
+        Dependabot::DependencyGroup.new(name: "monorepo-deps/@angular/core", rules: { patterns: ["@angular/core"] })
+      end
+
+      it "strips the @ symbol from the branch name" do
+        # The @ symbol is not allowed in git branch names by sanitize_ref
+        expect(namer.new_branch_name).to start_with("dependabot/bundler/monorepo-deps/angular/core")
+        expect(namer.new_branch_name).not_to include("@")
+      end
+    end
+
+    context "when the group name contains a slash and using underscore separator" do
+      let(:directory) { "/" }
+      let(:target_branch) { "" }
+      let(:separator) { "_" }
+      let(:dependency_group) do
+        Dependabot::DependencyGroup.new(name: "monorepo-deps/lodash", rules: { patterns: ["lodash"] })
+      end
+
+      it "replaces all slashes with the custom separator" do
+        expect(namer.new_branch_name).to start_with("dependabot_bundler_monorepo-deps_lodash")
+        expect(namer.new_branch_name).not_to include("/")
       end
     end
   end

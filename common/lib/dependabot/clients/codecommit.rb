@@ -79,22 +79,23 @@ module Dependabot
 
       sig do
         params(
-          repo: String, commit: T.nilable(String),
+          repo: String,
+          commit: T.nilable(String),
           path: T.nilable(String)
         )
-          # See PR 9344: should .returns(Seahorse::Client::Response)
-          # but it not extend Delegator, unblocking until shim or
-          # another fix is implemented
-          .returns(T.untyped)
+          .returns(Seahorse::Client::Response)
       end
       def fetch_repo_contents(repo, commit = nil, path = nil)
         actual_path = path
         actual_path = "/" if path.to_s.empty?
 
-        cc_client.get_folder(
-          repository_name: repo,
-          commit_specifier: commit,
-          folder_path: actual_path
+        T.cast(
+          cc_client.get_folder(
+            repository_name: repo,
+            commit_specifier: commit,
+            folder_path: actual_path
+          ),
+          Seahorse::Client::Response
         )
       end
 
@@ -112,20 +113,23 @@ module Dependabot
           commit_specifier: commit,
           file_path: path
         ).file_content
-        rescue Aws::CodeCommit::Errors::FileDoesNotExistException
-          raise NotFound
+      rescue Aws::CodeCommit::Errors::FileDoesNotExistException
+        raise NotFound
       end
 
       sig do
         params(
           branch_name: String
         )
-          .returns(String)
+          .returns(Seahorse::Client::Response)
       end
       def branch(branch_name)
-        cc_client.get_branch(
-          repository_name: source.unscoped_repo,
-          branch_name: branch_name
+        T.cast(
+          cc_client.get_branch(
+            repository_name: source.unscoped_repo,
+            branch_name: branch_name
+          ),
+          Seahorse::Client::Response
         )
       end
 
@@ -182,18 +186,24 @@ module Dependabot
           repo: String,
           branch_name: String
         )
-          .returns(Aws::CodeCommit::Types::Commit)
+          .returns(Seahorse::Client::Response)
       end
       def commits(repo, branch_name = T.must(source.branch))
         retrieved_commits = fetch_commits(repo, branch_name, 5)
 
-        result = @cc_client.batch_get_commits(
-          commit_ids: retrieved_commits,
-          repository_name: repo
+        result = T.cast(
+          @cc_client.batch_get_commits(
+            commit_ids: retrieved_commits,
+            repository_name: repo
+          ),
+          Seahorse::Client::Response
         )
 
         # sort the results by date
-        result.commits.sort! { |a, b| b.author.date <=> a.author.date }
+        output = T.cast(result.data, Aws::CodeCommit::Types::BatchGetCommitsOutput)
+        commits = output.commits
+        commits&.sort_by! { |commit| commit.author&.date || "" }
+        commits&.reverse!
         result
       end
 
@@ -203,7 +213,7 @@ module Dependabot
           state: String,
           branch: String
         )
-          .returns(T::Array[Aws::CodeCommit::Types::PullRequest])
+          .returns(T::Array[Seahorse::Client::Response])
       end
       def pull_requests(repo, state, branch)
         pull_request_ids = @cc_client.list_pull_requests(
@@ -211,18 +221,20 @@ module Dependabot
           pull_request_status: state
         ).pull_request_ids
 
-        result = []
+        result = T.let([], T::Array[Seahorse::Client::Response])
         # list_pull_requests only gets us the pull request id
         # get_pull_request has all the info we need
         pull_request_ids.each do |id|
-          pr_hash = @cc_client.get_pull_request(
-            pull_request_id: id
+          pr_hash = T.cast(
+            @cc_client.get_pull_request(
+              pull_request_id: id
+            ),
+            Seahorse::Client::Response
           )
+          output = T.cast(pr_hash.data, Aws::CodeCommit::Types::GetPullRequestOutput)
           # only include PRs from the referenced branch
-          if pr_hash.pull_request.pull_request_targets[0]
-                    .source_reference.include? branch
-            result << pr_hash
-          end
+          source_reference = T.must(output.pull_request.pull_request_targets[0]).source_reference
+          result << pr_hash if source_reference.delete_prefix("refs/heads/") == branch.delete_prefix("refs/heads/")
         end
         result
       end
@@ -233,13 +245,16 @@ module Dependabot
           branch_name: String,
           commit_id: String
         )
-          .returns(Aws::CodeCommit::Types::BranchInfo)
+          .returns(Seahorse::Client::Response)
       end
       def create_branch(repo, branch_name, commit_id)
-        cc_client.create_branch(
-          repository_name: repo,
-          branch_name: branch_name,
-          commit_id: commit_id
+        T.cast(
+          cc_client.create_branch(
+            repository_name: repo,
+            branch_name: branch_name,
+            commit_id: commit_id
+          ),
+          Seahorse::Client::Response
         )
       end
 
@@ -251,23 +266,31 @@ module Dependabot
           commit_message: String,
           files: T::Array[Dependabot::DependencyFile]
         )
-          .returns(Aws::CodeCommit::Types::CreateCommitOutput)
+          .returns(Seahorse::Client::Response)
       end
-      def create_commit(branch_name, author_name, base_commit, commit_message,
-                        files)
-        cc_client.create_commit(
-          repository_name: source.unscoped_repo,
-          branch_name: branch_name,
-          parent_commit_id: base_commit,
-          author_name: author_name,
-          commit_message: commit_message,
-          put_files: files.map do |file|
-            {
-              file_path: file.path,
-              file_mode: "NORMAL",
-              file_content: file.content
-            }
-          end
+      def create_commit(
+        branch_name,
+        author_name,
+        base_commit,
+        commit_message,
+        files
+      )
+        T.cast(
+          cc_client.create_commit(
+            repository_name: source.unscoped_repo,
+            branch_name: branch_name,
+            parent_commit_id: base_commit,
+            author_name: author_name,
+            commit_message: commit_message,
+            put_files: files.map do |file|
+              {
+                file_path: file.path,
+                file_mode: "NORMAL",
+                file_content: file.content
+              }
+            end
+          ),
+          Seahorse::Client::Response
         )
       end
 
@@ -278,18 +301,25 @@ module Dependabot
           source_branch: String,
           pr_description: String
         )
-          .returns(T.nilable(Aws::CodeCommit::Types::CreatePullRequestOutput))
+          .returns(Seahorse::Client::Response)
       end
-      def create_pull_request(pr_name, target_branch, source_branch,
-                              pr_description)
-        cc_client.create_pull_request(
-          title: pr_name,
-          description: pr_description,
-          targets: [
-            repository_name: source.unscoped_repo,
-            source_reference: target_branch,
-            destination_reference: source_branch
-          ]
+      def create_pull_request(
+        pr_name,
+        target_branch,
+        source_branch,
+        pr_description
+      )
+        T.cast(
+          cc_client.create_pull_request(
+            title: pr_name,
+            description: pr_description,
+            targets: [
+              { repository_name: source.unscoped_repo,
+                source_reference: target_branch,
+                destination_reference: source_branch }
+            ]
+          ),
+          Seahorse::Client::Response
         )
       end
 

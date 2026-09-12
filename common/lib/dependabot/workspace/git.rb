@@ -1,4 +1,4 @@
-# typed: strict
+# typed: strong
 # frozen_string_literal: true
 
 require "sorbet-runtime"
@@ -56,9 +56,9 @@ module Dependabot
         return nil if changed_files(ignored_mode: "no").empty?
 
         debug("store_change - before: #{current_commit}")
-        sha, diff = commit(memo)
+        sha = commit(memo)
 
-        change_attempts << ChangeAttempt.new(self, id: sha, memo: memo, diff: diff)
+        change_attempts << ChangeAttempt.new(self, id: sha, memo: memo)
       ensure
         debug("store_change - after: #{current_commit}")
       end
@@ -71,10 +71,10 @@ module Dependabot
           .returns(T.nilable(T::Array[Dependabot::Workspace::ChangeAttempt]))
       end
       def capture_failed_change_attempt(memo = nil, error = nil)
-        return nil if changed_files(ignored_mode: "matching").empty? && error.nil?
+        return nil if changed_files(ignored_mode: "matching").empty?
 
-        sha, diff = stash(memo)
-        change_attempts << ChangeAttempt.new(self, id: sha, memo: memo, diff: diff, error: error)
+        sha = stash(memo)
+        change_attempts << ChangeAttempt.new(self, id: sha, memo: memo, error: error)
       end
 
       private
@@ -87,7 +87,7 @@ module Dependabot
 
       sig { returns(String) }
       def head_sha
-        run_shell_command("git rev-parse HEAD").strip
+        run_shell_command("git rev-parse HEAD", stderr_to_stdout: false).strip
       end
 
       sig { returns(String) }
@@ -112,7 +112,7 @@ module Dependabot
         ).strip
       end
 
-      sig { params(memo: T.nilable(String)).returns([String, String]) }
+      sig { params(memo: T.nilable(String)).returns(String) }
       def stash(memo = nil)
         msg = memo || "workspace change attempt"
         run_shell_command("git add --all --force .")
@@ -122,19 +122,12 @@ module Dependabot
           allow_unsafe_shell_command: true
         )
 
-        sha = last_stash_sha
-        diff = run_shell_command(
-          "git stash show --patch #{sha}",
-          fingerprint: "git stash show --patch <sha>"
-        )
-
-        [sha, diff]
+        last_stash_sha
       end
 
-      sig { params(memo: T.nilable(String)).returns([String, String]) }
+      sig { params(memo: T.nilable(String)).returns(String) }
       def commit(memo = nil)
-        run_shell_command("git add #{path}")
-        diff = run_shell_command("git diff --cached .")
+        run_shell_command(["git", "add", "--", path.to_s])
 
         msg = memo || "workspace change"
         run_shell_command(
@@ -143,7 +136,7 @@ module Dependabot
           allow_unsafe_shell_command: true
         )
 
-        [head_sha, diff]
+        head_sha
       end
 
       sig { params(sha: String).returns(String) }
@@ -159,9 +152,40 @@ module Dependabot
         run_shell_command("git clean -fx .")
       end
 
-      sig { params(args: String, kwargs: T.any(T::Boolean, String)).returns(String) }
-      def run_shell_command(*args, **kwargs)
-        Dir.chdir(path) { T.unsafe(SharedHelpers).run_shell_command(*args, **kwargs) }
+      sig do
+        params(
+          command: SharedHelpers::Command,
+          allow_unsafe_shell_command: T::Boolean,
+          cwd: T.nilable(String),
+          env: T.nilable(T::Hash[String, String]),
+          fingerprint: T.nilable(String),
+          stderr_to_stdout: T::Boolean,
+          timeout: Integer,
+          output_observer: CommandHelpers::OutputObserver
+        ).returns(String)
+      end
+      def run_shell_command(
+        command,
+        allow_unsafe_shell_command: false,
+        cwd: nil,
+        env: {},
+        fingerprint: nil,
+        stderr_to_stdout: true,
+        timeout: CommandHelpers::TIMEOUTS::DEFAULT,
+        output_observer: nil
+      )
+        Dir.chdir(path) do
+          SharedHelpers.run_shell_command(
+            command,
+            allow_unsafe_shell_command: allow_unsafe_shell_command,
+            cwd: cwd,
+            env: env,
+            fingerprint: fingerprint,
+            stderr_to_stdout: stderr_to_stdout,
+            timeout: timeout,
+            output_observer: output_observer
+          )
+        end
       end
 
       sig { params(message: String).void }

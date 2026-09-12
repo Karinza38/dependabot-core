@@ -1,4 +1,4 @@
-# typed: true
+# typed: strong
 # frozen_string_literal: true
 
 require "sorbet-runtime"
@@ -14,22 +14,18 @@ module Dependabot
 
       require_relative "file_updater/dependency_set_updater"
       require_relative "file_updater/property_value_updater"
+      require_relative "file_updater/lockfile_updater"
+      require_relative "file_updater/wrapper_updater"
 
       SUPPORTED_BUILD_FILE_NAMES = %w(build.gradle build.gradle.kts).freeze
 
-      def self.updated_files_regex
-        [
-          # Matches build.gradle or build.gradle.kts in root directory
-          %r{(^|.*/)build\.gradle(\.kts)?$},
-          # Matches gradle/libs.versions.toml in root or any subdirectory
-          %r{(^|.*/)?gradle/libs\.versions\.toml$},
-          # Matches settings.gradle or settings.gradle.kts in root or any subdirectory
-          %r{(^|.*/)settings\.gradle(\.kts)?$},
-          # Matches dependencies.gradle in root or any subdirectory
-          %r{(^|.*/)dependencies\.gradle$}
-        ]
-      end
+      # Matches the start of a Gradle dependency substitution block, e.g.
+      #   resolutionStrategy.dependencySubstitution {
+      # Coordinates inside such a block are substitution targets, not real
+      # dependency declarations, and must never be rewritten.
+      SUBSTITUTION_BLOCK_START_REGEX = /\bdependencySubstitution\s*\{/
 
+      sig { override.returns(T::Array[::Dependabot::DependencyFile]) }
       def updated_dependency_files
         updated_files = buildfiles.dup
 
@@ -53,30 +49,41 @@ module Dependabot
 
       private
 
+      sig { override.void }
       def check_required_files
         raise "No build.gradle or build.gradle.kts!" if dependency_files.empty?
       end
 
+      sig { void }
       def original_file
         dependency_files.find do |f|
           SUPPORTED_BUILD_FILE_NAMES.include?(f.name)
         end
       end
 
+      # rubocop:disable Metrics/AbcSize
+      # rubocop:disable Metrics/PerceivedComplexity
+      sig do
+        params(buildfiles: T::Array[Dependabot::DependencyFile], dependency: Dependabot::Dependency)
+          .returns(T::Array[Dependabot::DependencyFile])
+      end
       def update_buildfiles_for_dependency(buildfiles:, dependency:)
         files = buildfiles.dup
 
+        # dependencies may have multiple requirements targeting the same file or build dir
+        # we keep the last one by path to later run its native helpers
+        buildfiles_processed = T.let({}, T::Hash[String, Dependabot::DependencyFile])
+
         # The UpdateChecker ensures the order of requirements is preserved
         # when updating, so we can zip them together in new/old pairs.
-        reqs = dependency.requirements.zip(dependency.previous_requirements)
+        reqs = dependency.requirements.zip(T.must(dependency.previous_requirements))
                          .reject { |new_req, old_req| new_req == old_req }
-
         # Loop through each changed requirement and update the buildfiles
         reqs.each do |new_req, old_req|
-          raise "Bad req match" unless new_req[:file] == old_req[:file]
-          next if new_req[:requirement] == old_req[:requirement]
+          raise "Bad req match" if old_req.nil? || new_req.file != old_req.file
+          next if new_req.requirement == old_req.requirement
 
-          buildfile = files.find { |f| f.name == new_req.fetch(:file) }
+          buildfile = files.find { |f| f.name == new_req.file }
 
           # Currently, Dependabot assumes that Gradle projects using Gradle submodules are all in a single
           # repo. However, some projects are actually using git submodule references for the Gradle submodules.
@@ -87,65 +94,149 @@ module Dependabot
 
           raise DependencyFileNotResolvable, "No build file found to update the dependency" if buildfile.nil?
 
-          if new_req.dig(:metadata, :property_name)
+          if new_req.metadata_string("property_name")
             files = update_files_for_property_change(files, old_req, new_req)
-          elsif new_req.dig(:metadata, :dependency_set)
+          elsif new_req.metadata_string_hash("dependency_set")
             files = update_files_for_dep_set_change(files, old_req, new_req)
           else
-            files[files.index(buildfile)] =
-              update_version_in_buildfile(
-                dependency,
-                buildfile,
-                old_req,
-                new_req
-              )
+            files[T.must(files.index(buildfile))] = update_version_in_buildfile(dependency, buildfile, old_req, new_req)
           end
+
+          # Always look up the updated buildfile from files after any modification
+          # to ensure buildfiles_processed contains the latest version
+          updated_buildfile = files.find { |f| f.name == buildfile.name }
+          buildfiles_processed[buildfile.name] = T.must(updated_buildfile)
         end
+
+        # runs native updaters (e.g. wrapper, lockfile) on relevant build files updated
+        buildfiles_processed.each_value do |buildfile|
+          wrapper_updater = WrapperUpdater.new(dependency_files: files, dependency: dependency)
+          updated_files = wrapper_updater.update_files(buildfile)
+          replace_updated_files(files, updated_files)
+        end
+        update_lockfiles_for_buildfiles(files, buildfiles_processed)
 
         files
       end
+      # rubocop:enable Metrics/PerceivedComplexity
+      # rubocop:enable Metrics/AbcSize
 
+      sig do
+        params(
+          files: T::Array[Dependabot::DependencyFile],
+          buildfiles_processed: T::Hash[String, Dependabot::DependencyFile]
+        ).void
+      end
+      def update_lockfiles_for_buildfiles(files, buildfiles_processed)
+        # Support files (e.g. fetched convention plugin sources) are excluded from
+        # `buildfiles`/`files`, but Gradle still needs them on disk to compile
+        # plugins referenced by included/buildSrc builds, so pass them through too.
+        support_files = dependency_files.select(&:support_file?)
+        lockfile_updater = LockfileUpdater.new(
+          dependency_files: files + support_files,
+          repo_contents_path: repo_contents_path
+        )
+        buildfiles_by_root = T.let({}, T::Hash[String, T::Array[Dependabot::DependencyFile]])
+
+        buildfiles_processed.each_value do |buildfile|
+          root_dir = lockfile_updater.determine_root_dir(build_file: buildfile)
+          buildfiles_by_root[root_dir] ||= []
+          T.must(buildfiles_by_root[root_dir]) << buildfile
+        end
+
+        buildfiles_by_root.each_value do |buildfiles|
+          updated_files = lockfile_updater.update_lockfiles(T.must(buildfiles.first), build_files: buildfiles)
+
+          # Support files are only needed to populate Gradle's working directory;
+          # they must never be reintroduced into the buildfiles-only result set.
+          replace_updated_files(files, updated_files.reject(&:support_file?))
+        end
+      end
+      sig do
+        params(
+          files: T::Array[Dependabot::DependencyFile],
+          updated_files: T::Array[Dependabot::DependencyFile]
+        ).returns(T::Array[Dependabot::DependencyFile])
+      end
+      def replace_updated_files(files, updated_files)
+        updated_files.each do |file|
+          existing_file = files.find { |f| f.name == file.name }
+          if existing_file.nil?
+            files << file
+          else
+            files[T.must(files.index(existing_file))] = file
+          end
+        end
+        files
+      end
+
+      sig do
+        params(
+          buildfiles: T::Array[Dependabot::DependencyFile],
+          old_req: Dependabot::DependencyRequirement,
+          new_req: Dependabot::DependencyRequirement
+        )
+          .returns(T::Array[Dependabot::DependencyFile])
+      end
       def update_files_for_property_change(buildfiles, old_req, new_req)
         files = buildfiles.dup
-        property_name = new_req.fetch(:metadata).fetch(:property_name)
-        buildfile = files.find { |f| f.name == new_req.fetch(:file) }
+        property_name = T.must(new_req.metadata_string("property_name"))
+        file = T.must(new_req.file)
+        buildfile = T.must(files.find { |f| f.name == file })
 
         PropertyValueUpdater.new(dependency_files: files)
                             .update_files_for_property_change(
                               property_name: property_name,
                               callsite_buildfile: buildfile,
-                              previous_value: old_req.fetch(:requirement),
-                              updated_value: new_req.fetch(:requirement)
+                              previous_value: T.must(old_req.requirement_string),
+                              updated_value: T.must(new_req.requirement_string)
                             )
       end
 
+      sig do
+        params(
+          buildfiles: T::Array[Dependabot::DependencyFile],
+          old_req: Dependabot::DependencyRequirement,
+          new_req: Dependabot::DependencyRequirement
+        )
+          .returns(T::Array[Dependabot::DependencyFile])
+      end
       def update_files_for_dep_set_change(buildfiles, old_req, new_req)
         files = buildfiles.dup
-        dependency_set = new_req.fetch(:metadata).fetch(:dependency_set)
-        buildfile = files.find { |f| f.name == new_req.fetch(:file) }
+        dependency_set = T.must(new_req.metadata_string_hash("dependency_set"))
+        buildfile = T.must(files.find { |f| f.name == new_req.file })
 
         DependencySetUpdater.new(dependency_files: files)
                             .update_files_for_dep_set_change(
                               dependency_set: dependency_set,
                               buildfile: buildfile,
-                              previous_requirement: old_req.fetch(:requirement),
-                              updated_requirement: new_req.fetch(:requirement)
+                              previous_requirement: T.must(old_req.requirement_string),
+                              updated_requirement: T.must(new_req.requirement_string)
                             )
       end
 
-      def update_version_in_buildfile(dependency, buildfile, previous_req,
-                                      requirement)
-        original_content = buildfile.content.dup
+      sig do
+        params(
+          dependency: Dependabot::Dependency,
+          buildfile: Dependabot::DependencyFile,
+          previous_req: Dependabot::DependencyRequirement,
+          requirement: Dependabot::DependencyRequirement
+        )
+          .returns(Dependabot::DependencyFile)
+      end
+      def update_version_in_buildfile(
+        dependency,
+        buildfile,
+        previous_req,
+        requirement
+      )
+        original_content = T.must(buildfile.content.dup)
 
         updated_content =
           original_buildfile_declarations(dependency, previous_req).reduce(original_content) do |content, declaration|
             content.gsub(
               declaration,
-              updated_buildfile_declaration(
-                declaration,
-                previous_req,
-                requirement
-              )
+              updated_buildfile_declaration(declaration, previous_req, requirement)
             )
           end
 
@@ -154,37 +245,92 @@ module Dependabot
         updated_file(file: buildfile, content: updated_content)
       end
 
+      # rubocop:disable Metrics/AbcSize
+      # rubocop:disable Metrics/PerceivedComplexity
+      sig do
+        params(
+          dependency: Dependabot::Dependency,
+          requirement: Dependabot::DependencyRequirement
+        ).returns(T::Array[String])
+      end
       def original_buildfile_declarations(dependency, requirement)
         # This implementation is limited to declarations that appear on a
         # single line.
-        buildfile = buildfiles.find { |f| f.name == requirement.fetch(:file) }
-        buildfile.content.lines.select do |line|
-          line = evaluate_properties(line, buildfile)
-          line = line.gsub(%r{(?<=^|\s)//.*$}, "")
+        file = T.must(requirement.file)
+        buildfile = T.must(buildfiles.find { |f| f.name == file })
+        content = T.must(buildfile.content)
+        substitution_ranges = substitution_block_line_ranges(content, kotlin: file.end_with?(".kts"))
+
+        content.lines.each_with_index.filter_map do |line, index|
+          next if substitution_ranges.any? { |range| range.cover?(index) }
+
+          evaluated = evaluate_properties(line, buildfile)
+          evaluated = evaluated.gsub(%r{(?<=^|\s)//.*$}, "")
 
           if dependency.name.include?(":")
-            next false unless line.include?(dependency.name.split(":").first)
-            next false unless line.include?(dependency.name.split(":").last)
-          elsif requirement.fetch(:file).end_with?(".toml")
-            next false unless line.include?(dependency.name)
+            dep_parts = dependency.name.split(":")
+            next unless evaluated.include?(T.must(dep_parts.first)) || evaluated.include?(T.must(dep_parts.last))
+          elsif file.end_with?(".properties")
+            property = requirement.source_string("property")
+            next unless property && evaluated.start_with?(property)
+          elsif file.end_with?(".toml")
+            next unless evaluated.include?(dependency.name)
           else
             name_regex_value = /['"]#{Regexp.quote(dependency.name)}['"]/
             name_regex = /(id|kotlin)(\s+#{name_regex_value}|\(#{name_regex_value}\))/
-            next false unless line.match?(name_regex)
+            next unless evaluated.match?(name_regex)
           end
 
-          line.include?(requirement.fetch(:requirement))
+          line if evaluated.include?(T.must(requirement.requirement_string))
         end
       end
+      # rubocop:enable Metrics/AbcSize
+      # rubocop:enable Metrics/PerceivedComplexity
 
+      # Returns the (0-based) line-index ranges covered by dependencySubstitution
+      # blocks, so lines inside them can be excluded regardless of formatting.
+      # Braces inside strings/comments are masked so the matching closing brace
+      # is located correctly.
+      sig { params(content: String, kotlin: T::Boolean).returns(T::Array[T::Range[Integer]]) }
+      def substitution_block_line_ranges(content, kotlin: false)
+        ranges = T.let([], T::Array[T::Range[Integer]])
+        masked = Gradle::FileParser.mask_literals_and_comments(content, kotlin: kotlin)
+
+        masked.to_enum(:scan, SUBSTITUTION_BLOCK_START_REGEX).each do
+          match = T.must(Regexp.last_match)
+          start_offset = match.begin(0)
+          close_offset = match.end(0) + closing_bracket_index(T.must(masked[match.end(0)..]))
+
+          start_line = T.must(masked[0...start_offset]).count("\n")
+          end_line = T.must(masked[0..close_offset]).count("\n")
+          ranges << (start_line..end_line)
+        end
+
+        ranges
+      end
+
+      sig { params(string: String).returns(Integer) }
+      def closing_bracket_index(string)
+        closes_required = 1
+
+        string.chars.each_with_index do |char, index|
+          closes_required += 1 if char == "{"
+          closes_required -= 1 if char == "}"
+          return index if closes_required.zero?
+        end
+
+        0
+      end
+
+      sig { params(string: String, buildfile: Dependabot::DependencyFile).returns(String) }
       def evaluate_properties(string, buildfile)
         result = string.dup
 
         string.scan(Gradle::FileParser::PROPERTY_REGEX) do
-          prop_name = T.must(Regexp.last_match).named_captures.fetch("property_name")
-          property_value = property_value_finder.property_value(
-            property_name: prop_name,
-            callsite_buildfile: buildfile
+          prop_name = T.must(T.must(Regexp.last_match).named_captures.fetch("property_name"))
+          property_value = T.let(
+            property_value_finder.property_value(property_name: prop_name, callsite_buildfile: buildfile),
+            T.nilable(String)
           )
           next unless property_value
 
@@ -194,23 +340,31 @@ module Dependabot
         result
       end
 
+      sig { returns(Gradle::FileParser::PropertyValueFinder) }
       def property_value_finder
-        @property_value_finder ||=
-          Gradle::FileParser::PropertyValueFinder
-          .new(dependency_files: dependency_files)
-      end
-
-      def updated_buildfile_declaration(original_buildfile_declaration, previous_req, requirement)
-        original_req_string = previous_req.fetch(:requirement)
-
-        original_buildfile_declaration.gsub(
-          original_req_string,
-          requirement.fetch(:requirement)
+        @property_value_finder ||= T.let(
+          Gradle::FileParser::PropertyValueFinder.new(dependency_files: dependency_files),
+          T.nilable(Gradle::FileParser::PropertyValueFinder)
         )
       end
 
+      sig do
+        params(
+          original_buildfile_declaration: String,
+          previous_req: Dependabot::DependencyRequirement,
+          requirement: Dependabot::DependencyRequirement
+        ).returns(String)
+      end
+      def updated_buildfile_declaration(original_buildfile_declaration, previous_req, requirement)
+        original_req_string = T.must(previous_req.requirement_string)
+        new_req_string = T.must(requirement.requirement_string)
+
+        original_buildfile_declaration.gsub(original_req_string, new_req_string)
+      end
+
+      sig { returns(T::Array[Dependabot::DependencyFile]) }
       def buildfiles
-        @buildfiles ||= dependency_files.reject(&:support_file?)
+        @buildfiles ||= T.let(dependency_files.reject(&:support_file?), T.nilable(T::Array[Dependabot::DependencyFile]))
       end
     end
   end

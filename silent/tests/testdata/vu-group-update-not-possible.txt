@@ -35,11 +35,13 @@ stdout -count=1 mark_as_processed
 -- input-up-to-date.yml --
 job:
   package-manager: "silent"
+  cooldown:
+    default-days: 0
   source:
     directory: "/up-to-date"
     provider: example
-    hostname: example.com
-    api-endpoint: https://example.com/api/v3
+    hostname: 127.0.0.1
+    api-endpoint: http://127.0.0.1/api/v3
     repo: dependabot/smoke-tests
   dependency-groups:
     - name: all-group
@@ -76,11 +78,13 @@ THIS IS NOT JSON
 -- input-errored.yml --
 job:
   package-manager: "silent"
+  cooldown:
+    default-days: 0
   source:
     directory: "/errors"
     provider: example
-    hostname: example.com
-    api-endpoint: https://example.com/api/v3
+    hostname: 127.0.0.1
+    api-endpoint: http://127.0.0.1/api/v3
     repo: dependabot/smoke-tests
   dependency-groups:
     - name: all-group

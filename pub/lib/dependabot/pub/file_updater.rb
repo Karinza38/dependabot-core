@@ -1,4 +1,4 @@
-# typed: strict
+# typed: strong
 # frozen_string_literal: true
 
 require "dependabot/file_updaters"
@@ -12,14 +12,6 @@ module Dependabot
       extend T::Sig
 
       include Dependabot::Pub::Helpers
-
-      sig { override.returns(T::Array[Regexp]) }
-      def self.updated_files_regex
-        [
-          %r{^(.*/)?pubspec\.yaml$},
-          %r{^(.*/)?pubspec\.lock$}
-        ]
-      end
 
       sig { override.returns(T::Array[DependencyFile]) }
       def updated_dependency_files

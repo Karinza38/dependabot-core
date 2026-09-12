@@ -1,0 +1,327 @@
+# typed: strict
+# frozen_string_literal: true
+
+require "yaml"
+require "sorbet-runtime"
+require "dependabot/file_parsers"
+require "dependabot/file_parsers/base"
+require "dependabot/conda/requirement"
+require "dependabot/conda/version"
+require "dependabot/conda/package_manager"
+require "dependabot/conda/conda_registry_client"
+
+module Dependabot
+  module Conda
+    class FileParser < Dependabot::FileParsers::Base
+      extend T::Sig
+
+      ParsedDependency = T.type_alias do
+        {
+          name: String,
+          version: T.nilable(String),
+          requirements: T::Array[Dependabot::DependencyRequirement]
+        }
+      end
+
+      sig { override.returns(T::Array[Dependabot::Dependency]) }
+      def parse
+        dependencies = T.let([], T::Array[Dependabot::Dependency])
+
+        environment_files.each do |file|
+          dependencies.concat(parse_environment_file(file))
+        end
+
+        dependencies.uniq
+      end
+
+      sig { returns(Ecosystem) }
+      def ecosystem
+        @ecosystem ||= T.let(
+          Ecosystem.new(
+            name: ECOSYSTEM,
+            package_manager: package_manager,
+            language: nil
+          ),
+          T.nilable(Ecosystem)
+        )
+      end
+
+      private
+
+      sig { returns(Ecosystem::VersionManager) }
+      def package_manager
+        @package_manager ||= T.let(
+          CondaPackageManager.new,
+          T.nilable(Ecosystem::VersionManager)
+        )
+      end
+
+      sig { returns(T::Array[Dependabot::DependencyFile]) }
+      def environment_files
+        dependency_files.select { |f| f.name.match?(/^environment\.ya?ml$/i) }
+      end
+
+      sig { params(file: Dependabot::DependencyFile).returns(T::Array[Dependabot::Dependency]) }
+      def parse_environment_file(file)
+        dependencies = T.let([], T::Array[Dependabot::Dependency])
+
+        begin
+          content = file.content || ""
+          parsed_yaml = YAML.safe_load(content)
+          return dependencies unless parsed_yaml.is_a?(Hash)
+
+          # Parse main dependencies (conda packages)
+          if parsed_yaml["dependencies"].is_a?(Array)
+            dependencies.concat(parse_conda_dependencies(parsed_yaml["dependencies"], file))
+          end
+
+          # Parse pip dependencies if present
+          pip_deps = find_pip_dependencies(parsed_yaml["dependencies"])
+          dependencies.concat(parse_pip_dependencies(pip_deps, file)) if pip_deps
+        rescue Psych::SyntaxError, Psych::DisallowedClass => e
+          raise Dependabot::DependencyFileNotParseable, "Invalid YAML in #{file.name}: #{e.message}"
+        end
+
+        dependencies
+      end
+
+      sig do
+        params(
+          dependencies: T::Array[Object],
+          file: Dependabot::DependencyFile
+        ).returns(T::Array[Dependabot::Dependency])
+      end
+      def parse_conda_dependencies(dependencies, file)
+        parsed_dependencies = T.let([], T::Array[Dependabot::Dependency])
+
+        # Check if environment has fully qualified packages (Tier 2)
+        has_fully_qualified = dependencies.any? do |dep|
+          dep.is_a?(String) && fully_qualified_package?(dep)
+        end
+
+        dependencies.each do |dep|
+          next unless dep.is_a?(String)
+          next if dep.is_a?(Hash)
+          next if has_fully_qualified
+
+          parsed_dep = parse_conda_dependency_string(dep, file)
+          next unless parsed_dep
+
+          name = parsed_dep[:name]
+          next if name == "pip"
+
+          parsed_dependencies << create_dependency(
+            name: name,
+            version: parsed_dep[:version],
+            requirements: parsed_dep[:requirements],
+            package_manager: "conda"
+          )
+        end
+
+        parsed_dependencies
+      end
+
+      sig { params(dependencies: Object).returns(T.nilable(T::Array[String])) }
+      def find_pip_dependencies(dependencies)
+        return nil unless dependencies.is_a?(Array)
+
+        pip_section = dependencies.find { |dep| dep.is_a?(Hash) && dep["pip"] }
+        return nil unless pip_section
+
+        pip_deps = pip_section["pip"]
+        pip_deps.is_a?(Array) ? pip_deps : nil
+      end
+
+      sig do
+        params(pip_deps: T::Array[String], file: Dependabot::DependencyFile).returns(T::Array[Dependabot::Dependency])
+      end
+      def parse_pip_dependencies(pip_deps, file)
+        parsed_dependencies = T.let([], T::Array[Dependabot::Dependency])
+
+        pip_deps.each do |dep|
+          next unless dep.is_a?(String)
+
+          parsed_dep = parse_pip_dependency_string(dep, file)
+          next unless parsed_dep
+
+          parsed_dependencies << create_dependency(
+            name: parsed_dep[:name],
+            version: parsed_dep[:version],
+            requirements: parsed_dep[:requirements],
+            package_manager: "pip"
+          )
+        end
+
+        parsed_dependencies
+      end
+
+      sig { params(dep_string: String, file: Dependabot::DependencyFile).returns(T.nilable(ParsedDependency)) }
+      def parse_conda_dependency_string(dep_string, file)
+        return nil if dep_string.nil?
+
+        # Extract channel prefix before normalizing (e.g., "conda-forge::numpy=1.26.0")
+        channel = extract_channel_from_dependency_string(dep_string)
+
+        # Handle channel specifications: conda-forge::numpy=1.21.0
+        normalized_dep_string = normalize_conda_dependency_string(dep_string)
+        return nil if normalized_dep_string.nil?
+
+        # Handle bracket syntax: package[version='>=1.0']
+        if normalized_dep_string.include?("[")
+          bracket_match = normalized_dep_string.match(/^([a-zA-Z0-9_.-]+)\[version=['"](.+)['"]\]$/)
+          normalized_dep_string = "#{bracket_match[1]}#{bracket_match[2]}" if bracket_match
+        end
+        match = normalized_dep_string.match(/^([a-zA-Z0-9_.-]+)(?:\s*(.+))?$/)
+        return nil unless match
+
+        name = T.must(match[1])
+        constraint = match[2]&.strip
+
+        version = extract_conda_version(constraint)
+        requirements = build_conda_requirements(constraint, file, channel)
+
+        {
+          name: name,
+          version: version,
+          requirements: requirements
+        }
+      end
+
+      sig { params(dep_string: String).returns(T.nilable(String)) }
+      def extract_channel_from_dependency_string(dep_string)
+        return nil unless dep_string.include?("::")
+
+        channel = dep_string.split("::", 2).first
+        return nil unless channel
+        return nil unless CondaRegistryClient::SUPPORTED_CHANNELS.include?(channel)
+
+        channel
+      end
+
+      sig { params(dep_string: String).returns(T.nilable(String)) }
+      def normalize_conda_dependency_string(dep_string)
+        return dep_string unless dep_string.include?("::")
+
+        parts = dep_string.split("::", 2)
+        parts[1]
+      end
+
+      sig { params(constraint: T.nilable(String)).returns(T.nilable(String)) }
+      def extract_conda_version(constraint)
+        return nil unless constraint
+
+        case constraint
+        when /^==([0-9][a-zA-Z0-9._+-]+)$/
+          constraint[2..-1]
+        when /^=([0-9][a-zA-Z0-9._+-]+)$/
+          constraint[1..-1]
+        when /^>=([0-9][a-zA-Z0-9._+-]+)$/
+          constraint[2..-1]
+        when /^~=([0-9][a-zA-Z0-9._+-]+)$/
+          constraint[2..-1]
+        end
+      end
+
+      sig do
+        params(
+          constraint: T.nilable(String),
+          file: Dependabot::DependencyFile,
+          channel: T.nilable(String)
+        ).returns(T::Array[Dependabot::DependencyRequirement])
+      end
+      def build_conda_requirements(constraint, file, channel = nil)
+        source = channel ? { channel: channel } : nil
+
+        [Dependabot::DependencyRequirement.create(
+          requirement: constraint && !constraint.empty? ? constraint : nil,
+          file: file.name,
+          source: source,
+          groups: ["dependencies"]
+        )]
+      end
+
+      sig { params(dep_string: String, file: Dependabot::DependencyFile).returns(T.nilable(ParsedDependency)) }
+      def parse_pip_dependency_string(dep_string, file)
+        match = dep_string.match(/^([a-zA-Z0-9_.-]+)(?:\s*(==|>=|>|<=|<|!=|~=)\s*([0-9][a-zA-Z0-9._+-]*))?$/)
+        return nil unless match
+
+        name = T.must(match[1])
+        operator = match[2]
+        version = match[3]
+
+        extracted_version = nil
+        if version
+          case operator
+          when "==", "="
+            extracted_version = version
+          when ">=", "~="
+            extracted_version = version
+          when ">"
+            extracted_version = nil
+          when "<=", "<", "!="
+            extracted_version = nil
+          end
+        end
+
+        requirements = T.let([], T::Array[Dependabot::DependencyRequirement])
+        if operator && version
+          requirements << Dependabot::DependencyRequirement.create(
+            requirement: "#{operator}#{version}",
+            file: file.name,
+            source: nil,
+            groups: ["pip"]
+          )
+        end
+
+        {
+          name: name,
+          version: extracted_version,
+          requirements: requirements
+        }
+      end
+
+      sig do
+        params(
+          name: String,
+          version: T.nilable(String),
+          requirements: T::Array[Dependabot::DependencyRequirement],
+          package_manager: String
+        ).returns(Dependabot::Dependency)
+      end
+      def create_dependency(name:, version:, requirements:, package_manager:)
+        Dependabot::Dependency.new(
+          name: name,
+          version: version,
+          requirements: requirements,
+          package_manager: package_manager
+        )
+      end
+
+      sig { params(dep_string: String).returns(T::Boolean) }
+      def fully_qualified_package?(dep_string)
+        # Fully qualified: name=version=build_string (e.g., python=3.9.7=h60c2a47_0)
+        # Reject compound/ranged constraints that contain comparator characters
+        return false if dep_string.match?(/[<>!~,]/)
+        return false if dep_string.include?("==")
+        return false if dep_string.include?("[")
+
+        parts = dep_string.split("=")
+        return false unless parts.length == 3
+
+        name = T.must(parts[0])
+        version = T.must(parts[1])
+        build_string = T.must(parts[2])
+        return false if name.empty? || version.empty? || build_string.empty?
+
+        build_string.match?(/^[a-zA-Z0-9_]+$/)
+      end
+
+      sig { override.returns(T::Boolean) }
+      def check_required_files
+        dependency_files.any? { |f| f.name.match?(/^environment\.ya?ml$/i) }
+      end
+    end
+  end
+end
+
+Dependabot::FileParsers.register("conda", Dependabot::Conda::FileParser)

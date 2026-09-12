@@ -1,0 +1,592 @@
+using System.Collections.Immutable;
+using System.Text.Json;
+
+using NuGet.Versioning;
+
+using NuGetUpdater.Core.Analyze;
+using NuGetUpdater.Core.Run;
+using NuGetUpdater.Core.Run.ApiModel;
+using NuGetUpdater.Core.Test.Utilities;
+
+using Xunit;
+
+using DepType = NuGetUpdater.Core.Run.ApiModel.DependencyType;
+
+namespace NuGetUpdater.Core.Test.Run.ApiModel;
+
+public class JobTests
+{
+    [Theory]
+    [MemberData(nameof(IsUpdatePermittedTestData))]
+    public void IsUpdatePermitted(Job job, Dependency dependency, bool expectedResult)
+    {
+        var actualResult = job.IsUpdatePermitted(dependency);
+        Assert.Equal(expectedResult, actualResult);
+    }
+
+    public static IEnumerable<object?[]> IsUpdatePermittedTestData()
+    {
+        // with default allowed updates on a transitive dependency
+        yield return
+        [
+            CreateJob(
+                allowedUpdates: [
+                    new AllowedUpdate() { DependencyType = DepType.Direct, UpdateType = UpdateType.All }
+                ],
+                dependencies: [],
+                existingPrs: [],
+                securityAdvisories: [
+                    new Advisory() { DependencyName = "Some.Package", AffectedVersions = [], PatchedVersions = [Requirement.Parse(">= 1.11.0")], UnaffectedVersions = [] }
+                ],
+                securityUpdatesOnly: false,
+                updatingAPullRequest: false),
+            new Dependency("Some.Package", "1.8.0", DependencyType.PackageReference, IsTopLevel: false),
+            // expectedResult
+            false,
+        ];
+
+        // when dealing with a security update
+        yield return
+        [
+            CreateJob(
+                allowedUpdates: [
+                    new AllowedUpdate() { DependencyType = DepType.Direct, UpdateType = UpdateType.All }
+                ],
+                dependencies: [],
+                existingPrs: [],
+                securityAdvisories: [
+                    new Advisory() { DependencyName = "Some.Package", AffectedVersions = [], PatchedVersions = [Requirement.Parse(">= 1.11.0")], UnaffectedVersions = [] }
+                ],
+                securityUpdatesOnly: true,
+                updatingAPullRequest: false),
+            new Dependency("Some.Package", "1.8.0", DependencyType.PackageReference, IsTopLevel: false),
+            // expectedResult
+            true,
+        ];
+
+        // with a top-level dependency
+        yield return
+        [
+            CreateJob(
+            allowedUpdates: [
+                    new AllowedUpdate() { DependencyType = DepType.Direct, UpdateType = UpdateType.All },
+                    new AllowedUpdate() { DependencyType = DepType.Indirect, UpdateType = UpdateType.Security }
+                ],
+                dependencies: [],
+                existingPrs: [],
+                securityAdvisories: [],
+                securityUpdatesOnly: false,
+                updatingAPullRequest: false),
+            new Dependency("Some.Package", "1.8.0", DependencyType.PackageReference, IsTopLevel: true),
+            // expectedResult
+            true,
+        ];
+
+        // with a sub-dependency
+        yield return
+        [
+            CreateJob(
+            allowedUpdates: [
+                    new AllowedUpdate() { DependencyType = DepType.Direct, UpdateType = UpdateType.All },
+                    new AllowedUpdate() { DependencyType = DepType.Indirect, UpdateType = UpdateType.Security }
+                ],
+                dependencies: [],
+                existingPrs: [],
+                securityAdvisories: [],
+                securityUpdatesOnly: false,
+                updatingAPullRequest: false),
+            new Dependency("Some.Package", "1.8.0", DependencyType.PackageReference, IsTopLevel: false),
+            // expectedResult
+            false,
+        ];
+
+        // when insecure
+        yield return
+        [
+            CreateJob(
+            allowedUpdates: [
+                    new AllowedUpdate() { DependencyType = DepType.Direct, UpdateType = UpdateType.All },
+                    new AllowedUpdate() { DependencyType = DepType.Indirect, UpdateType = UpdateType.Security }
+                ],
+                dependencies: [],
+                existingPrs: [],
+                securityAdvisories: [
+                    new Advisory() { DependencyName = "Some.Package", AffectedVersions = [], PatchedVersions = [Requirement.Parse(">= 1.11.0")], UnaffectedVersions = [] }
+                ],
+                securityUpdatesOnly: false,
+                updatingAPullRequest: false),
+            new Dependency("Some.Package", "1.8.0", DependencyType.PackageReference, IsTopLevel: false),
+            // expectedResult
+            true,
+        ];
+
+        // when only security fixes are allowed
+        yield return
+        [
+            CreateJob(
+            allowedUpdates: [
+                    new AllowedUpdate() { DependencyType = DepType.Direct, UpdateType = UpdateType.All },
+                    new AllowedUpdate() { DependencyType = DepType.Indirect, UpdateType = UpdateType.Security }
+                ],
+                dependencies: [],
+                existingPrs: [],
+                securityAdvisories: [],
+                securityUpdatesOnly: true,
+                updatingAPullRequest: false),
+            new Dependency("Some.Package", "1.8.0", DependencyType.PackageReference, IsTopLevel: true),
+            // expectedResult
+            false,
+        ];
+
+        // when dealing with a security fix
+        yield return
+        [
+            CreateJob(
+            allowedUpdates: [
+                    new AllowedUpdate() { DependencyType = DepType.Direct, UpdateType = UpdateType.All },
+                    new AllowedUpdate() { DependencyType = DepType.Indirect, UpdateType = UpdateType.Security }
+                ],
+                dependencies: [],
+                existingPrs: [],
+                securityAdvisories: [
+                    new Advisory() { DependencyName = "Some.Package", AffectedVersions = [], PatchedVersions = [Requirement.Parse(">= 1.11.0")], UnaffectedVersions = [] }
+                ],
+                securityUpdatesOnly: true,
+                updatingAPullRequest: false),
+            new Dependency("Some.Package", "1.8.0", DependencyType.PackageReference, IsTopLevel: true),
+            // expectedResult
+            true,
+        ];
+
+        // when dealing with a security fix that doesn't apply
+        yield return
+        [
+            CreateJob(
+            allowedUpdates: [
+                    new AllowedUpdate() { DependencyType = DepType.Direct, UpdateType = UpdateType.All },
+                    new AllowedUpdate() { DependencyType = DepType.Indirect, UpdateType = UpdateType.Security }
+                ],
+                dependencies: [],
+                existingPrs: [],
+                securityAdvisories: [
+                    new Advisory() { DependencyName = "Some.Package", AffectedVersions = [Requirement.Parse("> 1.8.0")], PatchedVersions = [], UnaffectedVersions = [] }
+                ],
+                securityUpdatesOnly: true,
+                updatingAPullRequest: false),
+            new Dependency("Some.Package", "1.8.0", DependencyType.PackageReference, IsTopLevel: true),
+            // expectedResult
+            false,
+        ];
+
+        // when dealing with a security fix that doesn't apply to some versions
+        yield return
+        [
+            CreateJob(
+            allowedUpdates: [
+                    new AllowedUpdate() { DependencyType = DepType.Direct, UpdateType = UpdateType.All },
+                    new AllowedUpdate() { DependencyType = DepType.Indirect, UpdateType = UpdateType.Security }
+                ],
+                dependencies: [],
+                existingPrs: [],
+                securityAdvisories: [
+                    new Advisory() { DependencyName = "Some.Package", AffectedVersions = [Requirement.Parse("< 1.8.0"), Requirement.Parse("> 1.8.0")], PatchedVersions = [], UnaffectedVersions = [] }
+                ],
+                securityUpdatesOnly: true,
+                updatingAPullRequest: false),
+            new Dependency("Some.Package", "1.8.1", DependencyType.PackageReference, IsTopLevel: true),
+            // expectedResult
+            true,
+        ];
+
+        // when a dependency allow list that includes the dependency
+        yield return
+        [
+            CreateJob(
+                allowedUpdates: [
+                    new AllowedUpdate() { DependencyName = "Some.Package" }
+                ],
+                dependencies: [],
+                existingPrs: [],
+                securityAdvisories: [],
+                securityUpdatesOnly: false,
+                updatingAPullRequest: false),
+            new Dependency("Some.Package", "1.8.0", DependencyType.PackageReference, IsTopLevel: true),
+            // expectedResult
+            true,
+        ];
+
+        // with a dependency allow list that uses a wildcard
+        yield return
+        [
+            CreateJob(
+                allowedUpdates: [
+                    new AllowedUpdate() { DependencyName = "Some.*" }
+                ],
+                dependencies: [],
+                existingPrs: [],
+                securityAdvisories: [],
+                securityUpdatesOnly: false,
+                updatingAPullRequest: false),
+            new Dependency("Some.Package", "1.8.0", DependencyType.PackageReference, IsTopLevel: true),
+            // expectedResult
+            true,
+        ];
+
+        // when dependency allow list that excludes the dependency
+        yield return
+        [
+            CreateJob(
+                allowedUpdates: [
+                    new AllowedUpdate() { DependencyName = "Unrelated.Package" }
+                ],
+                dependencies: [],
+                existingPrs: [],
+                securityAdvisories: [],
+                securityUpdatesOnly: false,
+                updatingAPullRequest: false),
+            new Dependency("Some.Package", "1.8.0", DependencyType.PackageReference, IsTopLevel: true),
+            // expectedResult
+            false,
+        ];
+
+        // when matching with an incomplete dependency name
+        yield return
+        [
+            CreateJob(
+                allowedUpdates: [
+                    new AllowedUpdate() { DependencyName = "Some" }
+                ],
+                dependencies: [],
+                existingPrs: [],
+                securityAdvisories: [],
+                securityUpdatesOnly: false,
+                updatingAPullRequest: false),
+            new Dependency("Some.Package", "1.8.0", DependencyType.PackageReference, IsTopLevel: true),
+            // expectedResult
+            false,
+        ];
+
+        // with a dependency allow list that uses a wildcard
+        yield return
+        [
+            CreateJob(
+                allowedUpdates: [
+                    new AllowedUpdate() { DependencyName = "Unrelated.*" }
+                ],
+                dependencies: [],
+                existingPrs: [],
+                securityAdvisories: [],
+                securityUpdatesOnly: false,
+                updatingAPullRequest: false),
+            new Dependency("Some.Package", "1.8.0", DependencyType.PackageReference, IsTopLevel: true),
+            // expectedResult
+            false,
+        ];
+
+        // when security fixes are also allowed
+        yield return
+        [
+            CreateJob(
+                allowedUpdates: [
+                    new AllowedUpdate() { DependencyName = "Unrelated.Package" },
+                    new AllowedUpdate() { UpdateType = UpdateType.Security }
+                ],
+                dependencies: [],
+                existingPrs: [],
+                securityAdvisories: [],
+                securityUpdatesOnly: false,
+                updatingAPullRequest: false),
+            new Dependency("Some.Package", "1.8.0", DependencyType.PackageReference, IsTopLevel: true),
+            // expectedResult
+            false,
+        ];
+
+        // when dealing with a security fix
+        yield return
+        [
+            CreateJob(
+                allowedUpdates: [
+                    new AllowedUpdate() { DependencyName = "Unrelated.Package"}, new AllowedUpdate(){ UpdateType = UpdateType.Security }
+                ],
+                dependencies: [],
+                existingPrs: [],
+                securityAdvisories: [
+                    new Advisory() { DependencyName = "Some.Package", AffectedVersions = [], PatchedVersions = [Requirement.Parse(">= 1.11.0")], UnaffectedVersions = [] }
+                ],
+                securityUpdatesOnly: false,
+                updatingAPullRequest: false),
+            new Dependency("Some.Package", "1.8.0", DependencyType.PackageReference, IsTopLevel: true),
+            // expectedResult
+            true,
+        ];
+
+        // security job, not vulnerable => security update not needed
+        yield return
+        [
+            CreateJob(
+                allowedUpdates: [
+                    new AllowedUpdate() { UpdateType = UpdateType.Security }
+                ],
+                dependencies: [],
+                existingPrs: [],
+                securityAdvisories: [
+                    new Advisory() { DependencyName = "Some.Package", AffectedVersions = [Requirement.Parse("1.0.0")], PatchedVersions = [Requirement.Parse("1.1.0")] }
+                ],
+                securityUpdatesOnly: true,
+                updatingAPullRequest: false),
+            new Dependency("Some.Package", "1.1.0", DependencyType.PackageReference),
+            // expectedResult
+            false,
+        ];
+
+        // security job, not updating existing => pr already exists
+        yield return
+        [
+            CreateJob(
+                allowedUpdates: [
+                    new AllowedUpdate() { UpdateType = UpdateType.Security }
+                ],
+                dependencies: [],
+                existingPrs: [
+                    new PullRequest() { Dependencies = [new PullRequestDependency() { DependencyName = "Some.Package", DependencyVersion = NuGetVersion.Parse("1.2.0") }] }
+                ],
+                securityAdvisories: [
+                    new Advisory() { DependencyName = "Some.Package", AffectedVersions = [Requirement.Parse("1.1.0")] }
+                ],
+                securityUpdatesOnly: true,
+                updatingAPullRequest: false),
+            new Dependency("Some.Package", "1.1.0", DependencyType.PackageReference),
+            // expectedResult
+            false,
+        ];
+
+        // security job, updating existing => do update
+        yield return
+        [
+            CreateJob(
+                allowedUpdates: [
+                    new AllowedUpdate() { UpdateType = UpdateType.All, DependencyType = DepType.Direct }
+                ],
+                dependencies: ["Some.Package"],
+                existingPrs: [
+                    new PullRequest() { Dependencies = [new PullRequestDependency() { DependencyName = "Some.Package", DependencyVersion = NuGetVersion.Parse("1.1.0") }] }
+                ],
+                securityAdvisories: [
+                    new Advisory() { DependencyName = "Some.Package", AffectedVersions = [Requirement.Parse(">= 1.0.0, < 1.1.0")] }
+                ],
+                securityUpdatesOnly: true,
+                updatingAPullRequest: true),
+            new Dependency("Some.Package", "1.0.0", DependencyType.PackageReference),
+            // expectedResult
+            true,
+        ];
+    }
+
+    [Fact]
+    public async Task ExpandJobDirectories()
+    {
+        // arrange
+        using var tempDir = await TemporaryDirectory.CreateWithContentsAsync(
+            // file names are irrelevant, but make this function easy to use
+            ("src/client/android/ui/file.txt", "contents irrelevant"),
+            ("src/client/ios/ui/file.txt", "contents irrelevant"),
+            ("src/legacy/winphone/ui/file.txt", "contents irrelevant"),
+            ("src/server/linux/cloud/file.txt", "contents irrelevant"),
+            ("src/server/windows/file.txt", "contents irrelevant")
+        );
+        var job = new Job()
+        {
+            Source = new()
+            {
+                Provider = "github",
+                Repo = "test/repo",
+                Directories = [
+                    "src/server/linux", // single value
+                    "src/client/*/ui", // wildcard
+                ]
+            }
+        };
+
+        // act
+        var actualDirectories = job.GetAllDirectories(tempDir.DirectoryPath);
+
+        // assert - directories were expanded and original order maintained
+        var expectedDirectories = new[]
+        {
+            "/src/server/linux",
+            "/src/client/android/ui",
+            "/src/client/ios/ui"
+        }.ToImmutableArray();
+        AssertEx.Equal(expectedDirectories, actualDirectories);
+    }
+
+    [Fact]
+    public void ExpandJobDirectoriesIgnoresNullEntries()
+    {
+        // arrange
+        using var tempDir = new TemporaryDirectory();
+        var json = """
+            {
+              "job": {
+                "package-manager": "nuget",
+                "source": {
+                  "provider": "github",
+                  "repo": "test/repo",
+                  "directories": [
+                    null
+                  ]
+                }
+              }
+            }
+            """;
+        var job = RunWorker.Deserialize(json).Job;
+
+        // act - the null entry should be ignored, not cause a NullReferenceException
+        var actualDirectories = job.GetAllDirectories(tempDir.DirectoryPath);
+
+        // assert - null entry was filtered out, falling back to the repo root
+        var expectedDirectories = new[]
+        {
+            "/",
+        }.ToImmutableArray();
+        AssertEx.Equal(expectedDirectories, actualDirectories);
+    }
+
+    [Theory]
+    [InlineData("version", JobCommand.Version)]
+    [InlineData("update", JobCommand.Update)]
+    [InlineData("recreate", JobCommand.Recreate)]
+    [InlineData("security", JobCommand.Security)]
+    [InlineData("graph", JobCommand.Graph)]
+    [InlineData("", JobCommand.None)]
+    public void CommandDeserialization_KnownValues(string commandValue, JobCommand expectedCommand)
+    {
+        var json = $$"""
+            {
+              "job": {
+                "package-manager": "nuget",
+                "command": "{{commandValue}}",
+                "source": {
+                  "provider": "github",
+                  "repo": "test/repo",
+                  "directory": "/"
+                }
+              }
+            }
+            """;
+        var jobFile = RunWorker.Deserialize(json);
+        Assert.Equal(expectedCommand, jobFile.Job.Command);
+    }
+
+    [Fact]
+    public void CommandDeserialization_MissingField_DefaultsToNone()
+    {
+        var json = """
+            {
+              "job": {
+                "package-manager": "nuget",
+                "source": {
+                  "provider": "github",
+                  "repo": "test/repo",
+                  "directory": "/"
+                }
+              }
+            }
+            """;
+        var jobFile = RunWorker.Deserialize(json);
+        Assert.Equal(JobCommand.None, jobFile.Job.Command);
+    }
+
+    [Fact]
+    public void CommandDeserialization_NullValue_DefaultsToNone()
+    {
+        var json = """
+            {
+              "job": {
+                "package-manager": "nuget",
+                "command": null,
+                "source": {
+                  "provider": "github",
+                  "repo": "test/repo",
+                  "directory": "/"
+                }
+              }
+            }
+            """;
+        var jobFile = RunWorker.Deserialize(json);
+        Assert.Equal(JobCommand.None, jobFile.Job.Command);
+    }
+
+    [Fact]
+    public void CommandDeserialization_NonStringToken_DefaultsToNoneAndLogsWarning()
+    {
+        var json = """
+            {
+              "job": {
+                "package-manager": "nuget",
+                "command": 42,
+                "source": {
+                  "provider": "github",
+                  "repo": "test/repo",
+                  "directory": "/"
+                }
+              }
+            }
+            """;
+
+        var logger = new StringLogger();
+        var jobFile = RunWorker.Deserialize(json, logger);
+        Assert.Equal(JobCommand.None, jobFile.Job.Command);
+        Assert.Contains(logger.Messages, m => m.Contains("Unexpected JSON token type"));
+    }
+
+    [Fact]
+    public void CommandDeserialization_UnknownValue_DefaultsToNoneAndLogsWarning()
+    {
+        var json = """
+            {
+              "job": {
+                "package-manager": "nuget",
+                "command": "unknown_value",
+                "source": {
+                  "provider": "github",
+                  "repo": "test/repo",
+                  "directory": "/"
+                }
+              }
+            }
+            """;
+
+        var logger = new StringLogger();
+        var options = new JsonSerializerOptions(RunWorker.SerializerOptions);
+        // replace the default converter with one using our test logger
+        options.Converters.Insert(0, new JobCommandConverter(logger));
+        var jobFile = JsonSerializer.Deserialize<JobFile>(json, options)!;
+        Assert.Equal(JobCommand.None, jobFile.Job.Command);
+        Assert.Contains(logger.Messages, m => m.Contains("Unknown job command value") && m.Contains("unknown_value"));
+    }
+
+    private static Job CreateJob(
+        ImmutableArray<AllowedUpdate> allowedUpdates,
+        ImmutableArray<string> dependencies,
+        ImmutableArray<PullRequest> existingPrs,
+        ImmutableArray<Advisory> securityAdvisories,
+        bool securityUpdatesOnly,
+        bool updatingAPullRequest)
+    {
+        return new Job()
+        {
+            AllowedUpdates = allowedUpdates,
+            Dependencies = dependencies,
+            ExistingPullRequests = existingPrs,
+            SecurityAdvisories = securityAdvisories,
+            SecurityUpdatesOnly = securityUpdatesOnly,
+            Source = new()
+            {
+                Provider = "nuget",
+                Repo = "test/repo",
+            },
+            UpdatingAPullRequest = updatingAPullRequest,
+        };
+    }
+}

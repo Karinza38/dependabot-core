@@ -18,12 +18,14 @@ RSpec.describe namespace::PoetryVersionResolver do
   end
 
   let(:credentials) do
-    [Dependabot::Credential.new({
-      "type" => "git_source",
-      "host" => "github.com",
-      "username" => "x-access-token",
-      "password" => "token"
-    })]
+    [Dependabot::Credential.new(
+      {
+        "type" => "git_source",
+        "host" => "github.com",
+        "username" => "x-access-token",
+        "password" => "token"
+      }
+    )]
   end
   let(:dependency_files) { [pyproject, lockfile] }
   let(:pyproject) do
@@ -91,6 +93,30 @@ RSpec.describe namespace::PoetryVersionResolver do
     context "with a dependency defined under a non-dev group" do
       let(:pyproject_content) do
         super().gsub("[tool.poetry.dependencies]", "[tool.poetry.group.docs.dependencies]")
+      end
+
+      it { is_expected.to eq(Gem::Version.new("2.18.4")) }
+    end
+
+    context "with a metadata-only poetry group" do
+      let(:pyproject_fixture_name) { "poetry_metadata_only_group.toml" }
+
+      it "resolves the latest version when a poetry group has no dependencies table" do
+        expect(latest_resolvable_version).to eq(Gem::Version.new("2.18.4"))
+      end
+    end
+
+    context "with a non-package mode project" do
+      let(:pyproject_fixture_name) { "poetry_non_package_mode_simple.toml" }
+      let(:lockfile_fixture_name) { "version_not_specified.lock" }
+      let(:dependency_version) { "2.18.0" }
+      let(:dependency_requirements) do
+        [{
+          file: "pyproject.toml",
+          requirement: "*",
+          groups: ["dependencies"],
+          source: nil
+        }]
       end
 
       it { is_expected.to eq(Gem::Version.new("2.18.4")) }
@@ -372,18 +398,48 @@ RSpec.describe namespace::PoetryVersionResolver do
         end
       end
     end
+
+    context "when checking a security fix version" do
+      context "when the fix version is resolvable" do
+        let(:version) { Gem::Version.new("2.18.1") }
+
+        it "confirms the security fix can be applied" do
+          expect(resolvable).to be(true)
+        end
+      end
+
+      context "when the fix version is too high for transitive constraints" do
+        let(:version) { Gem::Version.new("99.0.0") }
+
+        it "indicates the security fix is not installable" do
+          expect(resolvable).to be(false)
+        end
+      end
+    end
   end
 
   describe "handles SharedHelpers::HelperSubprocessFailed errors raised by version resolver" do
     subject(:poetry_error_handler) { error_handler.handle_poetry_error(exception) }
 
+    let(:exception) { Exception.new(response) }
     let(:error_handler) do
       Dependabot::Python::PoetryErrorHandler.new(
         dependencies: dependency,
         dependency_files: dependency_files
       )
     end
-    let(:exception) { Exception.new(response) }
+
+    context "with 'Cannot enrich dependency with incompatible constraints' error" do
+      let(:response) do
+        "Cannot enrich dependency with incompatible constraints: foo (>=1.0.0) and foo (<1.0.0)"
+      end
+
+      it "raises a helpful error with details" do
+        expect { poetry_error_handler }.to raise_error(Dependabot::DependencyFileNotResolvable) do |error|
+          expect(error.message).to include("Incompatible version constraints for foo: >=1.0.0 vs <1.0.0")
+        end
+      end
+    end
 
     context "with incompatible constraints mentioned in requirements" do
       let(:response) { "Incompatible constraints in requirements of histolab (0.7.0):" }
@@ -549,6 +605,137 @@ RSpec.describe namespace::PoetryVersionResolver do
             .to include("scipy requires Python <3.13,>=3.9, so it will not be satisfied for")
         end
       end
+    end
+
+    context "with a misconfigured pyproject.toml file" do
+      let(:response) do
+        "Creating virtualenv analysis-nlUUV3qa-py3.13 in pypoetry/virtualenvs
+        Updating dependencies
+        Resolving dependencies...
+        list index out of range"
+      end
+
+      it "raises a helpful error" do
+        expect { poetry_error_handler }.to raise_error(Dependabot::DependencyFileNotResolvable)
+      end
+    end
+
+    context "with a timed out response error" do
+      let(:response) do
+        "HTTPSConnectionPool(host='nexus.nee.com', port=443): " \
+          "Max retries exceeded with url:  (Caused by ProxyError('Unable to connect to proxy'" \
+          ", RemoteDisconnected('Remote end closed connection without response')))"
+      end
+
+      it "raises a helpful error" do
+        expect { poetry_error_handler }.to raise_error(Dependabot::InconsistentRegistryResponse)
+      end
+    end
+
+    context "with a timed out response error" do
+      let(:response) do
+        "HTTPSConnectionPool(host='pypi.pymetrics.com', port=443): Read timed out. (read timeout=15)"
+      end
+
+      it "raises a helpful error" do
+        expect { poetry_error_handler }.to raise_error(Dependabot::InconsistentRegistryResponse)
+      end
+    end
+
+    context "with a 500 server error" do
+      let(:response) do
+        "500 Server Error: Internal Server Error for url: http://nexus.bvc.euc1.lan/repository/le/adup-utils/"
+      end
+
+      it "raises a helpful error" do
+        expect { poetry_error_handler }.to raise_error(Dependabot::InconsistentRegistryResponse)
+      end
+    end
+
+    context "with version solving failed error" do
+      let(:response) do
+        "Creating virtualenv mobileweb-h6LnalBm-py3.13 in /home/dependabot/.cache/pypoetry/virtualenvs" \
+          "Updating dependencies" \
+          "Resolving dependencies..." \
+          "Unable to determine package info for cryptography"
+      end
+
+      it "raises a helpful error" do
+        expect { poetry_error_handler }.to raise_error(Dependabot::DependencyFileNotResolvable)
+      end
+    end
+
+    context "with a self dependency error" do
+      let(:response) do
+        "Creating virtualenv mobileweb-h6LnalBm-py3.13 in /home/dependabot/.cache/pypoetry/virtualenvs" \
+          "Updating dependencies" \
+          "Resolving dependencies..." \
+          "Package 'tensorflow-macos' is listed as a dependency of itself."
+      end
+
+      it "raises a helpful error" do
+        expect { poetry_error_handler }.to raise_error(Dependabot::DependencyFileNotResolvable)
+      end
+    end
+
+    context "with a variation of incompatible constraints error" do
+      let(:response) do
+        "Creating virtualenv mobileweb-h6LnalBm-py3.13 in /home/dependabot/.cache/pypoetry/virtualenvs" \
+          "Updating dependencies" \
+          "Resolving dependencies..." \
+          "Incompatible constraints in requirements of reflector (0.1.0):" \
+          "types-setuptools (==75.8.0.20250210)" \
+          "types-setuptools (>=69.1.0.20240308,<70.0.0.0)"
+      end
+
+      it "raises a helpful error" do
+        expect { poetry_error_handler }.to raise_error(Dependabot::DependencyFileNotResolvable)
+      end
+    end
+
+    context "with a project is listed a dependency" do
+      let(:response) do
+        "Creating virtualenv kiota-serialization-multipart-GzD6BRdm-py3.13 in " \
+          "/home/dependabot/.cache/pypoetry/virtualenvs" \
+          "Updating dependencies" \
+          "Resolving dependencies..." \
+          "Path tmp/20250109-1637-dc4aky/json for kiota-serialization-json does not exist"
+      end
+
+      it "raises a helpful error" do
+        expect { poetry_error_handler }.to raise_error(Dependabot::DependencyFileNotResolvable)
+      end
+    end
+  end
+
+  describe "plugin installation during resolution" do
+    it "invokes the poetry plugin installer" do
+      plugin_installer = instance_double(
+        Dependabot::Python::PoetryPluginInstaller,
+        install_required_plugins: nil
+      )
+      allow(Dependabot::Python::PoetryPluginInstaller)
+        .to receive(:from_dependency_files).and_return(plugin_installer)
+      allow(Dependabot::SharedHelpers).to receive(:in_a_temporary_directory).and_yield
+      allow(Dependabot::SharedHelpers).to receive(:with_git_configured).and_yield
+      allow(Dependabot::SharedHelpers).to receive(:run_shell_command).and_return("")
+
+      language_version_manager = instance_double(
+        Dependabot::Python::LanguageVersionManager,
+        install_required_python: nil
+      )
+      allow(resolver).to receive_messages(
+        language_version_manager: language_version_manager,
+        write_temporary_dependency_files: nil
+      )
+
+      begin
+        resolver.latest_resolvable_version(requirement: "*")
+      rescue StandardError
+        nil
+      end
+
+      expect(plugin_installer).to have_received(:install_required_plugins)
     end
   end
 end

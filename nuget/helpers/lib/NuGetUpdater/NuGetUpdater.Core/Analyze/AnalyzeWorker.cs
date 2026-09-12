@@ -7,6 +7,7 @@ using NuGet.Frameworks;
 using NuGet.Versioning;
 
 using NuGetUpdater.Core.Discover;
+using NuGetUpdater.Core.Run.ApiModel;
 
 namespace NuGetUpdater.Core.Analyze;
 
@@ -16,6 +17,8 @@ public partial class AnalyzeWorker : IAnalyzeWorker
 {
     public const string AnalysisDirectoryName = "./.dependabot/analysis";
 
+    private readonly string _jobId;
+    private readonly ExperimentsManager _experimentsManager;
     private readonly ILogger _logger;
 
     internal static readonly JsonSerializerOptions SerializerOptions = new()
@@ -24,8 +27,10 @@ public partial class AnalyzeWorker : IAnalyzeWorker
         Converters = { new JsonStringEnumConverter(), new RequirementArrayConverter() },
     };
 
-    public AnalyzeWorker(ILogger logger)
+    public AnalyzeWorker(string jobId, ExperimentsManager experimentsManager, ILogger logger)
     {
+        _jobId = jobId;
+        _experimentsManager = experimentsManager;
         _logger = logger;
     }
 
@@ -46,15 +51,11 @@ public partial class AnalyzeWorker : IAnalyzeWorker
         {
             analysisResult = await RunAsync(repoRoot, discovery, dependencyInfo);
         }
-        catch (HttpRequestException ex)
-        when (ex.StatusCode == HttpStatusCode.Unauthorized || ex.StatusCode == HttpStatusCode.Forbidden)
+        catch (Exception ex)
         {
-            var localPath = PathHelper.JoinPath(repoRoot, discovery.Path);
-            using var nugetContext = new NuGetContext(localPath);
             analysisResult = new AnalysisResult
             {
-                ErrorType = ErrorType.AuthenticationFailure,
-                ErrorDetails = "(" + string.Join("|", nugetContext.PackageSources.Select(s => s.Source)) + ")",
+                Error = JobErrorBase.ErrorFromException(ex, _jobId, PathHelper.JoinPath(repoRoot, discovery.Path)),
                 UpdatedVersion = string.Empty,
                 CanUpdate = false,
                 UpdatedDependencies = [],
@@ -66,6 +67,8 @@ public partial class AnalyzeWorker : IAnalyzeWorker
 
     public async Task<AnalysisResult> RunAsync(string repoRoot, WorkspaceDiscoveryResult discovery, DependencyInfo dependencyInfo)
     {
+        MSBuildHelper.RegisterMSBuild(repoRoot, repoRoot, _logger);
+
         var startingDirectory = PathHelper.JoinPath(repoRoot, discovery.Path);
 
         _logger.Info($"Starting analysis of {dependencyInfo.Name}...");
@@ -81,7 +84,7 @@ public partial class AnalyzeWorker : IAnalyzeWorker
             .Select(NuGetFramework.Parse)
             .ToImmutableArray();
         var propertyBasedDependencies = discovery.Projects.SelectMany(p
-            => p.Dependencies.Where(d => !d.IsTransitive &&
+            => p.Dependencies.Where(d => d.IsTopLevel &&
                 d.EvaluationResult?.RootPropertyName is not null)
             ).ToImmutableArray();
         var dotnetToolsHasDependency = discovery.DotNetToolsJson?.Dependencies.Any(d => d.Name.Equals(dependencyInfo.Name, StringComparison.OrdinalIgnoreCase)) == true;
@@ -146,12 +149,12 @@ public partial class AnalyzeWorker : IAnalyzeWorker
             else if (dotnetToolsHasDependency)
             {
                 var infoUrl = await nugetContext.GetPackageInfoUrlAsync(dependencyInfo.Name, updatedVersion.ToNormalizedString(), CancellationToken.None);
-                updatedDependencies = [new Dependency(dependencyInfo.Name, updatedVersion.ToNormalizedString(), DependencyType.DotNetTool, IsDirect: true, InfoUrl: infoUrl)];
+                updatedDependencies = [new Dependency(dependencyInfo.Name, updatedVersion.ToNormalizedString(), DependencyType.DotNetTool, InfoUrl: infoUrl)];
             }
             else if (globalJsonHasDependency)
             {
                 var infoUrl = await nugetContext.GetPackageInfoUrlAsync(dependencyInfo.Name, updatedVersion.ToNormalizedString(), CancellationToken.None);
-                updatedDependencies = [new Dependency(dependencyInfo.Name, updatedVersion.ToNormalizedString(), DependencyType.MSBuildSdk, IsDirect: true, InfoUrl: infoUrl)];
+                updatedDependencies = [new Dependency(dependencyInfo.Name, updatedVersion.ToNormalizedString(), DependencyType.MSBuildSdk, InfoUrl: infoUrl)];
             }
             else
             {
@@ -190,11 +193,11 @@ public partial class AnalyzeWorker : IAnalyzeWorker
             return true;
         }
 
-        // Since the dependency is not vulnerable, we only need to update if it is not transitive.
+        // Since the dependency is not vulnerable, we only need to update if it is a top-level dependency.
         return projectsWithDependency.Any(p =>
             p.Dependencies.Any(d =>
                 d.Name.Equals(dependencyInfo.Name, StringComparison.OrdinalIgnoreCase) &&
-                !d.IsTransitive));
+                d.IsTopLevel));
     }
 
     private static Task<WorkspaceDiscoveryResult> DeserializeWorkspaceDiscoveryResultFileAsync(string path)
@@ -232,7 +235,9 @@ public partial class AnalyzeWorker : IAnalyzeWorker
         CancellationToken cancellationToken)
     {
         var versionResult = await VersionFinder.GetVersionsAsync(
+            projectFrameworks,
             dependencyInfo,
+            DateTimeOffset.UtcNow,
             nugetContext,
             logger,
             cancellationToken);
@@ -243,33 +248,6 @@ public partial class AnalyzeWorker : IAnalyzeWorker
             versionResult,
             projectFrameworks,
             findLowestVersion: dependencyInfo.IsVulnerable,
-            nugetContext,
-            logger,
-            cancellationToken);
-    }
-
-    internal static async Task<NuGetVersion?> FindUpdatedVersionAsync(
-        ImmutableHashSet<string> packageIds,
-        ImmutableArray<NuGetFramework> projectFrameworks,
-        NuGetVersion version,
-        bool findLowestVersion,
-        NuGetContext nugetContext,
-        ILogger logger,
-        CancellationToken cancellationToken)
-    {
-        var versionResult = await VersionFinder.GetVersionsAsync(
-            packageIds.First(),
-            version,
-            nugetContext,
-            logger,
-            cancellationToken);
-
-        return await FindUpdatedVersionAsync(
-            packageIds,
-            version.ToNormalizedString(),
-            versionResult,
-            projectFrameworks,
-            findLowestVersion,
             nugetContext,
             logger,
             cancellationToken);
@@ -408,12 +386,13 @@ public partial class AnalyzeWorker : IAnalyzeWorker
             .SelectMany(p => p.TargetFrameworks)
             .Select(NuGetFramework.Parse)
             .Distinct()
+            .Select(f => f.GetShortFolderName())
             .ToImmutableArray();
 
         // When updating peer dependencies, we only need to consider top-level dependencies.
         var projectDependencyNames = projectsWithDependency
             .SelectMany(p => p.Dependencies)
-            .Where(d => !d.IsTransitive)
+            .Where(d => d.IsTopLevel)
             .Select(d => d.Name)
             .ToImmutableHashSet(StringComparer.OrdinalIgnoreCase);
 
@@ -448,7 +427,7 @@ public partial class AnalyzeWorker : IAnalyzeWorker
     {
         var packageDeclarationsUsingProperty = discovery.Projects
             .SelectMany(p =>
-                p.Dependencies.Where(d => !d.IsTransitive &&
+                p.Dependencies.Where(d => d.IsTopLevel &&
                     d.Name.Equals(packageId, StringComparison.OrdinalIgnoreCase) &&
                     d.EvaluationResult?.RootPropertyName is not null)
             ).ToImmutableArray();

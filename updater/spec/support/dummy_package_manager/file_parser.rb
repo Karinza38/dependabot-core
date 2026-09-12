@@ -1,4 +1,4 @@
-# typed: true
+# typed: false
 # frozen_string_literal: true
 
 require "dependabot/dependency"
@@ -21,10 +21,10 @@ module DummyPackageManager
             version: version,
             package_manager: "dummy",
             requirements: [
-              requirement: version.to_s,
-              groups: [],
-              file: dependency_file.name,
-              source: nil
+              { requirement: version.to_s,
+                groups: [],
+                file: dependency_file.name,
+                source: nil }
             ]
           )
         end

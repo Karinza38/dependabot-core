@@ -32,7 +32,7 @@ Welcome to the public home of Dependabot :dependabot:.
 Dependabot-Core is the library at the heart of [Dependabot](https://docs.github.com/en/code-security/dependabot) security / version updates.
 
 Use it to generate automated pull requests updating dependencies for projects written in Ruby, JavaScript, Python,
-PHP, Dart, Elixir, Elm, Go, Rust, Java and .NET. It can also update git submodules, Docker files, and Terraform files.
+PHP, Dart, Elixir, Elm, Go, Rust, Java, Julia, and .NET. It can also update git submodules, Docker files, Opentofu, Terraform files and Pre-Commit hooks.
 Features include:
 
 - Check for the latest version of a dependency *that's resolvable given a project's other dependencies*
@@ -52,22 +52,22 @@ started.
 
 >**Note:** If you're looking to run Dependabot locally for development/debugging purposes, see the [Development Guide](#development-guide).
 
-## Dependabot-Script
-
-The [dependabot-script](https://github.com/dependabot/dependabot-script) repo provides a collection of example scripts for configuring the Dependabot-Core library.
-It is intended as a starting point for advanced users to run a self-hosted version of Dependabot within their own projects.
-
->**Note:** We recently refactored the monolithic docker image used within the Dependabot Core library into one-image-per-ecosystem. Unfortunately, that broke dependabot-scripts, and we haven't had time to update them yet. We are aware of the problem and hope to provide a solution soon.
-
 ## Dependabot CLI
 
-The [Dependabot CLI](https://github.com/dependabot/cli) is a newer tool that may eventually replace [`dependabot-script`](#dependabot-script) for standalone use cases.
-While it creates dependency diffs, it's currently missing the logic to turn those diffs into actual PRs. Nevertheless, it
-may be useful for advanced users looking for examples of how to hack on Dependabot.
+The open-source [Dependabot CLI](https://github.com/dependabot/cli) is our recommended entrypoint for standalone use cases.
+
+We use it in production here at GitHub, and advanced users can also leverage it to run a self-hosted version of Dependabot within their own projects / CI systems.
+
+It creates dependency diffs but does not create PRs. So you will need to wire that up yourself.
+To aid with that, we created the [example-cli-usage](https://github.com/dependabot/example-cli-usage) repo which demonstrates how to turn those diffs into actual PR's.
+
+## Write your own Ruby-based tool
+
+Alternatively, because Dependabot-Core is a Ruby library, you can write your own ruby-based wrapper that leverages the Dependabot-core code. The tricky bit is Dependabot assumes it's running in an isolated, throw-away environment so you'll need to handle all that yourself. For example protecting against security risks of arbitrary code execution exfiltrating credentials, ensuring the appropriate version of Go or Python or whatever language you need is available, and handling when Dependabot makes changes to its runtime environment.
 
 ## Dependabot on CI
 
-In an environment such as GitHub where Dependabot is running in a container, if you want to change your build or installation process depending on whether Dependabot is checking, you can determine it by the existence of `DEPENDABOT` environment variable.
+In an environment such as GitHub where Dependabot runs in a container, if you want to change your build or installation process depending on whether it's running within the context of the Dependabot container, you can check the existence of the `DEPENDABOT` environment variable.
 
 # Contributing to Dependabot
 
@@ -86,7 +86,7 @@ closed as "cannot reproduce".
 Our issue tracker is quite active, and as a result there's a good chance someone already filed the same issue. If so,
 please upvote that issue, because we use 👍 reactions on issues as one signal to gauge the impact of a feature request or bug.
 
-However, please do not leave comments that contribute nothing new to the discussion. For details, see [https://github.com/golang/go/wiki/NoPlusOne](https://github.com/golang/go/wiki/NoPlusOne). This is open source, if you see something you want fixed, we are happy to coach you through contributing a pull request to fix it.
+However, please do not leave comments that contribute nothing new to the discussion. For details, see [https://go.dev/wiki/NoPlusOne](https://go.dev/wiki/NoPlusOne). This is open source, if you see something you want fixed, we are happy to coach you through contributing a pull request to fix it.
 
 ### Don't file issues about Security Alerts or Dependency Graph
 
@@ -112,7 +112,7 @@ Contribution workflow:
 Please refer to the [CONTRIBUTING](CONTRIBUTING.md) guidelines for more information.
 
 ## New Ecosystems
-	
+
 If you're interested in contributing support for a new ecosystem, please refer to the [contributing guidelines](CONTRIBUTING.md#contributing-new-ecosystems) for more information.
 
 # Development Guide
@@ -177,8 +177,10 @@ To (re)build a specific one:
 
   ```shell
   $ docker pull ghcr.io/dependabot/dependabot-updater-core # OR
-  $ docker build -f Dockerfile.updater-core . # recommended on ARM
+  $ docker build -f Dockerfile.updater-core . --tag=dependabot-manual-build/updater-core # recommended on ARM
   ```
+
+Each language/ecosystem sits on top of the core image. You need to rebuild whichever one you’re working on so it picks up your new core bits. For instance, if you’re working on **Go Modules**:
 
 - The Updater ecosystem image:
 
@@ -187,10 +189,33 @@ To (re)build a specific one:
   $ script/build go_modules # recommended on ARM
   ```
 
-- The development container using the `--rebuild` flag:
+  Or explicitly:
+  ```shell
+  $ docker build \
+  --platform linux/amd64 \
+  --file go_modules/Dockerfile \
+  --build-arg UPDATER_CORE_IMAGE=dependabot-manual-build/updater-core \
+  --tag dependabot-manual-build/updater-gomod \
+  .
+  ```
+
+- Spin-up the development container using the `--rebuild` flag:
 
   ```shell
   $ bin/docker-dev-shell go_modules --rebuild
+  ```
+
+  If successful, you should be inside the shell:
+
+  ```shell
+  => running docker development shell
+  [dependabot-core-dev] ~ $
+  ```
+
+- Once inside the shell, you can run tests, e.g.:
+
+  ```shell
+  rspec common/spec/dependabot/file_fetchers/base_exclude_spec.rb
   ```
 
 ### Making Changes to native Package Manager helpers
@@ -232,8 +257,8 @@ It has a [dedicated debugging guide](https://github.com/dependabot/cli#debugging
 
 You can use the `bin/dry-run.rb` script to simulate a dependency update job, printing
 the diff that would be generated to the terminal. It takes two positional
-arguments: the package manager and the GitHub repo name (including the
-account):
+arguments: the [package manager](https://docs.github.com/en/code-security/dependabot/dependabot-version-updates/configuration-options-for-the-dependabot.yml-file#package-ecosystem)
+and the GitHub repo name (including the account):
 
 ```bash
 $ bin/docker-dev-shell go_modules

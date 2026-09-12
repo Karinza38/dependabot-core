@@ -37,7 +37,9 @@ RSpec.describe Dependabot::Updater::Operations::RefreshVersionUpdatePullRequest 
       create_pull_request: nil,
       update_pull_request: nil,
       close_pull_request: nil,
-      record_ecosystem_meta: nil
+      record_ecosystem_meta: nil,
+      record_cooldown_meta: nil,
+      increment_metric: nil
     )
   end
   let(:mock_error_handler) { instance_double(Dependabot::Updater::ErrorHandler) }
@@ -49,14 +51,14 @@ RSpec.describe Dependabot::Updater::Operations::RefreshVersionUpdatePullRequest 
   let(:job) do
     Dependabot::Job.new_update_job(
       job_id: "1558782000",
-      job_definition: job_definition_with_fetched_files
+      job_definition:
     )
   end
 
   let(:dependency_snapshot) do
     Dependabot::DependencySnapshot.create_from_job_definition(
       job: job,
-      job_definition: job_definition_with_fetched_files
+      fetched_files:
     )
   end
 
@@ -80,11 +82,8 @@ RSpec.describe Dependabot::Updater::Operations::RefreshVersionUpdatePullRequest 
   let(:supported_versions) { %w(2 3) }
   let(:deprecated_versions) { %w(1) }
 
-  let(:job_definition_with_fetched_files) do
-    job_definition.merge({
-      "base_commit_sha" => "mock-sha",
-      "base64_dependency_files" => encode_dependency_files(dependency_files)
-    })
+  let(:fetched_files) do
+    Dependabot::FetchedFiles.new(base_commit_sha: "mock-sha", dependency_files:)
   end
 
   let(:dependency_files) do
@@ -139,17 +138,11 @@ RSpec.describe Dependabot::Updater::Operations::RefreshVersionUpdatePullRequest 
   end
 
   before do
-    allow(Dependabot::Experiments).to receive(:enabled?).with(:lead_security_dependency).and_return(false)
-
     allow(Dependabot::UpdateCheckers).to receive(:for_package_manager).and_return(stub_update_checker_class)
     allow(Dependabot::DependencyChangeBuilder)
       .to receive(:create_from)
       .and_return(stub_dependency_change)
     allow(dependency_snapshot).to receive(:ecosystem).and_return(ecosystem)
-  end
-
-  after do
-    Dependabot::Experiments.reset!
   end
 
   describe "#perform" do
@@ -183,6 +176,44 @@ RSpec.describe Dependabot::Updater::Operations::RefreshVersionUpdatePullRequest 
         perform
       end
     end
+
+    context "when the refresh job carries more than one directory" do
+      let(:job_definition) do
+        definition = job_definition_fixture("bundler/version_updates/pull_request_simple")
+        definition["job"]["dependencies"] = ["dummy-pkg-a"]
+        definition["job"]["updating-a-pull-request"] = true
+        definition["job"]["source"].delete("directory")
+        definition["job"]["source"]["directories"] = %w(/foo /bar)
+        definition
+      end
+
+      let(:dependency_files) do
+        %w(/foo /bar).flat_map do |dir|
+          [
+            Dependabot::DependencyFile.new(
+              name: "Gemfile",
+              content: fixture("bundler/original/Gemfile"),
+              directory: dir
+            ),
+            Dependabot::DependencyFile.new(
+              name: "Gemfile.lock",
+              content: fixture("bundler/original/Gemfile.lock"),
+              directory: dir
+            )
+          ]
+        end
+      end
+
+      it "ends the job gracefully without raising or touching pull requests" do
+        expect(mock_service).to receive(:capture_exception)
+        expect(mock_service).not_to receive(:create_pull_request)
+        expect(mock_service).not_to receive(:update_pull_request)
+        expect(mock_service).not_to receive(:close_pull_request)
+        expect(mock_error_handler).not_to receive(:handle_dependency_error)
+
+        expect { perform }.not_to raise_error
+      end
+    end
   end
 
   describe "#check_and_update_pull_request" do
@@ -207,6 +238,45 @@ RSpec.describe Dependabot::Updater::Operations::RefreshVersionUpdatePullRequest 
       end
     end
 
+    context "when the lead dependency has an active GitHub Security block" do
+      before do
+        allow(stub_update_checker).to receive(:up_to_date?).and_return(false)
+        allow(refresh_version_update_pull_request).to receive(:all_versions_ignored?).and_return(true)
+        allow(refresh_version_update_pull_request).to receive(:close_pull_request)
+        allow(job).to receive_messages(dependencies: ["dummy-pkg-a"], blocked_versions_for?: true)
+      end
+
+      it "increments the blocked versions ignored metric tagged with refresh_version_update" do
+        refresh_version_update_pull_request.send(:check_and_update_pull_request, [dependency])
+
+        expect(mock_service).to have_received(:increment_metric).with(
+          "blocked_versions.ignored",
+          tags: {
+            operation: "refresh_version_update",
+            package_manager: "bundler"
+          }
+        )
+      end
+    end
+
+    context "when the lead dependency has no active GitHub Security block" do
+      before do
+        allow(stub_update_checker).to receive(:up_to_date?).and_return(false)
+        allow(refresh_version_update_pull_request).to receive(:all_versions_ignored?).and_return(true)
+        allow(refresh_version_update_pull_request).to receive(:close_pull_request)
+        allow(job).to receive_messages(dependencies: ["dummy-pkg-a"], blocked_versions_for?: false)
+      end
+
+      it "does not increment the blocked versions ignored metric" do
+        refresh_version_update_pull_request.send(:check_and_update_pull_request, [dependency])
+
+        expect(mock_service).not_to have_received(:increment_metric).with(
+          "blocked_versions.ignored",
+          tags: anything
+        )
+      end
+    end
+
     context "when all versions are ignored" do
       before do
         allow(stub_update_checker).to receive(:up_to_date?).and_return(false)
@@ -214,6 +284,15 @@ RSpec.describe Dependabot::Updater::Operations::RefreshVersionUpdatePullRequest 
           :all_versions_ignored?
         ).and_return(true)
         allow(job).to receive(:dependencies).and_return(["dummy-pkg-a"])
+      end
+
+      it "closes the pull request with reason :up_to_date" do
+        expect(refresh_version_update_pull_request).to receive(
+          :close_pull_request
+        ).with(reason: :up_to_date)
+        refresh_version_update_pull_request.send(
+          :check_and_update_pull_request, [dependency]
+        )
       end
 
       it "does not create or update a pull request" do

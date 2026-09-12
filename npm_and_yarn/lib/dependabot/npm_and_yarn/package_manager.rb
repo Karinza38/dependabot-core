@@ -1,10 +1,17 @@
-# typed: strict
+# typed: strong
 # frozen_string_literal: true
 
 require "dependabot/shared_helpers"
 require "dependabot/ecosystem"
 require "dependabot/npm_and_yarn/requirement"
 require "dependabot/npm_and_yarn/version_selector"
+require "dependabot/npm_and_yarn/registry_helper"
+require "dependabot/npm_and_yarn/npm_package_manager"
+require "dependabot/npm_and_yarn/yarn_package_manager"
+require "dependabot/npm_and_yarn/pnpm_package_manager"
+require "dependabot/npm_and_yarn/language"
+require "dependabot/npm_and_yarn/constraint_helper"
+require "dependabot/package/npm_package_manager_config"
 
 module Dependabot
   module NpmAndYarn
@@ -46,148 +53,6 @@ module Dependabot
     MANIFEST_PACKAGE_MANAGER_KEY = "packageManager"
     MANIFEST_ENGINES_KEY = "engines"
 
-    class NpmPackageManager < Ecosystem::VersionManager
-      extend T::Sig
-      NAME = "npm"
-      RC_FILENAME = ".npmrc"
-      LOCKFILE_NAME = "package-lock.json"
-      SHRINKWRAP_LOCKFILE_NAME = "npm-shrinkwrap.json"
-
-      NPM_V6 = "6"
-      NPM_V7 = "7"
-      NPM_V8 = "8"
-      NPM_V9 = "9"
-      NPM_V10 = "10"
-
-      # Keep versions in ascending order
-      SUPPORTED_VERSIONS = T.let([
-        Version.new(NPM_V6),
-        Version.new(NPM_V7),
-        Version.new(NPM_V8),
-        Version.new(NPM_V9),
-        Version.new(NPM_V10)
-      ].freeze, T::Array[Dependabot::Version])
-
-      DEPRECATED_VERSIONS = T.let([].freeze, T::Array[Dependabot::Version])
-
-      sig do
-        params(
-          raw_version: String,
-          requirement: T.nilable(Dependabot::NpmAndYarn::Requirement)
-        ).void
-      end
-      def initialize(raw_version, requirement: nil)
-        super(
-          NAME,
-          Version.new(raw_version),
-          DEPRECATED_VERSIONS,
-          SUPPORTED_VERSIONS,
-          requirement
-        )
-      end
-
-      sig { override.returns(T::Boolean) }
-      def deprecated?
-        false
-      end
-
-      sig { override.returns(T::Boolean) }
-      def unsupported?
-        false
-      end
-    end
-
-    class YarnPackageManager < Ecosystem::VersionManager
-      extend T::Sig
-      NAME = "yarn"
-      RC_FILENAME = ".yarnrc"
-      RC_YML_FILENAME = ".yarnrc.yml"
-      LOCKFILE_NAME = "yarn.lock"
-
-      YARN_V1 = "1"
-      YARN_V2 = "2"
-      YARN_V3 = "3"
-
-      SUPPORTED_VERSIONS = T.let([
-        Version.new(YARN_V1),
-        Version.new(YARN_V2),
-        Version.new(YARN_V3)
-      ].freeze, T::Array[Dependabot::Version])
-
-      DEPRECATED_VERSIONS = T.let([].freeze, T::Array[Dependabot::Version])
-
-      sig do
-        params(
-          raw_version: String,
-          requirement: T.nilable(Requirement)
-        ).void
-      end
-      def initialize(raw_version, requirement: nil)
-        super(
-          NAME,
-          Version.new(raw_version),
-          DEPRECATED_VERSIONS,
-          SUPPORTED_VERSIONS,
-          requirement
-        )
-      end
-
-      sig { override.returns(T::Boolean) }
-      def deprecated?
-        false
-      end
-
-      sig { override.returns(T::Boolean) }
-      def unsupported?
-        false
-      end
-    end
-
-    class PNPMPackageManager < Ecosystem::VersionManager
-      extend T::Sig
-      NAME = "pnpm"
-      LOCKFILE_NAME = "pnpm-lock.yaml"
-      PNPM_WS_YML_FILENAME = "pnpm-workspace.yaml"
-
-      PNPM_V7 = "7"
-      PNPM_V8 = "8"
-      PNPM_V9 = "9"
-
-      SUPPORTED_VERSIONS = T.let([
-        Version.new(PNPM_V7),
-        Version.new(PNPM_V8),
-        Version.new(PNPM_V9)
-      ].freeze, T::Array[Dependabot::Version])
-
-      DEPRECATED_VERSIONS = T.let([].freeze, T::Array[Dependabot::Version])
-
-      sig do
-        params(
-          raw_version: String,
-          requirement: T.nilable(Requirement)
-        ).void
-      end
-      def initialize(raw_version, requirement: nil)
-        super(
-          NAME,
-          Version.new(raw_version),
-          DEPRECATED_VERSIONS,
-          SUPPORTED_VERSIONS,
-          requirement
-        )
-      end
-
-      sig { override.returns(T::Boolean) }
-      def deprecated?
-        false
-      end
-
-      sig { override.returns(T::Boolean) }
-      def unsupported?
-        false
-      end
-    end
-
     DEFAULT_PACKAGE_MANAGER = NpmPackageManager::NAME
 
     # Define a type alias for the expected class interface
@@ -199,11 +64,17 @@ module Dependabot
       )
     end
 
-    PACKAGE_MANAGER_CLASSES = T.let({
-      NpmPackageManager::NAME => NpmPackageManager,
-      YarnPackageManager::NAME => YarnPackageManager,
-      PNPMPackageManager::NAME => PNPMPackageManager
-    }.freeze, T::Hash[String, NpmAndYarnPackageManagerClassType])
+    PACKAGE_MANAGER_CLASSES = T.let(
+      {
+        NpmPackageManager::NAME => NpmPackageManager,
+        YarnPackageManager::NAME => YarnPackageManager,
+        PNPMPackageManager::NAME => PNPMPackageManager
+      }.freeze,
+      T::Hash[String, NpmAndYarnPackageManagerClassType]
+    )
+
+    # Error malformed version number string
+    ERROR_MALFORMED_VERSION_NUMBER = "Malformed version number"
 
     class PackageManagerDetector
       extend T::Sig
@@ -212,14 +83,13 @@ module Dependabot
       sig do
         params(
           lockfiles: T::Hash[Symbol, T.nilable(Dependabot::DependencyFile)],
-          package_json: T.nilable(T::Hash[String, T.untyped])
+          config: Dependabot::Package::NpmPackageManagerConfig
         ).void
       end
-      def initialize(lockfiles, package_json)
+      def initialize(lockfiles, config)
         @lockfiles = lockfiles
-        @package_json = package_json
-        @manifest_package_manager = T.let(package_json&.fetch(MANIFEST_PACKAGE_MANAGER_KEY, nil), T.nilable(String))
-        @engines = T.let(package_json&.fetch(MANIFEST_ENGINES_KEY, {}), T::Hash[String, T.untyped])
+        @manifest_package_manager = T.let(config.package_manager, T.nilable(String))
+        @engines = T.let(config.engines || {}, T::Hash[String, String])
       end
 
       # Returns npm, yarn, or pnpm based on the lockfiles, package.json, and engines
@@ -260,47 +130,10 @@ module Dependabot
 
       sig { returns(T.nilable(String)) }
       def name_from_engines
-        return unless @engines.is_a?(Hash)
-
         PACKAGE_MANAGER_CLASSES.each_key do |manager_name|
           return manager_name if @engines[manager_name]
         end
         nil
-      end
-    end
-
-    class Language < Ecosystem::VersionManager
-      extend T::Sig
-      NAME = "node"
-
-      SUPPORTED_VERSIONS = T.let([].freeze, T::Array[Dependabot::Version])
-
-      DEPRECATED_VERSIONS = T.let([].freeze, T::Array[Dependabot::Version])
-
-      sig do
-        params(
-          raw_version: T.nilable(String),
-          requirement: T.nilable(Requirement)
-        ).void
-      end
-      def initialize(raw_version, requirement: nil)
-        super(
-          NAME,
-          Version.new(raw_version),
-          DEPRECATED_VERSIONS,
-          SUPPORTED_VERSIONS,
-          requirement
-        )
-      end
-
-      sig { override.returns(T::Boolean) }
-      def deprecated?
-        false
-      end
-
-      sig { override.returns(T::Boolean) }
-      def unsupported?
-        false
       end
     end
 
@@ -310,18 +143,24 @@ module Dependabot
 
       sig do
         params(
-          package_json: T.nilable(T::Hash[String, T.untyped]),
-          lockfiles: T::Hash[Symbol, T.nilable(Dependabot::DependencyFile)]
+          config: Dependabot::Package::NpmPackageManagerConfig,
+          lockfiles: T::Hash[Symbol, T.nilable(Dependabot::DependencyFile)],
+          registry_config_files: T::Hash[Symbol, T.nilable(Dependabot::DependencyFile)],
+          credentials: T.nilable(T::Array[Dependabot::Credential])
         ).void
       end
-      def initialize(package_json, lockfiles:)
-        @package_json = package_json
+      def initialize(config, lockfiles, registry_config_files, credentials)
         @lockfiles = lockfiles
-        @package_manager_detector = T.let(PackageManagerDetector.new(lockfiles, package_json), PackageManagerDetector)
-        @manifest_package_manager = T.let(package_json&.fetch(MANIFEST_PACKAGE_MANAGER_KEY, nil), T.nilable(String))
-        @engines = T.let(package_json&.fetch(MANIFEST_ENGINES_KEY, nil), T.nilable(T::Hash[String, T.untyped]))
+        @registry_helper = T.let(
+          RegistryHelper.new(registry_config_files, credentials),
+          Dependabot::NpmAndYarn::RegistryHelper
+        )
+        @package_manager_detector = T.let(PackageManagerDetector.new(lockfiles, config), PackageManagerDetector)
+        @manifest_package_manager = T.let(config.package_manager, T.nilable(String))
+        @engines = T.let(config.engines, T.nilable(T::Hash[String, String]))
 
         @installed_versions = T.let({}, T::Hash[String, String])
+        @registries = T.let({}, T::Hash[String, String])
 
         @language = T.let(nil, T.nilable(Ecosystem::VersionManager))
         @language_requirement = T.let(nil, T.nilable(Requirement))
@@ -337,7 +176,7 @@ module Dependabot
       sig { returns(Ecosystem::VersionManager) }
       def language
         @language ||= Language.new(
-          Helpers.node_version,
+          raw_version: Helpers.node_version,
           requirement: language_requirement
         )
       end
@@ -351,36 +190,103 @@ module Dependabot
       def find_engine_constraints_as_requirement(name)
         Dependabot.logger.info("Processing engine constraints for #{name}")
 
-        return nil unless @engines.is_a?(Hash) && @engines[name]
-
-        raw_constraint = @engines[name].to_s.strip
+        raw_constraint = raw_engine_constraint(name)
         return nil if raw_constraint.empty?
 
-        raw_constraints = raw_constraint.split
-        constraints = raw_constraints.map do |constraint|
-          case constraint
-          when /^\d+$/
-            ">=#{constraint}.0.0 <#{constraint.to_i + 1}.0.0"
-          when /^\d+\.\d+$/
-            ">=#{constraint} <#{constraint.split('.').first.to_i + 1}.0.0"
-          when /^\d+\.\d+\.\d+$/
-            "=#{constraint}"
-          else
-            Dependabot.logger.warn("Unrecognized constraint format for #{name}: #{constraint}")
-            constraint
-          end
+        constraint_groups = parse_constraint_groups(raw_constraint)
+        if constraint_groups.nil?
+          Dependabot.logger.warn(
+            "Unrecognized constraint format for #{name}: #{raw_constraint}"
+          )
+          return nil
         end
 
-        Dependabot.logger.info("Parsed constraints for #{name}: #{constraints.join(', ')}")
-        Requirement.new(constraints)
+        # A wildcard/latest branch translates to no constraints, which means
+        # there is effectively no engine requirement.
+        return nil if constraint_groups.any?(&:empty?)
+
+        constraint_groups = constraint_groups.reject(&:empty?)
+
+        return nil if constraint_groups.empty?
+
+        parsed_constraints = constraint_groups.map { |group| group.join(" ") }.join(" || ")
+        Dependabot.logger.info("Parsed constraints for #{name}: #{parsed_constraints}")
+
+        requirement_for_group(constraint_groups, name)
       rescue StandardError => e
         Dependabot.logger.error("Error processing constraints for #{name}: #{e.message}")
         nil
       end
 
+      sig { params(name: String).returns(String) }
+      def raw_engine_constraint(name)
+        return "" unless @engines
+
+        @engines.fetch(name, "").strip
+      end
+
+      sig { params(raw_constraint: String).returns(T.nilable(T::Array[T::Array[String]])) }
+      def parse_constraint_groups(raw_constraint)
+        raw_constraint.split("||").map(&:strip).reject(&:empty?).map do |constraint_group|
+          constraints = ConstraintHelper.extract_ruby_constraints(constraint_group)
+          return nil if constraints.nil?
+
+          expanded_constraints(constraints)
+        end
+      end
+
+      sig { params(constraints: T::Array[String]).returns(T::Array[String]) }
+      def expanded_constraints(constraints)
+        constraints.flat_map do |constraint|
+          parts = constraint.strip.split(/\s+/)
+          if parts.length > 1 && parts.all? { |part| part.match?(ConstraintHelper::VALID_CONSTRAINT_REGEX) }
+            parts
+          else
+            [constraint]
+          end
+        end
+      end
+
+      sig do
+        params(
+          constraint_groups: T::Array[T::Array[String]],
+          name: String
+        ).returns(Requirement)
+      end
+      def requirement_for_group(constraint_groups, name)
+        requirements = constraint_groups.map { |constraints| Requirement.new(constraints) }
+        fallback_requirement = T.must(requirements.first)
+
+        current_version = current_engine_version(name)
+        return fallback_requirement unless current_version
+
+        matching_requirement = requirements.find { |requirement| requirement.satisfied_by?(current_version) }
+        matching_requirement || fallback_requirement
+      end
+
+      sig { params(name: String).returns(T.nilable(Dependabot::Version)) }
+      def current_engine_version(name)
+        raw_version = if name == Language::NAME
+                        Helpers.node_version
+                      else
+                        @installed_versions[name]
+                      end
+
+        return nil if raw_version.to_s.strip.empty?
+
+        Version.new(raw_version)
+      rescue StandardError
+        nil
+      end
+
+      private :raw_engine_constraint,
+              :parse_constraint_groups,
+              :expanded_constraints,
+              :requirement_for_group,
+              :current_engine_version
+
       # rubocop:disable Metrics/CyclomaticComplexity
       # rubocop:disable Metrics/PerceivedComplexity
-      # rubocop:disable Metrics/AbcSize
       sig { params(name: String).returns(T.nilable(T.any(Integer, String))) }
       def setup(name)
         # we prioritize version mentioned in "packageManager" instead of "engines"
@@ -392,6 +298,8 @@ module Dependabot
                @manifest_package_manager.nil?
           return
         end
+
+        return package_manager.version.to_s if package_manager.deprecated? || package_manager.unsupported?
 
         if @engines && @manifest_package_manager.nil?
           # if "packageManager" doesn't exists in manifest file,
@@ -412,31 +320,44 @@ module Dependabot
           )
         end
 
-        if Dependabot::Experiments.enabled?(:enable_corepack_for_npm_and_yarn)
-          version ||= requested_version(name) || guessed_version(name)
+        version ||= requested_version(name)
 
-          if version
-            raise_if_unsupported!(name, version.to_s)
-            install(name, version.to_s)
-          end
+        if version
+          raise_if_unsupported!(name, version.to_s)
+          install(name, version)
         else
-          version ||= requested_version(name)
+          version = guessed_version(name)
 
           if version
             raise_if_unsupported!(name, version.to_s)
-
-            install(name, version)
-          else
-            version = guessed_version(name)
-
-            if version
-              raise_if_unsupported!(name, version.to_s)
-
-              install(name, version.to_s) if name == PNPMPackageManager::NAME
-            end
+            install(name, version.to_s) if name == PNPMPackageManager::NAME
           end
         end
         version
+      end
+      # rubocop:enable Metrics/CyclomaticComplexity
+      # rubocop:enable Metrics/PerceivedComplexity
+
+      sig { params(name: String).returns(T.nilable(String)) }
+      def detect_version(name)
+        # Prioritize version mentioned in "packageManager" instead of "engines"
+        if @manifest_package_manager&.start_with?("#{name}@")
+          detected_version = @manifest_package_manager.split("@").last.to_s
+        end
+
+        # If "packageManager" has no version specified, check if we can extract "engines" information
+        detected_version ||= check_engine_version(name) if detected_version.to_s.empty?
+
+        # If neither "packageManager" nor "engines" have versions, infer version from lockfileVersion
+        detected_version ||= guessed_version(name) if detected_version.to_s.empty?
+
+        # Strip and validate version format
+        detected_version_string = detected_version.to_s.strip
+
+        # Ensure detected_version is neither "0" nor invalid format
+        return if detected_version_string == "0" || !detected_version_string.match?(ConstraintHelper::VERSION_REGEX)
+
+        detected_version_string
       end
 
       sig { params(name: T.nilable(String)).returns(Ecosystem::VersionManager) }
@@ -445,6 +366,16 @@ module Dependabot
 
         name = ensure_valid_package_manager(name)
         package_manager_class = T.must(PACKAGE_MANAGER_CLASSES[name])
+
+        detected_version = detect_version(name)
+
+        # if we have a detected version, we check if it is deprecated or unsupported
+        if detected_version
+          package_manager = package_manager_class.new(
+            detected_version: detected_version.to_s
+          )
+          return package_manager if package_manager.deprecated? || package_manager.unsupported?
+        end
 
         installed_version = installed_version(name)
         Dependabot.logger.info("Installed version for #{name}: #{installed_version}")
@@ -456,21 +387,20 @@ module Dependabot
           Dependabot.logger.info("No version requirement found for #{name}")
         end
 
-        package_manager_instance = package_manager_class.new(
-          installed_version,
+        package_manager_class.new(
+          detected_version: detected_version,
+          raw_version: installed_version,
           requirement: package_manager_requirement
         )
+      rescue ArgumentError => e
+        raise DependencyFileNotParseable, e.message if e.message.include?(ERROR_MALFORMED_VERSION_NUMBER)
 
-        Dependabot.logger.info("Package manager resolved for #{name}: #{package_manager_instance}")
-        package_manager_instance
+        raise
       rescue StandardError => e
         Dependabot.logger.error("Error resolving package manager for #{name || 'default'}: #{e.message}")
         raise
       end
 
-      # rubocop:enable Metrics/CyclomaticComplexity
-      # rubocop:enable Metrics/PerceivedComplexity
-      # rubocop:enable Metrics/AbcSize
       # Retrieve the installed version of the package manager by executing
       # the "corepack <name> -v" command and using the output.
       # If the output does not match the expected version format (PACKAGE_MANAGER_VERSION_REGEX),
@@ -491,7 +421,7 @@ module Dependabot
 
         # If we can't get the installed version or the version is invalid, we need to get inferred version
         unless @installed_versions[name]&.match?(PACKAGE_MANAGER_VERSION_REGEX)
-          @installed_versions[name] = Helpers.public_send(:"#{name}_version_numeric", @lockfiles[name.to_sym]).to_s
+          @installed_versions[name] = T.must(numeric_lockfile_version(name, @lockfiles[name.to_sym])).to_s
         end
 
         T.must(@installed_versions[name])
@@ -504,21 +434,22 @@ module Dependabot
         return unless name == PNPMPackageManager::NAME
         return unless Version.new(version) < Version.new("7")
 
-        raise ToolVersionNotSupported.new(PNPMPackageManager::NAME.upcase, version, "7.*, 8.*")
+        raise ToolVersionNotSupported.new(PNPMPackageManager::NAME.upcase, version, "7.*, 8.*, 9.*, 10.*")
       end
 
       sig { params(name: String, version: T.nilable(String)).void }
       def install(name, version)
-        if Dependabot::Experiments.enabled?(:enable_corepack_for_npm_and_yarn)
-          return Helpers.install(name, version.to_s)
-        end
-
         Dependabot.logger.info("Installing \"#{name}@#{version}\"")
 
-        SharedHelpers.run_shell_command(
-          "corepack install #{name}@#{version} --global --cache-only",
-          fingerprint: "corepack install <name>@<version> --global --cache-only"
-        )
+        begin
+          SharedHelpers.run_shell_command(
+            "corepack install #{name}@#{version} --global --cache-only",
+            fingerprint: "corepack install <name>@<version> --global --cache-only"
+          )
+        rescue SharedHelpers::HelperSubprocessFailed => e
+          Dependabot.logger.error("Error installing #{name}@#{version}: #{e.message}")
+          Helpers.fallback_to_local_version(name)
+        end
       end
 
       sig { params(name: T.nilable(String)).returns(String) }
@@ -538,30 +469,60 @@ module Dependabot
         match["version"]
       end
 
-      sig { params(name: String).returns(T.nilable(T.any(Integer, String))) }
+      sig { params(name: String).returns(T.nilable(Integer)) }
       def guessed_version(name)
         lockfile = @lockfiles[name.to_sym]
         return unless lockfile
 
-        version = Helpers.send(:"#{name}_version_numeric", lockfile)
+        version = numeric_lockfile_version(name, lockfile)
 
         Dependabot.logger.info("Guessed version info \"#{name}\" : \"#{version}\"")
 
         version
       end
 
-      sig { params(name: T.untyped).returns(T.nilable(String)) }
+      sig { params(name: String).returns(T.nilable(String)) }
       def check_engine_version(name)
-        return if @package_json.nil?
+        return unless @engines
 
         version_selector = VersionSelector.new
-        engine_versions = version_selector.setup(@package_json, name)
+
+        engine_versions = version_selector.setup(@engines, name, dependabot_versions(name))
 
         return if engine_versions.empty?
 
         version = engine_versions[name]
         Dependabot.logger.info("Returned (#{MANIFEST_ENGINES_KEY}) info \"#{name}\" : \"#{version}\"")
         version
+      end
+
+      sig { params(name: String).returns(T.nilable(T::Array[Dependabot::Version])) }
+      def dependabot_versions(name)
+        case name
+        when "npm"
+          NpmPackageManager::SUPPORTED_VERSIONS
+        when "yarn"
+          YarnPackageManager::SUPPORTED_VERSIONS
+        when "pnpm"
+          PNPMPackageManager::SUPPORTED_VERSIONS
+        end
+      end
+
+      sig do
+        params(
+          name: String,
+          lockfile: T.nilable(Dependabot::DependencyFile)
+        ).returns(T.nilable(Integer))
+      end
+      def numeric_lockfile_version(name, lockfile)
+        case name
+        when NpmPackageManager::NAME
+          Helpers.npm_version_numeric(lockfile)
+        when YarnPackageManager::NAME
+          Helpers.yarn_version_numeric(lockfile)
+        when PNPMPackageManager::NAME
+          Helpers.pnpm_version_numeric(lockfile)
+        end
       end
     end
   end

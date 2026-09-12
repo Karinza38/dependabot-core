@@ -29,6 +29,12 @@ module Dependabot
         fetched_files += root_files
         fetched_files += scoped_files
         fetched_files += custom_directory_files
+
+        # Mark all files as not support files
+        fetched_files.each do |file|
+          file.support_file = false
+        end
+
         return fetched_files if fetched_files.any?
 
         raise Dependabot::DependencyFileNotFound.new(
@@ -61,17 +67,17 @@ module Dependabot
         end
       end
 
-      sig { returns(T::Array[T.untyped]) }
+      sig { returns(T::Array[Dependabot::FileFetchers::RepositoryContent]) }
       def custom_directories
         repo_contents(dir: ".devcontainer").select { |f| f.type == "dir" && f.name != ".devcontainer" }
       end
 
-      sig { returns(T.untyped) }
+      sig { returns(T.nilable(Dependabot::FileFetchers::RepositoryContent)) }
       def devcontainer_directory
         @devcontainer_directory ||=
           T.let(
             repo_contents.find { |f| f.type == "dir" && f.name == ".devcontainer" },
-            T.untyped
+            T.nilable(Dependabot::FileFetchers::RepositoryContent)
           )
       end
 

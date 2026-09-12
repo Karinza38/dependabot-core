@@ -1,10 +1,11 @@
-# typed: strict
+# typed: strong
 # frozen_string_literal: true
 
 require "sorbet-runtime"
 
 require "dependabot/file_fetchers"
 require "dependabot/file_fetchers/base"
+require "dependabot/file_filtering"
 
 module Dependabot
   module Gradle
@@ -15,15 +16,27 @@ module Dependabot
       require_relative "file_parser"
       require_relative "file_fetcher/settings_file_parser"
 
+      SUPPORTED_LOCK_FILE_NAMES = %w(gradle.lockfile).freeze
+
       SUPPORTED_BUILD_FILE_NAMES =
-        T.let(%w(build.gradle build.gradle.kts).freeze, T::Array[String])
+        %w(build.gradle build.gradle.kts).freeze
 
       SUPPORTED_SETTINGS_FILE_NAMES =
-        T.let(%w(settings.gradle settings.gradle.kts).freeze, T::Array[String])
+        %w(settings.gradle settings.gradle.kts).freeze
+
+      SUPPORTED_WRAPPER_FILES_PATH = %w(
+        gradlew
+        gradlew.bat
+        gradle/wrapper/gradle-wrapper.jar
+        gradle/wrapper/gradle-wrapper.properties
+      ).freeze
 
       # For now Gradle only supports library .toml files in the main gradle folder
       SUPPORTED_VERSION_CATALOG_FILE_PATH =
-        T.let(%w(/gradle/libs.versions.toml).freeze, T::Array[String])
+        %w(/gradle/libs.versions.toml).freeze
+
+      PLUGIN_SOURCE_SET_DIRS =
+        %w(src/main/java src/main/kotlin src/main/groovy src/main/resources).freeze
 
       sig do
         override
@@ -31,13 +44,15 @@ module Dependabot
             source: Dependabot::Source,
             credentials: T::Array[Dependabot::Credential],
             repo_contents_path: T.nilable(String),
-            options: T::Hash[String, String]
+            options: T::Hash[Symbol, Object],
+            update_config: T.nilable(Dependabot::Config::UpdateConfig)
           )
           .void
       end
-      def initialize(source:, credentials:, repo_contents_path: nil, options: {})
+      def initialize(source:, credentials:, repo_contents_path: nil, options: {}, update_config: nil)
         super
 
+        @lockfile_name = T.let(SUPPORTED_LOCK_FILE_NAMES.first, String)
         @buildfile_name = T.let(nil, T.nilable(String))
       end
 
@@ -55,18 +70,88 @@ module Dependabot
 
       sig { override.returns(T::Array[DependencyFile]) }
       def fetch_files
-        all_buildfiles_in_build(".")
+        fetched_files = all_buildfiles_in_build(".")
+
+        # Filter excluded files from final collection
+        filtered_files = fetched_files.reject do |file|
+          Dependabot::FileFiltering.should_exclude_path?(file.name, "file from final collection", @exclude_paths)
+        end
+
+        filtered_files
       end
 
       private
 
       sig { params(root_dir: String).returns(T::Array[DependencyFile]) }
       def all_buildfiles_in_build(root_dir)
-        files = [buildfile(root_dir), settings_file(root_dir), version_catalog_file(root_dir)].compact
+        files = [buildfile(root_dir), settings_file(root_dir), version_catalog_file(root_dir), lockfile(root_dir),
+                 properties_file(root_dir)]
+                .compact
+        files += wrapper_files(root_dir)
         files += subproject_buildfiles(root_dir)
+        files += subproject_lockfiles(root_dir)
         files += dependency_script_plugins(root_dir)
+        files += convention_plugin_source_files(files, root_dir)
+
         files + included_builds(root_dir)
                 .flat_map { |dir| all_buildfiles_in_build(dir) }
+      end
+
+      # Only fetch source trees for *nested* project directories (e.g. "build-logic/convention"
+      # or "included/convention"), plus the root of a non-top-level build (e.g. "build-logic" or
+      # "buildSrc" itself), never the top-level repo root ("app" style modules of the outermost
+      # build). This targets the common convention-plugin module pattern - whether declared at an
+      # included/buildSrc build's own root or nested within it - without recursively scanning
+      # every ordinary top-level application module of the outermost build.
+      sig { params(files: T::Array[DependencyFile], root_dir: String).returns(T::Array[DependencyFile]) }
+      def convention_plugin_source_files(files, root_dir)
+        nested_plugin_project_dirs(files, root_dir).flat_map do |project_dir|
+          PLUGIN_SOURCE_SET_DIRS.flat_map do |relative_dir|
+            fetch_tree_support_files(clean_join([project_dir, relative_dir]))
+          end
+        end
+      end
+
+      sig { params(files: T::Array[DependencyFile], root_dir: String).returns(T::Array[String]) }
+      def nested_plugin_project_dirs(files, root_dir)
+        buildfile_dirs(files).select { |dir| plugin_source_eligible_dir?(dir, root_dir) }
+      end
+
+      # A directory is eligible for convention-plugin source scanning if it's nested below the
+      # outermost repo root (contains a "/"), or if it's the own root of a build that is itself
+      # nested (i.e. root_dir isn't the outermost "."), such as an included build or buildSrc.
+      sig { params(dir: String, root_dir: String).returns(T::Boolean) }
+      def plugin_source_eligible_dir?(dir, root_dir)
+        return true if root_dir != "." && dir == root_dir
+
+        dir.include?("/")
+      end
+
+      sig { params(files: T::Array[DependencyFile]).returns(T::Array[String]) }
+      def buildfile_dirs(files)
+        files.filter_map do |file|
+          next unless SUPPORTED_BUILD_FILE_NAMES.include?(File.basename(file.name))
+
+          clean_join([File.dirname(file.name)])
+        end
+      end
+
+      sig { params(dir: String).returns(T::Array[DependencyFile]) }
+      def fetch_tree_support_files(dir)
+        entries = repo_contents(dir: dir, raise_errors: false)
+        return [] if entries.empty?
+
+        entries.flat_map do |entry|
+          entry_path = clean_join([dir, entry.name])
+          if entry.type == "dir"
+            fetch_tree_support_files(entry_path)
+          else
+            file = fetch_support_file(entry_path)
+            file ? [file] : []
+          end
+        end
+      rescue Dependabot::DependencyFileNotFound
+        []
       end
 
       sig { params(root_dir: String).returns(T::Array[String]) }
@@ -94,6 +179,32 @@ module Dependabot
       end
 
       sig { params(root_dir: String).returns(T::Array[DependencyFile]) }
+      def subproject_lockfiles(root_dir)
+        return [] unless settings_file(root_dir)
+
+        subproject_paths =
+          SettingsFileParser
+          .new(settings_file: T.must(settings_file(root_dir)))
+          .subproject_paths
+
+        subproject_paths.filter_map do |path|
+          lockfile_path = File.join(root_dir, path, @lockfile_name)
+
+          # Skip excluded subproject lockfiles
+          next nil if Dependabot::FileFiltering.should_exclude_path?(
+            lockfile_path,
+            "subproject lockfile in subproject '#{path}'",
+            @exclude_paths
+          )
+
+          fetch_file_from_host(lockfile_path)
+        rescue Dependabot::DependencyFileNotFound
+          # Gradle itself doesn't worry about missing subprojects, so we don't
+          nil
+        end
+      end
+
+      sig { params(root_dir: String).returns(T::Array[DependencyFile]) }
       def subproject_buildfiles(root_dir)
         return [] unless settings_file(root_dir)
 
@@ -105,10 +216,46 @@ module Dependabot
         subproject_paths.filter_map do |path|
           if @buildfile_name
             buildfile_path = File.join(root_dir, path, @buildfile_name)
+
+            # Skip excluded subproject buildfiles
+            next nil if Dependabot::FileFiltering.should_exclude_path?(
+              buildfile_path,
+              "subproject buildfile in subproject '#{path}'",
+              @exclude_paths
+            )
+
             fetch_file_from_host(buildfile_path)
           else
-            buildfile(File.join(root_dir, path))
+            subproject_dir = File.join(root_dir, path)
+
+            # Skip excluded subproject directories
+            next nil if Dependabot::FileFiltering.should_exclude_path?(
+              subproject_dir,
+              "subproject directory for subproject '#{path}'",
+              @exclude_paths
+            )
+
+            buildfile(subproject_dir)
           end
+        rescue Dependabot::DependencyFileNotFound
+          # Gradle itself doesn't worry about missing subprojects, so we don't
+          nil
+        end
+      end
+
+      sig { params(dir: String).returns(T::Array[DependencyFile]) }
+      def wrapper_files(dir)
+        SUPPORTED_WRAPPER_FILES_PATH.filter_map do |filename|
+          file = fetch_file_if_present(File.join(dir, filename))
+          next unless file
+
+          if File.basename(file.name) == "gradle-wrapper.jar"
+            file.content = Base64.encode64(T.must(file.content)) if file.content
+            file.content_encoding = DependencyFile::ContentEncoding::BASE64
+          end
+
+          file.mode = DependencyFile::Mode::EXECUTABLE if File.basename(file.name) == "gradlew"
+          file
         rescue Dependabot::DependencyFileNotFound
           # Gradle itself doesn't worry about missing subprojects, so we don't
           nil
@@ -137,6 +284,13 @@ module Dependabot
                     .uniq
 
         dependency_plugin_paths.filter_map do |path|
+          # Skip excluded dependency script plugins
+          next nil if Dependabot::FileFiltering.should_exclude_path?(
+            path,
+            "dependency script plugin",
+            @exclude_paths
+          )
+
           fetch_file_from_host(path)
         rescue Dependabot::DependencyFileNotFound
           next nil if file_exists_in_submodule?(path)
@@ -153,6 +307,16 @@ module Dependabot
         true
       rescue Dependabot::DependencyFileNotFound
         false
+      end
+
+      sig { params(dir: String).returns(T.nilable(DependencyFile)) }
+      def lockfile(dir)
+        fetch_file_if_present(File.join(dir, @lockfile_name))
+      end
+
+      sig { params(dir: String).returns(T.nilable(DependencyFile)) }
+      def properties_file(dir)
+        fetch_file_if_present(File.join(dir, "gradle.properties"))
       end
 
       sig { params(dir: String).returns(T.nilable(DependencyFile)) }

@@ -42,13 +42,15 @@ pr-updated expected.json
 -- input.yml --
 job:
   package-manager: "silent"
+  cooldown:
+    default-days: 0
   dependencies:
     - dependency-a
   source:
     directory: "/"
     provider: example
-    hostname: example.com
-    api-endpoint: https://example.com/api/v3
+    hostname: 127.0.0.1
+    api-endpoint: http://127.0.0.1/api/v3
     repo: dependabot/smoke-tests
   security-advisories:
     - dependency-name: dependency-a
@@ -67,13 +69,15 @@ job:
 -- input-rebase-old.yml --
 job:
   package-manager: "silent"
+  cooldown:
+    default-days: 0
   dependencies:
     - dependency-a
   source:
     directory: "/"
     provider: example
-    hostname: example.com
-    api-endpoint: https://example.com/api/v3
+    hostname: 127.0.0.1
+    api-endpoint: http://127.0.0.1/api/v3
     repo: dependabot/smoke-tests
   security-advisories:
     - dependency-name: dependency-a
@@ -90,19 +94,23 @@ job:
           - "*"
   updating-a-pull-request: true
   existing-pull-requests:
-    - - dependency-name: dependency-a
-        dependency-version: 1.2.4
+    - pr-number: 123
+      dependencies:
+        - dependency-name: dependency-a
+          dependency-version: 1.2.4
 
 -- input-rebase-new.yml --
 job:
   package-manager: "silent"
+  cooldown:
+    default-days: 0
   dependencies:
     - dependency-a
   source:
     directory: "/"
     provider: example
-    hostname: example.com
-    api-endpoint: https://example.com/api/v3
+    hostname: 127.0.0.1
+    api-endpoint: http://127.0.0.1/api/v3
     repo: dependabot/smoke-tests
   security-advisories:
     - dependency-name: dependency-a
@@ -119,6 +127,9 @@ job:
           - "*"
   updating-a-pull-request: true
   existing-pull-requests:
-    - - dependency-name: dependency-a
-        dependency-version: 1.2.4
-        directory: "/"
+    - pr-number: 456
+      dependencies:
+        - dependency-name: dependency-a
+          dependency-version: 1.2.4
+          directory: "/"
+

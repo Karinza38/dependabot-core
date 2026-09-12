@@ -1,4 +1,4 @@
-# typed: true
+# typed: strict
 # frozen_string_literal: true
 
 require "digest"
@@ -9,6 +9,7 @@ require "sorbet-runtime"
 require "dependabot/errors"
 require "dependabot/logger"
 require "dependabot/pub/requirement"
+require "dependabot/pub/requirement_source"
 require "dependabot/requirements_update_strategy"
 require "dependabot/shared_helpers"
 
@@ -22,19 +23,27 @@ module Dependabot
 
       abstract!
 
-      sig { returns(T::Array[Dependabot::Credential]) }
-      attr_reader :credentials
+      sig { abstract.returns(T::Array[Dependabot::Credential]) }
+      def credentials; end
 
-      sig { returns(T::Array[Dependabot::DependencyFile]) }
-      attr_reader :dependency_files
+      sig { abstract.returns(T::Array[Dependabot::DependencyFile]) }
+      def dependency_files; end
 
-      sig { returns(T::Hash[Symbol, T.untyped]) }
-      attr_reader :options
+      sig { abstract.returns(T::Hash[Symbol, T.untyped]) }
+      def options; end
 
+      sig { returns(String) }
       def self.pub_helpers_path
         File.join(ENV.fetch("DEPENDABOT_NATIVE_HELPERS_PATH", nil), "pub")
       end
 
+      sig do
+        params(
+          dir: T.any(Pathname, String),
+          url: T.nilable(String)
+        )
+          .returns(T.nilable(T::Hash[String, T.untyped]))
+      end
       def self.run_infer_sdk_versions(dir, url: nil)
         env = {}
         cmd = File.join(pub_helpers_path, "infer_sdk_versions")
@@ -47,15 +56,18 @@ module Dependabot
 
       private
 
+      sig { returns(T::Array[T::Hash[String, T.untyped]]) }
       def dependency_services_list
         JSON.parse(run_dependency_services("list"))["dependencies"]
       end
 
+      sig { params(dependency: Dependabot::Dependency).returns(String) }
       def repository_url(dependency)
-        source = dependency.requirements&.first&.dig(:source)
-        source&.dig("description", "url") || options[:pub_hosted_url] || "https://pub.dev"
+        RequirementSource.new(dependency.requirements.first).description_string("url") || options[:pub_hosted_url] ||
+          "https://pub.dev"
       end
 
+      sig { params(dependency: Dependabot::Dependency).returns(T::Hash[String, T.untyped]) }
       def fetch_package_listing(dependency)
         # Because we get the security_advisories as a set of constraints, we
         # fetch the list of all versions and filter them to a list of vulnerable
@@ -67,12 +79,14 @@ module Dependabot
         JSON.parse(response.body)
       end
 
+      sig { params(dependency: Dependabot::Dependency).returns(T::Array[Dependabot::Pub::Version]) }
       def available_versions(dependency)
         fetch_package_listing(dependency)["versions"].map do |v|
           Dependabot::Pub::Version.new(v["version"])
         end
       end
 
+      sig { returns(T::Array[T::Hash[String, T.untyped]]) }
       def dependency_services_report
         sha256 = Digest::SHA256.new
         dependency_files.each do |f|
@@ -83,22 +97,37 @@ module Dependabot
         cache_file = "/tmp/report-#{hash}-pid-#{Process.pid}.json"
         return JSON.parse(File.read(cache_file)) if File.file?(cache_file)
 
-        report = JSON.parse(run_dependency_services("report", stdin_data: ""))["dependencies"]
+        report = JSON.parse(run_dependency_services("report"))["dependencies"]
         File.write(cache_file, JSON.generate(report))
         report
       end
 
+      sig do
+        params(
+          dependency_changes: T.nilable(T::Array[Dependabot::Dependency])
+        )
+          .returns(T::Array[Dependabot::DependencyFile])
+      end
       def dependency_services_apply(dependency_changes)
-        run_dependency_services("apply", stdin_data: dependencies_to_json(dependency_changes)) do |temp_dir|
-          dependency_files.map do |f|
-            updated_file = f.dup
-            updated_file.content = File.read(File.join(temp_dir, f.name))
-            updated_file
-          end
-        end
+        T.cast(
+          run_dependency_services("apply", stdin_data: dependencies_to_json(dependency_changes)) do |temp_dir|
+            dependency_files.map do |f|
+              updated_file = f.dup
+              updated_file.content = File.read(File.join(temp_dir, f.name))
+              updated_file
+            end
+          end,
+          T::Array[Dependabot::DependencyFile]
+        )
+      end
+
+      sig { params(dependency: Dependabot::Dependency).returns(Excon::Response) }
+      def fetch_package_metadata(dependency)
+        Dependabot::RegistryClient.get(url: "#{repository_url(dependency)}/api/packages/#{dependency.name}")
       end
 
       # Clones the flutter repo into /tmp/flutter if needed
+      sig { void }
       def ensure_flutter_repo
         return if File.directory?("/tmp/flutter/.git")
 
@@ -116,6 +145,7 @@ module Dependabot
       end
 
       # Will ensure that /tmp/flutter contains the flutter repo checked out at `ref`.
+      sig { params(ref: String).void }
       def check_out_flutter_ref(ref)
         ensure_flutter_repo
         Dependabot.logger.info "Checking out Flutter version #{ref}"
@@ -146,6 +176,7 @@ module Dependabot
       ## Detects the right flutter release to use for the pubspec.yaml.
       ## Then checks it out if it is not already.
       ## Returns the sdk versions
+      sig { params(dir: T.any(Pathname, String)).returns(T::Hash[String, String]) }
       def ensure_right_flutter_release(dir)
         versions = Helpers.run_infer_sdk_versions(
           File.join(dir, dependency_files.first&.directory),
@@ -171,6 +202,7 @@ module Dependabot
         run_flutter_version
       end
 
+      sig { void }
       def run_flutter_doctor
         Dependabot.logger.info(
           "Running `flutter doctor` to install artifacts and create flutter/version."
@@ -185,6 +217,7 @@ module Dependabot
       end
 
       # Runs `flutter version` and returns the dart and flutter version numbers in a map.
+      sig { returns(T::Hash[String, String]) }
       def run_flutter_version
         Dependabot.logger.info "Running `flutter --version`"
         # Run `flutter --version --machine` to get the current flutter version.
@@ -216,7 +249,16 @@ module Dependabot
         }
       end
 
-      def run_dependency_services(command, stdin_data: nil)
+      sig do
+        type_parameters(:T)
+          .params(
+            command: String,
+            stdin_data: T.nilable(String),
+            blk: T.nilable(T.proc.params(arg0: String).returns(T.type_parameter(:T)))
+          )
+          .returns(T.any(String, T.type_parameter(:T)))
+      end
+      def run_dependency_services(command, stdin_data: nil, &blk)
         SharedHelpers.in_a_temporary_directory do |temp_dir|
           dependency_files.each do |f|
             in_path_name = File.join(temp_dir, f.directory, f.name)
@@ -244,15 +286,31 @@ module Dependabot
               stdin_data: stdin_data,
               chdir: command_dir
             )
-            raise Dependabot::DependabotError, "dependency_services failed: #{stderr}" unless status.success?
-            return stdout unless block_given?
+            raise_error(stderr) unless status.success?
+            return stdout unless blk
 
             yield command_dir
           end
         end
       end
 
+      sig { params(stderr: String).returns(T.noreturn) }
+      def raise_error(stderr)
+        if stderr.match?(/Failed parsing lock file|Unsupported operation|Duplicate mapping key|"name" field/)
+          raise DependencyFileNotEvaluatable, "dependency_services failed: #{stderr}"
+        elsif stderr.include?("Git error")
+          raise Dependabot::InvalidGitAuthToken, "dependency_services failed: #{stderr}"
+        elsif stderr.match?(/version solving failed|found no workspace root|Only apply dependency_services to the root/)
+          raise Dependabot::DependencyFileNotResolvable, "dependency_services failed: #{stderr}"
+        elsif stderr.include?("Could not find a file named \"pubspec.yaml\"")
+          raise Dependabot::DependencyFileNotFound.new("pubspec.yaml", "dependency_services failed: #{stderr}")
+        else
+          raise Dependabot::DependabotError, "dependency_services failed: #{stderr}"
+        end
+      end
+
       # Parses a dependency as listed by `dependency_services list`.
+      sig { params(json: T::Hash[String, T.untyped]).returns(Dependabot::Dependency) }
       def parse_listed_dependency(json)
         params = {
           name: json["name"],
@@ -278,18 +336,20 @@ module Dependabot
       #
       # The `requirements_update_strategy`` is
       # used to chose the right updated constraint.
-      def parse_updated_dependency(json, requirements_update_strategy: nil)
-        params = {
-          name: json["name"],
-          version: json["version"],
-          package_manager: "pub",
-          requirements: []
-        }
+      sig do
+        params(
+          json: T::Hash[String, T.untyped],
+          requirements_update_strategy: Dependabot::RequirementsUpdateStrategy
+        )
+          .returns(Dependabot::Dependency)
+      end
+      def parse_updated_dependency(json, requirements_update_strategy)
+        requirements = []
         constraint_field = constraint_field_from_update_strategy(requirements_update_strategy)
 
         if json["kind"] != "transitive" && !json[constraint_field].nil?
           constraint = json[constraint_field]
-          params[:requirements] << {
+          requirements << {
             requirement: constraint,
             groups: [json["kind"]],
             source: nil, # TODO: Expose some information about the source
@@ -297,27 +357,35 @@ module Dependabot
           }
         end
 
-        if json["previousVersion"]
-          params = {
-            **params,
-            previous_version: json["previousVersion"],
-            previous_requirements: []
+        previous_requirements = []
+        if json["previousVersion"] && json["kind"] != "transitive" && !json["previousConstraint"].nil?
+          constraint = json["previousConstraint"]
+          previous_requirements << {
+            requirement: constraint,
+            groups: [json["kind"]],
+            source: nil, # TODO: Expose some information about the source
+            file: "pubspec.yaml"
           }
-          if json["kind"] != "transitive" && !json["previousConstraint"].nil?
-            constraint = json["previousConstraint"]
-            params[:previous_requirements] << {
-              requirement: constraint,
-              groups: [json["kind"]],
-              source: nil, # TODO: Expose some information about the source
-              file: "pubspec.yaml"
-            }
-          end
         end
-        Dependency.new(**T.unsafe(params))
+
+        Dependency.new(
+          name: json["name"],
+          version: json["version"],
+          package_manager: "pub",
+          requirements: requirements,
+          previous_version: json["previousVersion"],
+          previous_requirements: json["previousVersion"] ? previous_requirements : nil
+        )
       end
 
       # expects "auto" to already have been resolved to one of the other
       # strategies.
+      sig do
+        params(
+          requirements_update_strategy: Dependabot::RequirementsUpdateStrategy
+        )
+          .returns(String)
+      end
       def constraint_field_from_update_strategy(requirements_update_strategy)
         case requirements_update_strategy
         when RequirementsUpdateStrategy::WidenRanges
@@ -326,27 +394,40 @@ module Dependabot
           "constraintBumped"
         when RequirementsUpdateStrategy::BumpVersionsIfNecessary
           "constraintBumpedIfNeeded"
+        else
+          raise "Unexpected requirements_update_strategy #{requirements_update_strategy}"
         end
       end
 
+      sig do
+        params(
+          dependencies: T.nilable(T::Array[Dependabot::Dependency])
+        )
+          .returns(T.nilable(String))
+      end
       def dependencies_to_json(dependencies)
         if dependencies.nil?
           nil
         else
           deps = dependencies.map do |d|
-            source = d.requirements.empty? ? nil : d.requirements.first[:source]
+            source = d.requirements.empty? ? nil : d.requirements.first&.[](:source)
             obj = {
               "name" => d.name,
               "version" => d.version,
               "source" => source
             }
 
-            obj["constraint"] = d.requirements[0][:requirement].to_s unless d.requirements.nil? || d.requirements.empty?
+            unless d.requirements.nil? || d.requirements.empty?
+              obj["constraint"] =
+                d.requirements[0]&.[](:requirement).to_s
+            end
             obj
           end
-          JSON.generate({
-            "dependencyChanges" => deps
-          })
+          JSON.generate(
+            {
+              "dependencyChanges" => deps
+            }
+          )
         end
       end
     end

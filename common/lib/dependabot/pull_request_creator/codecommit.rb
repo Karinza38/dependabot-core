@@ -1,4 +1,4 @@
-# typed: strict
+# typed: strong
 # frozen_string_literal: true
 
 require "sorbet-runtime"
@@ -61,9 +61,19 @@ module Dependabot
         )
           .void
       end
-      def initialize(source:, branch_name:, base_commit:, credentials:,
-                     files:, commit_message:, pr_description:, pr_name:,
-                     author_details:, labeler:, require_up_to_date_base:)
+      def initialize(
+        source:,
+        branch_name:,
+        base_commit:,
+        credentials:,
+        files:,
+        commit_message:,
+        pr_description:,
+        pr_name:,
+        author_details:,
+        labeler:,
+        require_up_to_date_base:
+      )
         @source                  = source
         @branch_name             = branch_name
         @base_commit             = base_commit
@@ -100,7 +110,7 @@ module Dependabot
         ) == base_commit
       end
 
-      sig { returns(T.nilable(Aws::CodeCommit::Types::CreatePullRequestOutput)) }
+      sig { returns(T.nilable(Seahorse::Client::Response)) }
       def create_pull_request
         branch = create_or_get_branch(base_commit)
         return unless branch
@@ -114,7 +124,6 @@ module Dependabot
           pr_description
           # codecommit doesn't support PR labels
         )
-        return unless pull_request
 
         pull_request
       end
@@ -132,8 +141,11 @@ module Dependabot
       sig { params(commit: String).returns(String) }
       def create_branch(commit)
         # codecommit returns an empty response on create branch success
-        codecommit_client_for_source.create_branch(source.repo, branch_name,
-                                                   commit)
+        codecommit_client_for_source.create_branch(
+          source.repo,
+          branch_name,
+          commit
+        )
         @branch_name = branch_name
         branch_name
       end
@@ -154,26 +166,25 @@ module Dependabot
       def branch_exists?(branch_name)
         @branch_ref ||= T.let(
           codecommit_client_for_source.branch(branch_name),
-          T.nilable(String)
+          T.nilable(Seahorse::Client::Response)
         )
         !@branch_ref.nil?
-        rescue Aws::CodeCommit::Errors::BranchDoesNotExistException
-          false
+      rescue Aws::CodeCommit::Errors::BranchDoesNotExistException
+        false
       end
 
       sig { returns(T::Boolean) }
       def unmerged_pull_request_exists?
         unmerged_prs = []
         pull_requests_for_branch.each do |pr|
-          unless T.unsafe(pr).pull_request
-                  .pull_request_targets[0].merge_metadata.is_merged
-            unmerged_prs << pr
-          end
+          output = T.cast(pr.data, Aws::CodeCommit::Types::GetPullRequestOutput)
+          target = T.must(output.pull_request.pull_request_targets[0])
+          unmerged_prs << pr unless target.merge_metadata&.is_merged
         end
         unmerged_prs.any?
       end
 
-      sig { returns(T::Array[Aws::CodeCommit::Types::PullRequest]) }
+      sig { returns(T::Array[Seahorse::Client::Response]) }
       def pull_requests_for_branch
         @pull_requests_for_branch ||=
           T.let(
@@ -181,17 +192,17 @@ module Dependabot
               open_prs = codecommit_client_for_source.pull_requests(
                 source.repo,
                 "open",
-                source.branch || default_branch
+                branch_name
               )
               closed_prs = codecommit_client_for_source.pull_requests(
                 source.repo,
                 "closed",
-                source.branch || default_branch
+                branch_name
               )
 
               [*open_prs, *closed_prs]
             end,
-            T.nilable(T::Array[Aws::CodeCommit::Types::PullRequest])
+            T.nilable(T::Array[Seahorse::Client::Response])
           )
       end
 

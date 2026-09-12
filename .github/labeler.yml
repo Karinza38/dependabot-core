@@ -18,7 +18,15 @@
 - changed-files:
   - any-glob-to-any-file: docker/**
 
-"L: dotnet-sdk":
+"L: docker:compose":
+- changed-files:
+  - any-glob-to-any-file:
+    - docker/lib/dependabot/docker_compose/**
+    - docker/lib/dependabot/shared/**
+    - docker/spec/dependabot/docker_compose/**
+    - docker/dependabot-docker_compose.gemspec
+
+"L: dotnet:dotnet-sdk":
 - changed-files:
   - any-glob-to-any-file: dotnet_sdk/**
 
@@ -40,7 +48,9 @@
 
 "L: javascript":
 - changed-files:
-  - any-glob-to-any-file: npm_and_yarn/**
+  - any-glob-to-any-file:
+    - bun/**
+    - npm_and_yarn/**
 
 "L: java:gradle":
 - changed-files:
@@ -66,10 +76,30 @@
 - changed-files:
   - any-glob-to-any-file: python/**
 
+"L: python:uv":
+- changed-files:
+  - any-glob-to-any-file: uv/**
+
+"L: rust:rust-toolchain":
+- changed-files:
+  - any-glob-to-any-file: rust_toolchain/**
+
 "L: terraform":
 - changed-files:
   - any-glob-to-any-file: terraform/**
 
+"L: opentofu":
+- changed-files:
+  - any-glob-to-any-file: opentofu/**
+
 "L: swift":
 - changed-files:
   - any-glob-to-any-file: swift/**
+
+"L: helm":
+- changed-files:
+  - any-glob-to-any-file: helm/**
+
+"L: cpp:vcpkg":
+- changed-files:
+  - any-glob-to-any-file: vcpkg/**

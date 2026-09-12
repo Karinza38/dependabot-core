@@ -15,12 +15,14 @@ RSpec.describe Dependabot::NpmAndYarn::MetadataFinder do
 
   let(:dependency_name) { "etag" }
   let(:credentials) do
-    [Dependabot::Credential.new({
-      "type" => "git_source",
-      "host" => "github.com",
-      "username" => "x-access-token",
-      "password" => "token"
-    })]
+    [Dependabot::Credential.new(
+      {
+        "type" => "git_source",
+        "host" => "github.com",
+        "username" => "x-access-token",
+        "password" => "token"
+      }
+    )]
   end
   let(:dependency) do
     Dependabot::Dependency.new(
@@ -81,6 +83,13 @@ RSpec.describe Dependabot::NpmAndYarn::MetadataFinder do
         source_url
         expect(WebMock).not_to have_requested(:get, npm_url)
       end
+    end
+
+    context "when the npm registry returns a bare JSON string body" do
+      let(:npm_latest_version_response) { '"Not Found"' }
+      let(:npm_all_versions_response) { '"Not Found"' }
+
+      it { is_expected.to be_nil }
     end
 
     context "when there is a github link in the npm response" do
@@ -236,17 +245,21 @@ RSpec.describe Dependabot::NpmAndYarn::MetadataFinder do
         context "with credentials" do
           let(:credentials) do
             [
-              Dependabot::Credential.new({
-                "type" => "git_source",
-                "host" => "github.com",
-                "username" => "x-access-token",
-                "password" => "token"
-              }),
-              Dependabot::Credential.new({
-                "type" => "npm_registry",
-                "registry" => "registry.npmjs.org",
-                "token" => "secret_token"
-              })
+              Dependabot::Credential.new(
+                {
+                  "type" => "git_source",
+                  "host" => "github.com",
+                  "username" => "x-access-token",
+                  "password" => "token"
+                }
+              ),
+              Dependabot::Credential.new(
+                {
+                  "type" => "npm_registry",
+                  "registry" => "registry.npmjs.org",
+                  "token" => "secret_token"
+                }
+              )
             ]
           end
 
@@ -300,17 +313,21 @@ RSpec.describe Dependabot::NpmAndYarn::MetadataFinder do
         context "with credentials" do
           let(:credentials) do
             [
-              Dependabot::Credential.new({
-                "type" => "git_source",
-                "host" => "github.com",
-                "username" => "x-access-token",
-                "password" => "token"
-              }),
-              Dependabot::Credential.new({
-                "type" => "npm_registry",
-                "registry" => "npm.fury.io/dependabot",
-                "token" => "secret_token"
-              })
+              Dependabot::Credential.new(
+                {
+                  "type" => "git_source",
+                  "host" => "github.com",
+                  "username" => "x-access-token",
+                  "password" => "token"
+                }
+              ),
+              Dependabot::Credential.new(
+                {
+                  "type" => "npm_registry",
+                  "registry" => "npm.fury.io/dependabot",
+                  "token" => "secret_token"
+                }
+              )
             ]
           end
 
@@ -344,17 +361,21 @@ RSpec.describe Dependabot::NpmAndYarn::MetadataFinder do
 
       let(:credentials) do
         [
-          Dependabot::Credential.new({
-            "type" => "git_source",
-            "host" => "github.com",
-            "username" => "x-access-token",
-            "password" => "token"
-          }),
-          Dependabot::Credential.new({
-            "type" => "npm_registry",
-            "registry" => "npm.fury.io/dependabot",
-            "token" => "secret_token"
-          })
+          Dependabot::Credential.new(
+            {
+              "type" => "git_source",
+              "host" => "github.com",
+              "username" => "x-access-token",
+              "password" => "token"
+            }
+          ),
+          Dependabot::Credential.new(
+            {
+              "type" => "npm_registry",
+              "registry" => "npm.fury.io/dependabot",
+              "token" => "secret_token"
+            }
+          )
         ]
       end
 
@@ -401,6 +422,109 @@ RSpec.describe Dependabot::NpmAndYarn::MetadataFinder do
 
       it "prefers to fetch metadata from the private registry" do
         expect(source_url).to eq("https://github.com/jshttp/etag")
+      end
+    end
+
+    context "when there is a space in the package resolved URL" do
+      let(:npm_latest_version_response) { nil }
+      let(:npm_all_versions_response) { nil }
+      let(:dependency_name) { "@etag/etag" }
+
+      let(:dependency) do
+        Dependabot::Dependency.new(
+          name: dependency_name,
+          version: "1.0",
+          requirements: [
+            {
+              file: "package.json",
+              requirement: "^1.0",
+              groups: [],
+              source: {
+                type: "registry",
+                url: "https://npm.example.com/registry with spaces"
+              }
+            }
+          ],
+          package_manager: "npm_and_yarn"
+        )
+      end
+
+      before do
+        # the URL reported above has spaces, but we only stub the escaped versions
+        stub_request(
+          :get, "https://npm.example.com/registry%20with%20spaces/@etag%2Fetag/latest"
+        ).to_return(status: 404, body: '{"error":"Not found"}').times(2)
+
+        stub_request(:get, "https://npm.example.com/registry%20with%20spaces/@etag%2Fetag")
+          .to_return(
+            status: 200,
+            body: fixture("gemfury_responses", "gemfury_response_etag.json")
+          )
+      end
+
+      it "escapes the spaces before querying the content" do
+        expect(source_url).to eq("https://github.com/jshttp/etag")
+      end
+    end
+
+    context "when the latest listing is unavailable and the all-versions fallback repeats a dead homepage" do
+      let(:npm_latest_version_response) { nil }
+      let(:npm_all_versions_response) do
+        JSON.dump(
+          {
+            "versions" => {
+              "2.0.0" => {
+                "homepage" => "https://typescript-eslint.io/typescript-eslint/typescript-eslint",
+                "bugs" => { "url" => "https://typescript-eslint.io/typescript-eslint/issues" }
+              },
+              "1.0.0" => {
+                "homepage" => "https://typescript-eslint.io/typescript-eslint/typescript-eslint",
+                "bugs" => { "url" => "https://typescript-eslint.io/typescript-eslint/issues" }
+              }
+            }
+          }
+        )
+      end
+
+      before do
+        stub_request(:get, npm_url + "/latest")
+          .to_return(status: 404, body: '{"error":"Not found"}')
+        stub_request(:get, "https://typescript-eslint.io/status").to_return(status: 404)
+      end
+
+      it "probes the repeated homepage host at most once" do
+        expect(source_url).to be_nil
+        expect(WebMock).to have_requested(:get, "https://typescript-eslint.io/status").once
+      end
+    end
+
+    context "when the latest listing is unavailable but the first all-versions repository resolves" do
+      let(:npm_latest_version_response) { nil }
+      let(:npm_all_versions_response) do
+        JSON.dump(
+          {
+            "versions" => {
+              "2.0.0" => {
+                "repository" => { "url" => "typescript-eslint/typescript-eslint" },
+                "homepage" => "https://typescript-eslint.io/typescript-eslint/typescript-eslint"
+              },
+              "1.0.0" => {
+                "homepage" => "https://typescript-eslint.io/typescript-eslint/typescript-eslint"
+              }
+            }
+          }
+        )
+      end
+
+      before do
+        stub_request(:get, npm_url + "/latest")
+          .to_return(status: 404, body: '{"error":"Not found"}')
+        stub_request(:get, "https://typescript-eslint.io/status").to_return(status: 404)
+      end
+
+      it "returns the repository source without probing the homepage" do
+        expect(source_url).to eq("https://github.com/typescript-eslint/typescript-eslint")
+        expect(WebMock).not_to have_requested(:get, "https://typescript-eslint.io/status")
       end
     end
   end
@@ -468,6 +592,445 @@ RSpec.describe Dependabot::NpmAndYarn::MetadataFinder do
           "[dougwilson](https://www.npmjs.com/~dougwilson), a new releaser " \
           "for etag since your current version."
         )
+      end
+    end
+
+    context "when the maintainer name contains spaces" do
+      let(:dependency_name) { "npm-package-json-lint" }
+      let(:npm_url) { "https://registry.npmjs.org/npm-package-json-lint" }
+      let(:dependency) do
+        Dependabot::Dependency.new(
+          name: dependency_name,
+          version: "10.0.0",
+          previous_version: "9.0.0",
+          requirements: [{
+            file: "package.json",
+            requirement: "^10.0",
+            groups: [],
+            source: nil
+          }],
+          package_manager: "npm_and_yarn"
+        )
+      end
+      let(:npm_all_versions_response) do
+        fixture("npm_responses", "npm-package-json-lint.json")
+      end
+
+      it "properly URL-encodes the maintainer name in the link" do
+        expect(maintainer_changes).to eq(
+          "This version was pushed to npm by " \
+          "[GitHub Actions](https://www.npmjs.com/~GitHub%20Actions), a new releaser " \
+          "for npm-package-json-lint since your current version."
+        )
+      end
+    end
+  end
+
+  describe "#install_script_changes" do
+    subject(:install_script_changes) { finder.install_script_changes }
+
+    let(:dependency_name) { "install-scripts-pkg" }
+    let(:npm_url) { "https://registry.npmjs.org/install-scripts-pkg" }
+    let(:npm_all_versions_response) do
+      fixture("npm_responses", "install_scripts.json")
+    end
+
+    before do
+      stub_request(:get, npm_url)
+        .to_return(status: 200, body: npm_all_versions_response)
+    end
+
+    context "when there is no previous version" do
+      let(:dependency) do
+        Dependabot::Dependency.new(
+          name: dependency_name,
+          version: "1.1.0",
+          requirements: [{
+            file: "package.json",
+            requirement: "^1.0",
+            groups: [],
+            source: nil
+          }],
+          package_manager: "npm_and_yarn"
+        )
+      end
+
+      it { is_expected.to be_nil }
+    end
+
+    context "when a preinstall script is added alongside existing postinstall" do
+      let(:dependency) do
+        Dependabot::Dependency.new(
+          name: dependency_name,
+          version: "1.3.0",
+          previous_version: "1.2.0",
+          requirements: [{
+            file: "package.json",
+            requirement: "^1.0",
+            groups: [],
+            source: nil
+          }],
+          package_manager: "npm_and_yarn"
+        )
+      end
+
+      it "returns a notification about the added script" do
+        expect(install_script_changes).to eq(
+          "This version adds `preinstall` script that runs during installation. " \
+          "Review the package contents before updating."
+        )
+      end
+    end
+
+    context "when a postinstall script is added" do
+      let(:dependency) do
+        Dependabot::Dependency.new(
+          name: dependency_name,
+          version: "1.1.0",
+          previous_version: "1.0.0",
+          requirements: [{
+            file: "package.json",
+            requirement: "^1.0",
+            groups: [],
+            source: nil
+          }],
+          package_manager: "npm_and_yarn"
+        )
+      end
+
+      it "returns a notification about the added script" do
+        expect(install_script_changes).to eq(
+          "This version adds `postinstall` script that runs during installation. " \
+          "Review the package contents before updating."
+        )
+      end
+    end
+
+    context "when a postinstall script is modified" do
+      let(:dependency) do
+        Dependabot::Dependency.new(
+          name: dependency_name,
+          version: "1.2.0",
+          previous_version: "1.1.0",
+          requirements: [{
+            file: "package.json",
+            requirement: "^1.0",
+            groups: [],
+            source: nil
+          }],
+          package_manager: "npm_and_yarn"
+        )
+      end
+
+      it "returns a notification about the modified script" do
+        expect(install_script_changes).to eq(
+          "This version modifies `postinstall` script that runs during installation. " \
+          "Review the package contents before updating."
+        )
+      end
+    end
+
+    context "when only non-install scripts change" do
+      let(:npm_all_versions_response) do
+        fixture("npm_responses", "etag.json")
+      end
+      let(:dependency_name) { "etag" }
+      let(:npm_url) { "https://registry.npmjs.org/etag" }
+      let(:dependency) do
+        Dependabot::Dependency.new(
+          name: dependency_name,
+          version: "1.7.0",
+          previous_version: "1.6.0",
+          requirements: [{
+            file: "package.json",
+            requirement: "^1.0",
+            groups: [],
+            source: nil
+          }],
+          package_manager: "npm_and_yarn"
+        )
+      end
+
+      it { is_expected.to be_nil }
+    end
+  end
+
+  describe "#attestation_changes" do
+    subject(:attestation_changes) { finder.attestation_changes }
+
+    let(:dependency_name) { "attestation-pkg" }
+    let(:npm_url) { "https://registry.npmjs.org/attestation-pkg" }
+    let(:npm_all_versions_response) do
+      fixture("npm_responses", "attestation_changes.json")
+    end
+
+    before do
+      stub_request(:get, npm_url)
+        .to_return(status: 200, body: npm_all_versions_response)
+    end
+
+    context "when there is no previous version" do
+      let(:dependency) do
+        Dependabot::Dependency.new(
+          name: dependency_name,
+          version: "1.1.0",
+          requirements: [{
+            file: "package.json",
+            requirement: "^1.0",
+            groups: [],
+            source: nil
+          }],
+          package_manager: "npm_and_yarn"
+        )
+      end
+
+      it { is_expected.to be_nil }
+    end
+
+    context "when attestation is lost between versions" do
+      let(:dependency) do
+        Dependabot::Dependency.new(
+          name: dependency_name,
+          version: "1.2.0",
+          previous_version: "1.1.0",
+          requirements: [{
+            file: "package.json",
+            requirement: "^1.0",
+            groups: [],
+            source: nil
+          }],
+          package_manager: "npm_and_yarn"
+        )
+      end
+
+      it "returns a warning about lost attestation" do
+        expect(attestation_changes).to eq(
+          "This version has no provenance attestation, while the previous version " \
+          "(1.1.0) was attested. Review the " \
+          "[package versions](https://www.npmjs.com/package/attestation-pkg?activeTab=versions) " \
+          "before updating."
+        )
+      end
+    end
+
+    context "when both versions are attested" do
+      let(:dependency) do
+        Dependabot::Dependency.new(
+          name: dependency_name,
+          version: "1.3.0",
+          previous_version: "1.1.0",
+          requirements: [{
+            file: "package.json",
+            requirement: "^1.0",
+            groups: [],
+            source: nil
+          }],
+          package_manager: "npm_and_yarn"
+        )
+      end
+
+      it { is_expected.to be_nil }
+    end
+
+    context "when neither version is attested" do
+      let(:dependency) do
+        Dependabot::Dependency.new(
+          name: dependency_name,
+          version: "1.2.0",
+          previous_version: "1.0.0",
+          requirements: [{
+            file: "package.json",
+            requirement: "^1.0",
+            groups: [],
+            source: nil
+          }],
+          package_manager: "npm_and_yarn"
+        )
+      end
+
+      it { is_expected.to be_nil }
+    end
+
+    context "when attestation is gained" do
+      let(:dependency) do
+        Dependabot::Dependency.new(
+          name: dependency_name,
+          version: "1.1.0",
+          previous_version: "1.0.0",
+          requirements: [{
+            file: "package.json",
+            requirement: "^1.0",
+            groups: [],
+            source: nil
+          }],
+          package_manager: "npm_and_yarn"
+        )
+      end
+
+      it { is_expected.to be_nil }
+    end
+
+    context "when using a non-standard registry" do
+      let(:dependency) do
+        Dependabot::Dependency.new(
+          name: dependency_name,
+          version: "1.2.0",
+          previous_version: "1.1.0",
+          requirements: [{
+            file: "package.json",
+            requirement: "^1.0",
+            groups: [],
+            source: { type: "registry", url: "https://npm.pkg.github.com" }
+          }],
+          package_manager: "npm_and_yarn"
+        )
+      end
+
+      before do
+        stub_request(:get, "https://npm.pkg.github.com/attestation-pkg")
+          .to_return(status: 200, body: npm_all_versions_response)
+      end
+
+      it { is_expected.to be_nil }
+    end
+  end
+
+  describe "#dependency_url" do
+    subject(:dependency_url) { finder.send(:dependency_url) }
+
+    context "when no source information is available" do
+      let(:dependency) do
+        Dependabot::Dependency.new(
+          name: dependency_name,
+          version: "1.6.0",
+          requirements: [
+            { file: "package.json", requirement: "^1.0", groups: [], source: nil }
+          ],
+          package_manager: "npm_and_yarn"
+        )
+      end
+
+      context "without credentials" do
+        let(:credentials) { [] }
+
+        it "falls back to public npm registry" do
+          expect(dependency_url).to eq("https://registry.npmjs.org/etag")
+        end
+      end
+
+      context "with replaces-base credential" do
+        let(:credentials) do
+          [Dependabot::Credential.new(
+            {
+              "type" => "npm_registry",
+              "registry" => "jfrogghdemo.jfrog.io/artifactory/api/npm/e2e-tests-dependabot-npm/",
+              "token" => "secret_token",
+              "replaces-base" => true
+            }
+          )]
+        end
+
+        it "uses private registry from credentials" do
+          expect(dependency_url).to eq("https://jfrogghdemo.jfrog.io/artifactory/api/npm/e2e-tests-dependabot-npm/etag")
+        end
+
+        it "removes trailing slashes from registry URL" do
+          expect(dependency_url).not_to include("npm//etag")
+        end
+      end
+
+      context "with registry URL that has no protocol" do
+        let(:credentials) do
+          [Dependabot::Credential.new(
+            {
+              "type" => "npm_registry",
+              "registry" => "npm.fury.io/dependabot",
+              "token" => "secret_token",
+              "replaces-base" => true
+            }
+          )]
+        end
+
+        it "adds https protocol" do
+          expect(dependency_url).to eq("https://npm.fury.io/dependabot/etag")
+        end
+      end
+
+      context "with multiple credentials" do
+        let(:credentials) do
+          [
+            Dependabot::Credential.new(
+              {
+                "type" => "npm_registry",
+                "registry" => "https://npm.fury.io/dependabot",
+                "token" => "secret_token",
+                "replaces-base" => true
+              }
+            ),
+            Dependabot::Credential.new(
+              {
+                "type" => "npm_registry",
+                "registry" => "another.registry.com",
+                "token" => "another_secret_token"
+              }
+            )
+          ]
+        end
+
+        it "takes precedence over other credentials" do
+          expect(dependency_url).to eq("https://npm.fury.io/dependabot/etag")
+        end
+      end
+
+      context "with scoped dependency name" do
+        let(:dependency_name) { "@babel/core" }
+        let(:credentials) do
+          [Dependabot::Credential.new(
+            {
+              "type" => "npm_registry",
+              "registry" => "npm.fury.io/dependabot",
+              "token" => "secret_token",
+              "replaces-base" => true
+            }
+          )]
+        end
+
+        it "escapes dependency name properly" do
+          expect(dependency_url).to eq("https://npm.fury.io/dependabot/@babel%2Fcore")
+        end
+      end
+    end
+
+    context "when source information is available from lockfile" do
+      let(:dependency) do
+        Dependabot::Dependency.new(
+          name: dependency_name,
+          version: "1.6.0",
+          requirements: [
+            {
+              file: "package.json",
+              requirement: "^1.0",
+              groups: [],
+              source: { type: "registry", url: "https://npm.fury.io/dependabot" }
+            }
+          ],
+          package_manager: "npm_and_yarn"
+        )
+      end
+
+      let(:credentials) do
+        [Dependabot::Credential.new(
+          {
+            "type" => "npm_registry",
+            "registry" => "different.registry.com",
+            "token" => "secret_token",
+            "replaces-base" => true
+          }
+        )]
+      end
+
+      it "uses replaces-base credentials, not source from lockfile" do
+        expect(dependency_url).to eq("https://different.registry.com/etag")
       end
     end
   end

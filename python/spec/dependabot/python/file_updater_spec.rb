@@ -11,12 +11,14 @@ require_common_spec "file_updaters/shared_examples_for_file_updaters"
 RSpec.describe Dependabot::Python::FileUpdater do
   let(:tmp_path) { Dependabot::Utils::BUMP_TMP_DIR_PATH }
   let(:credentials) do
-    [Dependabot::Credential.new({
-      "type" => "git_source",
-      "host" => "github.com",
-      "username" => "x-access-token",
-      "password" => "token"
-    })]
+    [Dependabot::Credential.new(
+      {
+        "type" => "git_source",
+        "host" => "github.com",
+        "username" => "x-access-token",
+        "password" => "token"
+      }
+    )]
   end
   let(:dependency) do
     Dependabot::Dependency.new(
@@ -56,55 +58,6 @@ RSpec.describe Dependabot::Python::FileUpdater do
   before { FileUtils.mkdir_p(tmp_path) }
 
   it_behaves_like "a dependency file updater"
-
-  describe "#updated_files_regex" do
-    subject(:updated_files_regex) { described_class.updated_files_regex }
-
-    it "is not empty" do
-      expect(updated_files_regex).not_to be_empty
-    end
-
-    context "when files match the regex patterns" do
-      it "returns true for files that should be updated" do
-        matching_files = [
-          "Pipfile",
-          "Pipfile.lock",
-          "requirements.txt",
-          "constraints.txt",
-          "some_dependency.in",
-          "setup.py",
-          "setup.cfg",
-          "pyproject.toml",
-          "pyproject.lock",
-          "poetry.lock",
-          "subdirectory/Pipfile",
-          "subdirectory/requirements.txt",
-          "requirements/test.in",
-          "requirements/test.txt"
-        ]
-
-        matching_files.each do |file_name|
-          expect(updated_files_regex).to(be_any { |regex| file_name.match?(regex) })
-        end
-      end
-
-      it "returns false for files that should not be updated" do
-        non_matching_files = [
-          "README.md",
-          ".github/workflow/main.yml",
-          "some_random_file.rb",
-          "package-lock.json",
-          "package.json",
-          "Gemfile",
-          "Gemfile.lock"
-        ]
-
-        non_matching_files.each do |file_name|
-          expect(updated_files_regex).not_to(be_any { |regex| file_name.match?(regex) })
-        end
-      end
-    end
-  end
 
   describe "#updated_dependency_files" do
     subject(:updated_files) { updater.updated_dependency_files }
@@ -352,6 +305,53 @@ RSpec.describe Dependabot::Python::FileUpdater do
       end
     end
 
+    context "with a PEP 621 pyproject.toml using Poetry build backend and poetry.lock" do
+      let(:dependency_files) { [pyproject, lockfile] }
+      let(:pyproject) do
+        Dependabot::DependencyFile.new(
+          name: "pyproject.toml",
+          content:
+            fixture("pyproject_files", "pep621_poetry_build_backend.toml")
+        )
+      end
+      let(:lockfile) do
+        Dependabot::DependencyFile.new(
+          name: "poetry.lock",
+          content:
+            fixture("poetry_locks", "pep621_poetry_build_backend.lock")
+        )
+      end
+
+      let(:dependency) do
+        Dependabot::Dependency.new(
+          name: "django",
+          version: "5.2.7",
+          previous_version: "5.0.0",
+          package_manager: "pip",
+          requirements: [{
+            requirement: "==5.2.7",
+            file: "pyproject.toml",
+            source: nil,
+            groups: ["dependencies"]
+          }],
+          previous_requirements: [{
+            requirement: "==5.0.0",
+            file: "pyproject.toml",
+            source: nil,
+            groups: ["dependencies"]
+          }],
+          metadata: { source_requirement: "==5.0.0" }
+        )
+      end
+
+      it "delegates to PoetryFileUpdater when using Poetry as build backend" do
+        expect(described_class::PoetryFileUpdater)
+          .to receive(:new).and_call_original
+        expect { updated_files }.not_to(change { Dir.entries(tmp_path) })
+        updated_files.each { |f| expect(f).to be_a(Dependabot::DependencyFile) }
+      end
+    end
+
     context "with a pip-compile file" do
       let(:dependency_files) { [manifest_file, generated_file] }
       let(:manifest_file) do
@@ -391,11 +391,12 @@ RSpec.describe Dependabot::Python::FileUpdater do
           instance_double(described_class::PipCompileFileUpdater)
         allow(described_class::PipCompileFileUpdater).to receive(:new)
           .and_return(dummy_updater)
+        stub_file = Data.define(:name).new("updated files")
         expect(dummy_updater)
           .to receive(:updated_dependency_files)
-          .and_return([OpenStruct.new(name: "updated files")])
+          .and_return([stub_file])
         expect(updater.updated_dependency_files)
-          .to eq([OpenStruct.new(name: "updated files")])
+          .to eq([stub_file])
       end
 
       context "when a requirements.txt that specifies a subdependency" do
@@ -417,15 +418,16 @@ RSpec.describe Dependabot::Python::FileUpdater do
         end
 
         it "delegates to PipCompileFileUpdater" do
+          stub_file = Data.define(:name).new("updated files")
           dummy_updater =
             instance_double(described_class::PipCompileFileUpdater)
           allow(described_class::PipCompileFileUpdater).to receive(:new)
             .and_return(dummy_updater)
           expect(dummy_updater)
             .to receive(:updated_dependency_files)
-            .and_return([OpenStruct.new(name: "updated files")])
+            .and_return([stub_file])
           expect(updater.updated_dependency_files)
-            .to eq([OpenStruct.new(name: "updated files")])
+            .to eq([stub_file])
         end
       end
     end

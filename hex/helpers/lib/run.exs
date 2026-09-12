@@ -1,10 +1,12 @@
 defmodule DependencyHelper do
   def main() do
-    IO.read(:stdio, :all)
-    |> Jason.decode!()
+    IO.read(:stdio, :eof)
+    |> JSON.decode!()
     |> run()
     |> case do
       {output, 0} ->
+        output = try_decode(output)
+
         if output =~ "No authenticated organization found" do
           {:error, output}
         else
@@ -12,9 +14,19 @@ defmodule DependencyHelper do
         end
 
       {error, 1} ->
-        {:error, error}
+        {:error, try_decode(error)}
     end
     |> handle_result()
+  end
+
+  defp try_decode(result) do
+    case Base.decode64(result) do
+      {:ok, result} ->
+        result
+
+      :error ->
+        result
+    end
   end
 
   defp handle_result({:ok, {:ok, result}}) do
@@ -33,7 +45,7 @@ defmodule DependencyHelper do
 
   defp encode_and_write(content) do
     content
-    |> Jason.encode!()
+    |> JSON.encode!()
     |> IO.write()
   end
 
@@ -67,16 +79,7 @@ defmodule DependencyHelper do
         script
       ] ++ args
 
-    System.cmd(
-      "mix",
-      args,
-      cd: dir,
-      env: %{
-        "MIX_EXS" => nil,
-        "MIX_LOCK" => nil,
-        "MIX_DEPS" => nil
-      }
-    )
+    System.cmd("mix", args, cd: dir, env: %{"MIX_EXS" => nil})
   end
 
   defp set_credentials([]), do: :ok
@@ -119,14 +122,21 @@ defmodule DependencyHelper do
 
   defp fetch_public_key(repo, repo_url, auth_key, fingerprint) do
     case Hex.Repo.get_public_key(%{trusted: true, url: repo_url, auth_key: auth_key}) do
-      {:ok, {200, key, _}} ->
-        if public_key_matches?(key, fingerprint) do
-          {:ok, key}
-        else
-          {:error, "Public key fingerprint mismatch for repo \"#{repo}\""}
+      {:ok, {200, _headers, key}} ->
+        try do
+          if public_key_matches?(key, fingerprint) do
+            {:ok, key}
+          else
+            {:error, "Public key fingerprint mismatch for repo \"#{repo}\""}
+          end
+        rescue
+          e in FunctionClauseError ->
+            {:error,
+             "Failed to decode public key for repo \"#{repo}\": " <>
+               "#{Exception.message(e)} (#{inspect(e.__struct__)})"}
         end
 
-      {:ok, {code, _, _}} ->
+      {:ok, {code, _headers, _body}} ->
         {:error, "Downloading public key for repo \"#{repo}\" failed with code: #{inspect(code)}"}
 
       other ->

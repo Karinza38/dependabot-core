@@ -35,6 +35,17 @@ RSpec.describe Dependabot::Hex::UpdateChecker::RequirementsUpdater do
 
     specify { expect(updater.updated_requirements.count).to eq(1) }
 
+    context "with a malformed requirement" do
+      let(:mixfile_req) do
+        { file: "mix.exs", requirement: 123, groups: [], source: nil }
+      end
+
+      it "raises a type error" do
+        expect { updater.updated_requirements }
+          .to raise_error(TypeError, "requirement must be a string, :unfixable, or nil")
+      end
+    end
+
     context "when there is no resolvable version" do
       let(:latest_resolvable_version) { nil }
 
@@ -191,17 +202,20 @@ RSpec.describe Dependabot::Hex::UpdateChecker::RequirementsUpdater do
 
         it "updates both requirements" do
           expect(updated_requirements)
-            .to contain_exactly({
-              file: "apps/dependabot_business/mix.exs",
-              requirement: "~> 1.5.0",
-              groups: [],
-              source: nil
-            }, {
-              file: "apps/dependabot_web/mix.exs",
-              requirement: "1.5.0",
-              groups: [],
-              source: nil
-            })
+            .to contain_exactly(
+              {
+                file: "apps/dependabot_business/mix.exs",
+                requirement: "~> 1.5.0",
+                groups: [],
+                source: nil
+              },
+              {
+                file: "apps/dependabot_web/mix.exs",
+                requirement: "1.5.0",
+                groups: [],
+                source: nil
+              }
+            )
         end
       end
     end

@@ -2,6 +2,7 @@
 # frozen_string_literal: true
 
 require "dependabot/updater/group_update_creation"
+require "dependabot/updater/group_dependency_selector"
 require "sorbet-runtime"
 
 # This class implements our strategy for creating a single Pull Request which
@@ -49,6 +50,7 @@ module Dependabot
           @group = group
         end
 
+        # rubocop:disable Metrics/AbcSize
         sig { returns(T.nilable(Dependabot::DependencyChange)) }
         def perform
           if group.dependencies.empty?
@@ -60,26 +62,35 @@ module Dependabot
 
           if dependency_change&.updated_dependencies&.any?
             Dependabot.logger.info("Creating a pull request for '#{group.name}'")
+
+            # Report any failed dependency updates before creating the PR
+            report_failed_dependency_updates_for_security_updates
+
             begin
               service.create_pull_request(T.must(dependency_change), dependency_snapshot.base_commit_sha)
             rescue StandardError => e
               error_handler.handle_job_error(error: e, dependency_group: group)
             ensure
               service.record_ecosystem_meta(dependency_snapshot.ecosystem)
+              service.record_cooldown_meta(job)
             end
           else
             Dependabot.logger.info("Nothing to update for Dependency Group: '#{group.name}'")
+
+            # If there are no updates, we still want to report them as failed updates
+            report_failed_dependency_updates_for_security_updates
           end
 
           dependency_change
         end
+        # rubocop:enable Metrics/AbcSize
 
         private
 
         sig { returns(Dependabot::Job) }
         attr_reader :job
 
-        sig { returns(Dependabot::Service) }
+        sig { override.returns(Dependabot::Service) }
         attr_reader :service
 
         sig { returns(Dependabot::DependencySnapshot) }
@@ -98,17 +109,64 @@ module Dependabot
           if job.source.directories.nil?
             @dependency_change = compile_all_dependency_changes_for(group)
           else
-            dependency_changes = T.must(job.source.directories).filter_map do |directory|
-              job.source.directory = directory
-              dependency_snapshot.current_directory = directory
-              compile_all_dependency_changes_for(group)
-            end
+            dependency_changes = T.let(
+              T.must(job.source.directories).filter_map do |directory|
+                job.source.directory = directory
+                dependency_snapshot.current_directory = directory
+                compile_all_dependency_changes_for(group)
+              end,
+              T::Array[Dependabot::DependencyChange]
+            )
 
-            # merge the changes together into one
-            dependency_change = T.let(T.must(dependency_changes.first), Dependabot::DependencyChange)
-            dependency_change.merge_changes!(T.must(dependency_changes[1..-1])) if dependency_changes.count > 1
-            @dependency_change = T.let(dependency_change, T.nilable(Dependabot::DependencyChange))
+            # `filter_map` drops directories that produced no change, so the array is empty
+            # when nothing could update across every directory. Return nil like the
+            # single-directory branch above (the caller skips the group) instead of
+            # `T.must`-ing `first` on an empty array, which raised `TypeError: Passed nil`.
+            first_change = dependency_changes.first
+            if first_change && dependency_changes.count > 1
+              first_change.merge_changes!(T.must(dependency_changes[1..-1]))
+            end
+            @dependency_change = T.let(first_change, T.nilable(Dependabot::DependencyChange))
           end
+
+          # Apply GroupDependencySelector filtering to ensure only group-eligible dependencies
+          if @dependency_change
+            selector = Dependabot::Updater::GroupDependencySelector.new(
+              group: group,
+              dependency_snapshot: dependency_snapshot
+            )
+            selector.filter_to_group!(@dependency_change)
+          end
+
+          @dependency_change
+        end
+
+        # The single place a security update failure is reported for the job. A dependency is
+        # only a failure if no directory managed to update it, so this cannot run until every
+        # directory has been compiled.
+        sig { void }
+        def report_failed_dependency_updates_for_security_updates
+          diagnosed, undiagnosed = failed_security_update_dependencies(dependency_change)
+                                   .partition { |dep| security_update_failures.key?(dep.name.downcase) }
+
+          # A diagnosed failure carries the conflicting dependencies and lowest non-vulnerable version.
+          diagnosed.each { |dep| report_security_update_failure(dep.name) }
+
+          # Handled state has to span every directory: computing `dependency_change` leaves
+          # `current_directory` pointing at the last one.
+          handled = Set.new(dependency_snapshot.all_handled_dependencies.map(&:downcase))
+
+          undiagnosed
+            .reject { |dep| handled.include?(dep.name.downcase) }
+            .each do |dep|
+              error_handler.handle_dependency_error(
+                error: Dependabot::DependabotError.new(
+                  "Security update failed for #{dep.name} #{dep.version}"
+                ),
+                dependency: dep,
+                dependency_group: group
+              )
+            end
         end
       end
     end

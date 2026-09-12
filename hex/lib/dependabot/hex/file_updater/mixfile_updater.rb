@@ -1,6 +1,7 @@
-# typed: true
+# typed: strong
 # frozen_string_literal: true
 
+require "sorbet-runtime"
 require "dependabot/hex/file_updater"
 require "dependabot/hex/file_updater/mixfile_requirement_updater"
 require "dependabot/hex/file_updater/mixfile_git_pin_updater"
@@ -9,15 +10,19 @@ module Dependabot
   module Hex
     class FileUpdater
       class MixfileUpdater
+        extend T::Sig
+
+        sig { params(mixfile: Dependabot::DependencyFile, dependencies: T::Array[Dependabot::Dependency]).void }
         def initialize(mixfile:, dependencies:)
           @mixfile = mixfile
           @dependencies = dependencies
         end
 
+        sig { returns(String) }
         def updated_mixfile_content
           dependencies
             .select { |dep| requirement_changed?(mixfile, dep) }
-            .reduce(mixfile.content.dup) do |content, dep|
+            .reduce(T.must(mixfile.content).dup) do |content, dep|
               updated_content = content
 
               updated_content = update_requirement(
@@ -40,25 +45,30 @@ module Dependabot
 
         private
 
+        sig { returns(Dependabot::DependencyFile) }
         attr_reader :mixfile
+
+        sig { returns(T::Array[Dependabot::Dependency]) }
         attr_reader :dependencies
 
+        sig { params(file: Dependabot::DependencyFile, dependency: Dependabot::Dependency).returns(T::Boolean) }
         def requirement_changed?(file, dependency)
           changed_requirements =
-            dependency.requirements - dependency.previous_requirements
+            dependency.requirements - (dependency.previous_requirements || [])
 
-          changed_requirements.any? { |f| f[:file] == file.name }
+          changed_requirements.any? { |requirement| requirement.file == file.name }
         end
 
+        sig { params(content: String, filename: String, dependency: Dependabot::Dependency).returns(String) }
         def update_requirement(content:, filename:, dependency:)
           updated_req =
-            dependency.requirements.find { |r| r[:file] == filename }
-                      .fetch(:requirement)
+            dependency.requirements.find { |r| r.file == filename }
+                      &.requirement_string
 
           old_req =
             dependency.previous_requirements
-                      .find { |r| r[:file] == filename }
-                      .fetch(:requirement)
+                      &.find { |r| r.file == filename }
+                      &.requirement_string
 
           return content unless old_req
 
@@ -70,15 +80,16 @@ module Dependabot
           ).updated_content
         end
 
+        sig { params(content: String, filename: String, dependency: Dependabot::Dependency).returns(String) }
         def update_git_pin(content:, filename:, dependency:)
           updated_pin =
-            dependency.requirements.find { |r| r[:file] == filename }
-                      &.dig(:source, :ref)
+            dependency.requirements.find { |r| r.file == filename }
+                      &.source_string("ref")
 
           old_pin =
             dependency.previous_requirements
-                      .find { |r| r[:file] == filename }
-                      &.dig(:source, :ref)
+                      &.find { |r| r.file == filename }
+                      &.source_string("ref")
 
           return content unless old_pin
           return content if old_pin == updated_pin
@@ -87,7 +98,7 @@ module Dependabot
             dependency_name: dependency.name,
             mixfile_content: content,
             previous_pin: old_pin,
-            updated_pin: updated_pin
+            updated_pin: T.must(updated_pin)
           ).updated_content
         end
       end

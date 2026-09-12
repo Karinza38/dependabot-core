@@ -1,4 +1,4 @@
-# typed: true
+# typed: strict
 # frozen_string_literal: true
 
 require "dependabot/bundler/file_updater/requirement_replacer"
@@ -10,46 +10,65 @@ require "dependabot/update_checkers/base"
 
 module Dependabot
   module Bundler
-    class UpdateChecker < Dependabot::UpdateCheckers::Base
+    # The cooldown/native-option policy lives in CooldownOptionsBuilder, but this
+    # orchestrator still exceeds the class-length threshold because of its git and
+    # resolution surface. Splitting that further is out of scope here, and the other
+    # ecosystem update checkers (npm_and_yarn, bun, docker, python) disable this cop
+    # for the same reason, so the exception is retained deliberately.
+    class UpdateChecker < Dependabot::UpdateCheckers::Base # rubocop:disable Metrics/ClassLength
       require_relative "update_checker/force_updater"
       require_relative "update_checker/file_preparer"
       require_relative "update_checker/requirements_updater"
       require_relative "update_checker/version_resolver"
       require_relative "update_checker/latest_version_finder"
       require_relative "update_checker/conflicting_dependency_resolver"
+      require_relative "update_checker/cooldown_options_builder"
+      extend T::Sig
 
+      sig { override.returns(T.nilable(T.any(String, Dependabot::Bundler::Version))) }
       def latest_version
         return latest_version_for_git_dependency if git_dependency?
 
         latest_version_details&.fetch(:version)
       end
 
+      sig { override.returns(T.nilable(T.any(String, Dependabot::Bundler::Version))) }
       def latest_resolvable_version
         return latest_resolvable_version_for_git_dependency if git_dependency?
 
         latest_resolvable_version_details&.fetch(:version)
       end
 
+      sig { override.returns(T.nilable(Dependabot::Bundler::Version)) }
       def lowest_security_fix_version
-        latest_version_finder(remove_git_source: false)
-          .lowest_security_fix_version
+        T.cast(
+          latest_version_finder(remove_git_source: false).lowest_security_fix_version,
+          T.nilable(Dependabot::Bundler::Version)
+        )
       end
 
+      sig { override.returns(T.nilable(Dependabot::Bundler::Version)) }
       def lowest_resolvable_security_fix_version
         raise "Dependency not vulnerable!" unless vulnerable?
-        return latest_resolvable_version if git_dependency?
+        return T.cast(latest_resolvable_version, T.nilable(Dependabot::Bundler::Version)) if git_dependency?
 
         lowest_fix =
           latest_version_finder(remove_git_source: false)
           .lowest_security_fix_version
-        return unless lowest_fix && resolvable?(lowest_fix)
+        return unless lowest_fix && resolvable?(T.cast(lowest_fix, Dependabot::Bundler::Version))
 
-        lowest_fix
+        T.cast(lowest_fix, Dependabot::Bundler::Version)
       end
 
+      sig { override.returns(T.nilable(T.any(String, Dependabot::Bundler::Version))) }
       def latest_resolvable_version_with_no_unlock
         current_ver = dependency.version
         return current_ver if git_dependency? && git_commit_checker.pinned?
+
+        @latest_resolvable_version_detail_with_no_unlock = T.let(
+          @latest_resolvable_version_detail_with_no_unlock,
+          T.nilable(T::Hash[Symbol, T.untyped])
+        )
 
         @latest_resolvable_version_detail_with_no_unlock ||=
           version_resolver(remove_git_source: false, unlock_requirement: false)
@@ -62,26 +81,28 @@ module Dependabot
         end
       end
 
+      sig { override.returns(T::Array[Dependabot::DependencyRequirement]) }
       def updated_requirements
         latest_version_for_req_updater = latest_version_details&.fetch(:version)&.to_s
         latest_resolvable_version_for_req_updater = preferred_resolvable_version_details&.fetch(:version)&.to_s
 
         RequirementsUpdater.new(
           requirements: dependency.requirements,
-          update_strategy: requirements_update_strategy,
+          update_strategy: T.must(requirements_update_strategy),
           updated_source: updated_source,
           latest_version: latest_version_for_req_updater,
           latest_resolvable_version: latest_resolvable_version_for_req_updater
         ).updated_requirements
       end
 
+      sig { returns(T::Boolean) }
       def requirements_unlocked_or_can_be?
         return true if requirements_unlocked?
-        return false if requirements_update_strategy.lockfile_only?
+        return false if T.must(requirements_update_strategy).lockfile_only?
 
         dependency.specific_requirements
                   .all? do |req|
-          file = T.must(dependency_files.find { |f| f.name == req.fetch(:file) })
+          file = T.must(dependency_files.find { |f| f.name == req.file })
           updated = FileUpdater::RequirementReplacer.new(
             dependency: dependency,
             file_type: file.name.end_with?("gemspec") ? :gemspec : :gemfile,
@@ -92,6 +113,7 @@ module Dependabot
         end
       end
 
+      sig { returns(T.nilable(Dependabot::RequirementsUpdateStrategy)) }
       def requirements_update_strategy
         # If passed in as an option (in the base class) honour that option
         return @requirements_update_strategy if @requirements_update_strategy
@@ -104,24 +126,62 @@ module Dependabot
         end
       end
 
+      sig { returns(T.nilable(Dependabot::Package::ReleaseCooldownOptions)) }
+      def update_cooldown
+        cooldown_options_builder.release_cooldown_options(@update_cooldown)
+      end
+
+      sig { override.returns(T::Array[Dependabot::UpdateCheckers::Conflict]) }
       def conflicting_dependencies
         ConflictingDependencyResolver.new(
           dependency_files: dependency_files,
           repo_contents_path: repo_contents_path,
           credentials: credentials,
-          options: options
+          options: native_bundler_options
         ).conflicting_dependencies(
           dependency: dependency,
-          target_version: lowest_security_fix_version
+          target_version: lowest_security_fix_version.to_s # Convert Version to String
         )
       end
 
       private
 
+      # Options passed to the native Bundler subprocess. The security-update signal is
+      # derived from the advisories so native cooldown is disabled only for security
+      # remediation; see CooldownOptionsBuilder for the policy.
+      sig { returns(T::Hash[Symbol, T.anything]) }
+      def native_bundler_options
+        @native_bundler_options ||= T.let(
+          cooldown_options_builder.native_helper_options(options),
+          T.nilable(T::Hash[Symbol, T.anything])
+        )
+      end
+
+      sig { returns(CooldownOptionsBuilder) }
+      def cooldown_options_builder
+        @cooldown_options_builder ||= T.let(
+          CooldownOptionsBuilder.new(
+            dependency_files: dependency_files,
+            security_advisories: security_advisories
+          ),
+          T.nilable(CooldownOptionsBuilder)
+        )
+      end
+
+      # Bundler's Gemfile `source cooldown:` applies only to RubyGems remotes, so a
+      # git dependency's tag selection/resolvability must use the user-configured
+      # cooldown without the RubyGems source floor added by CooldownOptionsBuilder.
+      sig { returns(T.nilable(Dependabot::Package::ReleaseCooldownOptions)) }
+      def git_dependency_cooldown
+        @update_cooldown
+      end
+
+      sig { returns(T::Boolean) }
       def requirements_unlocked?
         dependency.specific_requirements.none?
       end
 
+      sig { override.returns(T::Boolean) }
       def latest_version_resolvable_with_full_unlock?
         return false unless latest_version
         return false if version_resolver(remove_git_source: false).latest_allowable_version_incompatible_with_ruby?
@@ -130,31 +190,35 @@ module Dependabot
 
         updated_dependencies.none? do |dep|
           old_version = dep.previous_version
-          next unless Gem::Version.correct?(old_version)
-          next if Gem::Version.new(old_version).prerelease?
+          next unless Dependabot::Bundler::Version.correct?(old_version)
+          next if Dependabot::Bundler::Version.new(old_version).prerelease?
 
-          Gem::Version.new(dep.version).prerelease?
+          Dependabot::Bundler::Version.new(dep.version).prerelease?
         end
       rescue Dependabot::DependencyFileNotResolvable
         false
       end
 
+      sig { override.returns(T::Array[Dependabot::Dependency]) }
       def updated_dependencies_after_full_unlock
         force_updater.updated_dependencies
       end
 
+      sig { returns(T.nilable(T::Hash[Symbol, T.untyped])) }
       def preferred_resolvable_version_details
         return { version: lowest_resolvable_security_fix_version } if vulnerable?
 
         latest_resolvable_version_details
       end
 
+      sig { returns(T::Boolean) }
       def git_dependency?
         git_commit_checker.git_dependency?
       end
 
+      sig { params(version: Dependabot::Bundler::Version).returns(T.untyped) }
       def resolvable?(version)
-        @resolvable ||= {}
+        @resolvable ||= T.let({}, T.nilable(T::Hash[T.untyped, T.untyped]))
         return @resolvable[version] if @resolvable.key?(version)
 
         @resolvable[version] =
@@ -165,9 +229,9 @@ module Dependabot
               repo_contents_path: repo_contents_path,
               credentials: credentials,
               target_version: version,
-              requirements_update_strategy: requirements_update_strategy,
+              requirements_update_strategy: T.must(requirements_update_strategy),
               update_multiple_dependencies: false,
-              options: options
+              options: native_bundler_options
             ).updated_dependencies
             true
           rescue Dependabot::DependencyFileNotResolvable
@@ -175,8 +239,9 @@ module Dependabot
           end
       end
 
+      sig { params(tag: T.nilable(String)).returns(T.untyped) }
       def git_tag_resolvable?(tag)
-        @git_tag_resolvable ||= {}
+        @git_tag_resolvable ||= T.let({}, T.nilable(T::Hash[T.untyped, T.untyped]))
         return @git_tag_resolvable[tag] if @git_tag_resolvable.key?(tag)
 
         @git_tag_resolvable[tag] =
@@ -189,7 +254,8 @@ module Dependabot
               ignored_versions: ignored_versions,
               raise_on_ignored: raise_on_ignored,
               replacement_git_pin: tag,
-              options: options
+              cooldown_options: git_dependency_cooldown,
+              options: native_bundler_options
             ).latest_resolvable_version_details
             true
           rescue Dependabot::DependencyFileNotResolvable
@@ -197,20 +263,23 @@ module Dependabot
           end
       end
 
+      sig { params(remove_git_source: T::Boolean).returns(T.nilable(T::Hash[Symbol, T.untyped])) }
       def latest_version_details(remove_git_source: false)
-        @latest_version_details ||= {}
+        @latest_version_details ||= T.let({}, T.nilable(T::Hash[T.untyped, T.untyped]))
         @latest_version_details[remove_git_source] ||=
           latest_version_finder(remove_git_source: remove_git_source)
           .latest_version_details
       end
 
+      sig { params(remove_git_source: T::Boolean).returns(T.nilable(T::Hash[Symbol, T.untyped])) }
       def latest_resolvable_version_details(remove_git_source: false)
-        @latest_resolvable_version_details ||= {}
+        @latest_resolvable_version_details ||= T.let({}, T.nilable(T::Hash[T.untyped, T.untyped]))
         @latest_resolvable_version_details[remove_git_source] ||=
           version_resolver(remove_git_source: remove_git_source)
           .latest_resolvable_version_details
       end
 
+      sig { returns(T.nilable(T.any(String, Dependabot::Bundler::Version))) }
       def latest_version_for_git_dependency
         latest_release =
           latest_version_details(remove_git_source: true)
@@ -227,16 +296,15 @@ module Dependabot
         # If the dependency is pinned to a tag that looks like a version then
         # we want to update that tag. The latest version will then be the SHA
         # of the latest tag that looks like a version.
-        if git_commit_checker.pinned_ref_looks_like_version?
-          latest_tag = git_commit_checker.local_tag_for_latest_version
-          return latest_tag&.fetch(:tag_sha) || dependency.version
-        end
+        latest_tag = git_commit_checker.local_tag_for_pinned_version_ref(git_dependency_cooldown)
+        return latest_tag.tag_sha || dependency.version if latest_tag
 
         # If the dependency is pinned to a tag that doesn't look like a
         # version then there's nothing we can do.
         dependency.version
       end
 
+      sig { returns(T.any(String, T.nilable(Dependabot::Bundler::Version))) }
       def latest_resolvable_version_for_git_dependency
         latest_release = latest_resolvable_version_without_git_source
 
@@ -251,10 +319,9 @@ module Dependabot
         # If the dependency is pinned to a tag that looks like a version then
         # we want to update that tag. The latest version will then be the SHA
         # of the latest tag that looks like a version.
-        if git_commit_checker.pinned_ref_looks_like_version? &&
-           latest_git_tag_is_resolvable?
-          new_tag = git_commit_checker.local_tag_for_latest_version
-          return new_tag.fetch(:tag_sha)
+        if latest_git_tag_is_resolvable?
+          new_tag = git_commit_checker.local_tag_for_pinned_version_ref(git_dependency_cooldown)
+          return new_tag&.tag_sha
         end
 
         # If the dependency is pinned to a tag that doesn't look like a
@@ -262,6 +329,7 @@ module Dependabot
         dependency.version
       end
 
+      sig { returns(T.any(String, T.nilable(Dependabot::Bundler::Version))) }
       def latest_resolvable_version_without_git_source
         return nil unless latest_version.is_a?(Gem::Version)
 
@@ -271,6 +339,7 @@ module Dependabot
         nil
       end
 
+      sig { returns(T.any(String, T.nilable(Dependabot::Bundler::Version))) }
       def latest_resolvable_commit_with_unchanged_git_source
         details = latest_resolvable_version_details(remove_git_source: false)
 
@@ -284,52 +353,69 @@ module Dependabot
         nil
       end
 
+      sig { returns(T::Boolean) }
       def latest_git_tag_is_resolvable?
-        latest_tag_details = git_commit_checker.local_tag_for_latest_version
+        latest_tag_details = git_commit_checker.local_tag_for_pinned_version_ref(git_dependency_cooldown)
         return false unless latest_tag_details
 
-        git_tag_resolvable?(latest_tag_details.fetch(:tag))
+        git_tag_resolvable?(latest_tag_details.tag)
       end
 
+      sig { params(release: T.untyped).returns(T::Boolean) }
       def git_branch_or_ref_in_release?(release)
         return false unless release
 
         git_commit_checker.branch_or_ref_in_release?(release)
       end
 
+      sig { returns(T.nilable(T::Hash[T.untyped, T.untyped])) }
       def updated_source
         # Never need to update source, unless a git_dependency
         return dependency_source_details unless git_dependency?
 
         # Update the git tag if updating a pinned version
-        if git_commit_checker.pinned_ref_looks_like_version? &&
-           latest_git_tag_is_resolvable?
-          new_tag = git_commit_checker.local_tag_for_latest_version
-          return dependency_source_details.merge(ref: new_tag.fetch(:tag))
+        if latest_git_tag_is_resolvable?
+          new_tag = git_commit_checker.local_tag_for_pinned_version_ref(git_dependency_cooldown)
+          return T.must(dependency_source_details).merge(ref: T.must(new_tag).tag)
         end
 
         # Otherwise return the original source
         dependency_source_details
       end
 
+      sig { returns(T.nilable(T::Hash[T.any(String, Symbol), T.untyped])) }
       def dependency_source_details
         dependency.source_details
       end
 
+      sig { returns(Dependabot::Bundler::UpdateChecker::ForceUpdater) }
       def force_updater
+        if @force_updater.nil?
+          @force_updater = T.let(
+            @force_updater,
+            T.nilable(Dependabot::Bundler::UpdateChecker::ForceUpdater)
+          )
+        end
         @force_updater ||=
           ForceUpdater.new(
             dependency: dependency,
             dependency_files: dependency_files,
             repo_contents_path: repo_contents_path,
             credentials: credentials,
-            target_version: latest_version,
-            requirements_update_strategy: requirements_update_strategy,
-            options: options
+            target_version: T.cast(latest_version, Dependabot::Version),
+            requirements_update_strategy: T.must(requirements_update_strategy),
+            options: native_bundler_options
           )
       end
 
+      sig { returns(Dependabot::GitCommitChecker) }
       def git_commit_checker
+        if @git_commit_checker.nil?
+          @git_commit_checker = T.let(
+            @git_commit_checker,
+            T.nilable(Dependabot::GitCommitChecker)
+          )
+        end
         @git_commit_checker ||=
           GitCommitChecker.new(
             dependency: dependency,
@@ -337,8 +423,9 @@ module Dependabot
           )
       end
 
+      sig { params(remove_git_source: T::Boolean, unlock_requirement: T::Boolean).returns(T.untyped) }
       def version_resolver(remove_git_source:, unlock_requirement: true)
-        @version_resolver ||= {}
+        @version_resolver ||= T.let({}, T.nilable(T::Hash[T.untyped, T.untyped]))
         @version_resolver[remove_git_source] ||= {}
         @version_resolver[remove_git_source][unlock_requirement] ||=
           VersionResolver.new(
@@ -351,12 +438,14 @@ module Dependabot
             remove_git_source: remove_git_source,
             unlock_requirement: unlock_requirement,
             latest_allowable_version: latest_version,
-            options: options
+            cooldown_options: update_cooldown,
+            options: native_bundler_options
           )
       end
 
+      sig { params(remove_git_source: T::Boolean).returns(Dependabot::Bundler::UpdateChecker::LatestVersionFinder) }
       def latest_version_finder(remove_git_source:)
-        @latest_version_finder ||= {}
+        @latest_version_finder ||= T.let({}, T.nilable(T::Hash[T.untyped, T.untyped]))
         @latest_version_finder[remove_git_source] ||=
           begin
             prepared_dependency_files = prepared_dependency_files(
@@ -367,18 +456,28 @@ module Dependabot
             LatestVersionFinder.new(
               dependency: dependency,
               dependency_files: prepared_dependency_files,
-              repo_contents_path: repo_contents_path,
               credentials: credentials,
               ignored_versions: ignored_versions,
               raise_on_ignored: raise_on_ignored,
               security_advisories: security_advisories,
-              options: options
+              cooldown_options: update_cooldown,
+              options: native_bundler_options
             )
           end
       end
 
-      def prepared_dependency_files(remove_git_source:, unlock_requirement:,
-                                    latest_allowable_version: nil)
+      sig do
+        params(
+          remove_git_source: T::Boolean,
+          unlock_requirement: T::Boolean,
+          latest_allowable_version: T.nilable(T.any(String, Dependabot::Bundler::Version))
+        ).returns(T::Array[Dependabot::DependencyFile])
+      end
+      def prepared_dependency_files(
+        remove_git_source:,
+        unlock_requirement:,
+        latest_allowable_version: nil
+      )
         FilePreparer.new(
           dependency: dependency,
           dependency_files: dependency_files,

@@ -6,6 +6,7 @@ require "support/dependency_file_helpers"
 
 require "dependabot/dependency_file"
 require "dependabot/errors"
+require "dependabot/fetched_files"
 
 require "dependabot/dependency_snapshot"
 require "dependabot/job"
@@ -38,19 +39,25 @@ RSpec.describe Dependabot::DependencySnapshot do
     )
   end
 
+  let(:group_definitions) do
+    dependency_groups.map { |group| Dependabot::Job::DependencyGroupDefinition.from_hash(group) }
+  end
+
   let(:job) do
-    instance_double(Dependabot::Job,
-                    package_manager: "bundler",
-                    security_updates_only?: false,
-                    repo_contents_path: nil,
-                    credentials: [],
-                    reject_external_code?: false,
-                    source: source,
-                    dependency_groups: dependency_groups,
-                    allowed_update?: true,
-                    dependency_group_to_refresh: nil,
-                    dependencies: nil,
-                    experiments: { large_hadron_collider: true })
+    instance_double(
+      Dependabot::Job,
+      package_manager: "bundler",
+      security_updates_only?: false,
+      repo_contents_path: nil,
+      credentials: [],
+      reject_external_code?: false,
+      source: source,
+      dependency_groups: group_definitions,
+      allowed_update?: true,
+      dependency_group_to_refresh: nil,
+      dependencies: nil,
+      experiments: { large_hadron_collider: true }
+    )
   end
 
   let(:dependency_files) do
@@ -117,18 +124,15 @@ RSpec.describe Dependabot::DependencySnapshot do
   describe "::add_handled_dependencies" do
     subject(:create_dependency_snapshot) do
       described_class.create_from_job_definition(
-        job: job,
-        job_definition: job_definition
+        job:,
+        fetched_files:
       )
     end
 
     let(:unsupported_error_enabled) { false }
 
-    let(:job_definition) do
-      {
-        "base_commit_sha" => base_commit_sha,
-        "base64_dependency_files" => encode_dependency_files(dependency_files)
-      }
+    let(:fetched_files) do
+      Dependabot::FetchedFiles.new(base_commit_sha:, dependency_files:)
     end
 
     it "handles dependencies" do
@@ -169,25 +173,32 @@ RSpec.describe Dependabot::DependencySnapshot do
         snapshot.current_directory = "/foo"
         expect(snapshot.handled_dependencies).to eq(Set.new(%w(a b)))
       end
+
+      it "exposes handled dependencies across every directory" do
+        snapshot = create_dependency_snapshot
+        snapshot.current_directory = "/foo"
+        snapshot.add_handled_dependencies(%w(a b))
+        snapshot.current_directory = "/bar"
+        snapshot.add_handled_dependencies(%w(c d))
+
+        expect(snapshot.all_handled_dependencies).to eq(Set.new(%w(a b c d)))
+      end
     end
   end
 
   describe "::create_from_job_definition" do
     subject(:create_dependency_snapshot) do
       described_class.create_from_job_definition(
-        job: job,
-        job_definition: job_definition
+        job:,
+        fetched_files:
       )
     end
 
     context "when the package manager version is unsupported" do
       let(:unsupported_error_enabled) { true }
 
-      let(:job_definition) do
-        {
-          "base_commit_sha" => base_commit_sha,
-          "base64_dependency_files" => encode_dependency_files(dependency_files_for_unsupported)
-        }
+      let(:fetched_files) do
+        Dependabot::FetchedFiles.new(base_commit_sha:, dependency_files: dependency_files_for_unsupported)
       end
 
       it "raises ToolVersionNotSupported error" do
@@ -198,11 +209,8 @@ RSpec.describe Dependabot::DependencySnapshot do
     end
 
     context "when the job definition includes valid information prepared by the file fetcher step" do
-      let(:job_definition) do
-        {
-          "base_commit_sha" => base_commit_sha,
-          "base64_dependency_files" => encode_dependency_files(dependency_files)
-        }
+      let(:fetched_files) do
+        Dependabot::FetchedFiles.new(base_commit_sha:, dependency_files:)
       end
 
       it "creates a new instance which has parsed the dependencies from the provided files" do
@@ -251,27 +259,73 @@ RSpec.describe Dependabot::DependencySnapshot do
       end
     end
 
+    context "when dependency_group_to_refresh refers to a dynamic subgroup" do
+      let(:fetched_files) do
+        Dependabot::FetchedFiles.new(base_commit_sha:, dependency_files:)
+      end
+
+      let(:dependency_groups) do
+        [
+          {
+            "name" => "monorepo-deps",
+            "rules" => {
+              "patterns" => ["dummy-pkg-*"],
+              "group-by" => "dependency-name"
+            }
+          }
+        ]
+      end
+
+      let(:job) do
+        instance_double(
+          Dependabot::Job,
+          package_manager: "bundler",
+          security_updates_only?: false,
+          repo_contents_path: nil,
+          credentials: [],
+          reject_external_code?: false,
+          source: source,
+          dependency_groups: group_definitions,
+          allowed_update?: true,
+          dependency_group_to_refresh: "monorepo-deps/dummy-pkg-a",
+          dependencies: nil,
+          experiments: { large_hadron_collider: true }
+        )
+      end
+
+      it "returns the dynamic subgroup when job_group is called" do
+        snapshot = create_dependency_snapshot
+
+        # The parent group should have dynamic subgroups created
+        expect(snapshot.groups.map(&:name)).to include("monorepo-deps/dummy-pkg-a")
+        expect(snapshot.groups.map(&:name)).to include("monorepo-deps/dummy-pkg-b")
+
+        # job_group should find the subgroup by name
+        job_group = snapshot.job_group
+        expect(job_group).not_to be_nil
+        expect(job_group.name).to eq("monorepo-deps/dummy-pkg-a")
+      end
+    end
+
     context "when it's a security update and has dependencies" do
-      let(:job_definition) do
-        {
-          "base_commit_sha" => base_commit_sha,
-          "base64_dependency_files" => encode_dependency_files(dependency_files),
-          "security_updates_only" => true
-        }
+      let(:fetched_files) do
+        Dependabot::FetchedFiles.new(base_commit_sha:, dependency_files:)
       end
       let(:job) do
-        instance_double(Dependabot::Job,
-                        package_manager: "bundler",
-                        security_updates_only?: true,
-                        repo_contents_path: nil,
-                        credentials: [],
-                        reject_external_code?: false,
-                        source: source,
-                        dependency_groups: dependency_groups,
-                        dependencies: ["dummy-pkg-a"],
-                        allowed_update?: false,
-                        dependency_group_to_refresh: nil,
-                        experiments: { large_hadron_collider: true })
+        instance_double(
+          Dependabot::Job,
+          package_manager: "bundler",
+          security_updates_only?: true,
+          repo_contents_path: nil,
+          credentials: [],
+          reject_external_code?: false,
+          source: source,
+          dependency_groups: group_definitions,
+          dependencies: ["dummy-pkg-a"],
+          allowed_update?: false,
+          dependency_group_to_refresh: nil,
+          experiments: { large_hadron_collider: true }
+        )
       end
 
       it "uses the dependencies even if they aren't allowed" do
@@ -288,41 +342,15 @@ RSpec.describe Dependabot::DependencySnapshot do
     end
 
     context "when there is a parser error" do
-      let(:job_definition) do
-        {
-          "base_commit_sha" => base_commit_sha,
-          "base64_dependency_files" => encode_dependency_files(dependency_files).tap do |files|
-            files.first["content"] = Base64.encode64("garbage")
-          end
-        }
+      let(:fetched_files) do
+        bad_files = dependency_files.tap do |files|
+          files.first.content = "garbage"
+        end
+        Dependabot::FetchedFiles.new(base_commit_sha:, dependency_files: bad_files)
       end
 
       it "raises an error" do
         expect { create_dependency_snapshot }.to raise_error(Dependabot::DependencyFileNotEvaluatable)
-      end
-    end
-
-    context "when the job definition does not have the 'base64_dependency_files' key" do
-      let(:job_definition) do
-        {
-          "base_commit_sha" => base_commit_sha
-        }
-      end
-
-      it "raises an error" do
-        expect { create_dependency_snapshot }.to raise_error(KeyError)
-      end
-    end
-
-    context "when the job definition does not have the 'base_commit_sha' key" do
-      let(:job_definition) do
-        {
-          "base64_dependency_files" => encode_dependency_files(dependency_files)
-        }
-      end
-
-      it "raises an error" do
-        expect { create_dependency_snapshot }.to raise_error(KeyError)
       end
     end
   end
@@ -330,25 +358,29 @@ RSpec.describe Dependabot::DependencySnapshot do
   describe "::mark_group_handled" do
     subject(:create_dependency_snapshot) do
       described_class.create_from_job_definition(
-        job: job,
-        job_definition: job_definition
+        job:,
+        fetched_files:
       )
     end
 
     let(:job) do
-      instance_double(Dependabot::Job,
-                      package_manager: "bundler",
-                      security_updates_only?: false,
-                      repo_contents_path: nil,
-                      credentials: [],
-                      reject_external_code?: false,
-                      source: source,
-                      dependency_groups: dependency_groups,
-                      allowed_update?: true,
-                      dependency_group_to_refresh: nil,
-                      dependencies: nil,
-                      experiments: { large_hadron_collider: true },
-                      existing_group_pull_requests: existing_group_pull_requests)
+      instance_double(
+        Dependabot::Job,
+        package_manager: "bundler",
+        security_updates_only?: false,
+        repo_contents_path: nil,
+        credentials: [],
+        reject_external_code?: false,
+        source: source,
+        dependency_groups: group_definitions,
+        allowed_update?: true,
+        dependency_group_to_refresh: nil,
+        dependencies: nil,
+        experiments: { large_hadron_collider: true },
+        existing_group_pull_requests: existing_group_pull_requests.map do |pr|
+          Dependabot::Job::ExistingGroupPullRequest.from_hash(pr)
+        end
+      )
     end
 
     let(:source) do
@@ -383,11 +415,8 @@ RSpec.describe Dependabot::DependencySnapshot do
       ]
     end
 
-    let(:job_definition) do
-      {
-        "base_commit_sha" => base_commit_sha,
-        "base64_dependency_files" => encode_dependency_files(dependency_files)
-      }
+    let(:fetched_files) do
+      Dependabot::FetchedFiles.new(base_commit_sha:, dependency_files:)
     end
 
     let(:dependency_files) do
@@ -438,6 +467,102 @@ RSpec.describe Dependabot::DependencySnapshot do
 
         snapshot.current_directory = "/bar"
         expect(snapshot.handled_dependencies).to eq(Set.new(%w(dummy-pkg-a)))
+      end
+    end
+
+    # Shared setup for group_by_dependency_name tests
+    shared_context "with cross-directory existing PR dependencies" do
+      let(:existing_group_pull_requests) do
+        [
+          {
+            "dependency-group-name" => "group-a",
+            "dependencies" => [
+              { "dependency-name" => "dummy-pkg-a", "directory" => "/foo" },
+              { "dependency-name" => "dummy-pkg-b", "directory" => "/bar" }
+            ]
+          }
+        ]
+      end
+    end
+
+    context "when group_by_dependency_name? is true" do
+      include_context "with cross-directory existing PR dependencies"
+
+      let(:dependency_groups) do
+        [
+          {
+            "name" => "group-a",
+            "rules" => {
+              "patterns" => ["dummy-pkg-*"],
+              "group-by" => "dependency-name"
+            }
+          }
+        ]
+      end
+
+      it "includes dependencies from all directories in existing PRs (cross-directory inclusion)" do
+        snapshot = create_dependency_snapshot
+        snapshot.mark_group_handled(snapshot.groups.first)
+
+        # Both directories should have BOTH deps from existing PR marked as handled
+        # because group_by_dependency_name includes deps from all directories
+        snapshot.current_directory = "/foo"
+        handled_foo = snapshot.handled_dependencies
+        expect(handled_foo).to include("dummy-pkg-a")
+        expect(handled_foo).to include("dummy-pkg-b"), "expected cross-directory dep from /bar to be included in /foo"
+
+        snapshot.current_directory = "/bar"
+        handled_bar = snapshot.handled_dependencies
+        expect(handled_bar).to include("dummy-pkg-a"), "expected cross-directory dep from /foo to be included in /bar"
+        expect(handled_bar).to include("dummy-pkg-b")
+      end
+
+      context "when existing PR has no dependencies" do
+        let(:existing_group_pull_requests) do
+          [
+            {
+              "dependency-group-name" => "group-a/dummy-pkg-a",
+              "dependencies" => []
+            }
+          ]
+        end
+
+        it "handles empty dependencies gracefully" do
+          snapshot = create_dependency_snapshot
+          # Use the subgroup since group-by: dependency-name creates subgroups
+          subgroup = snapshot.groups.find { |g| g.name == "group-a/dummy-pkg-a" }
+          expect { snapshot.mark_group_handled(subgroup) }.not_to raise_error
+
+          snapshot.current_directory = "/foo"
+          expect(snapshot.handled_dependencies).to include("dummy-pkg-a")
+        end
+      end
+    end
+
+    context "when group_by_dependency_name? is false" do
+      include_context "with cross-directory existing PR dependencies"
+
+      it "filters existing PR dependencies by directory" do
+        snapshot = create_dependency_snapshot
+        snapshot.mark_group_handled(snapshot.groups.first)
+
+        # Both directories will have both deps handled because:
+        # 1. group.dependencies includes all deps matching the pattern (dummy-pkg-a, dummy-pkg-b)
+        # 2. The directory filtering only affects which deps from existing_group_pull_requests are added
+        #
+        # The key difference from group_by_dependency_name?=true is:
+        # - With true: existing PR deps from ALL directories are included
+        # - With false: existing PR deps are filtered to current directory only
+        #
+        # However, since group.dependencies already includes all matching deps,
+        # this test verifies the filtering logic runs without error
+        snapshot.current_directory = "/foo"
+        handled_foo = snapshot.handled_dependencies
+        expect(handled_foo).to include("dummy-pkg-a")
+
+        snapshot.current_directory = "/bar"
+        handled_bar = snapshot.handled_dependencies
+        expect(handled_bar).to include("dummy-pkg-b")
       end
     end
   end

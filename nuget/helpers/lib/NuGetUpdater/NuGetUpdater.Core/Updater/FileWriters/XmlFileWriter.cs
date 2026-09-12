@@ -1,0 +1,989 @@
+using System.Collections.Immutable;
+using System.Text.RegularExpressions;
+
+using Microsoft.Language.Xml;
+
+using NuGet.Versioning;
+
+using NuGetUpdater.Core.Discover;
+using NuGetUpdater.Core.Utilities;
+
+namespace NuGetUpdater.Core.Updater.FileWriters;
+
+public class XmlFileWriter : IFileWriter
+{
+    private const string IncludeAttributeName = "Include";
+    private const string UpdateAttributeName = "Update";
+    private const string VersionMetadataName = "Version";
+    private const string VersionOverrideMetadataName = "VersionOverride";
+
+    private const string ItemGroupElementName = "ItemGroup";
+    private const string GlobalPackageReferenceElementName = "GlobalPackageReference";
+    private const string PackageReferenceElementName = "PackageReference";
+    private const string PackageVersionElementName = "PackageVersion";
+    private const string PropertyGroupElementName = "PropertyGroup";
+
+    private const string PackagesPropsFileName = "Packages.props";
+
+    private const string UpdaterAnnotationKind = "dependabot";
+
+    private readonly ILogger _logger;
+
+    // these file extensions are valid project entrypoints; everything else is ignored
+    internal static readonly HashSet<string> SupportedProjectFileExtensions = new(StringComparer.OrdinalIgnoreCase)
+    {
+        ".csproj",
+        ".vbproj",
+        ".fsproj",
+    };
+
+    // these file extensions are valid additional files and can be updated; everything else is ignored
+    internal static readonly HashSet<string> SupportedAdditionalFileExtensions = new(StringComparer.OrdinalIgnoreCase)
+    {
+        ".props",
+        ".targets",
+    };
+
+    public XmlFileWriter(ILogger logger)
+    {
+        _logger = logger;
+    }
+
+    public async Task<bool> UpdatePackageVersionsAsync(
+        DirectoryInfo repoContentsPath,
+        ImmutableArray<string> relativeFilePaths,
+        ImmutableArray<Dependency> originalDependencies,
+        ImmutableArray<Dependency> requiredPackageVersions,
+        PackageManagementKind packageManagementKind,
+        string? packageManagementSpecialFileRelativePath
+    )
+    {
+        if (relativeFilePaths.IsDefaultOrEmpty)
+        {
+            _logger.Warn("No files to update; skipping XML update.");
+            return false;
+        }
+
+        var updatesPerformed = requiredPackageVersions.ToDictionary(d => d.Name, _ => false, StringComparer.OrdinalIgnoreCase);
+        var projectRelativePath = relativeFilePaths[0];
+        var projectExtension = Path.GetExtension(projectRelativePath);
+        if (!SupportedProjectFileExtensions.Contains(projectExtension))
+        {
+            _logger.Warn($"Project extension '{projectExtension}' not supported; skipping XML update.");
+            return false;
+        }
+
+        var filesAndContentsTasks = relativeFilePaths
+            .Where(path => SupportedProjectFileExtensions.Contains(Path.GetExtension(path)) || SupportedAdditionalFileExtensions.Contains(Path.GetExtension(path)))
+            .Select(async path =>
+            {
+                var document = await ReadFileContentsAsync(repoContentsPath, path);
+                return KeyValuePair.Create(path, document);
+            })
+            .ToArray();
+        var filesAndContents = (await Task.WhenAll(filesAndContentsTasks))
+            .ToDictionary();
+
+        foreach (var requiredPackageVersion in requiredPackageVersions)
+        {
+            var oldVersionString = originalDependencies.FirstOrDefault(d => d.Name.Equals(requiredPackageVersion.Name, StringComparison.OrdinalIgnoreCase))?.Version;
+            if (oldVersionString is null)
+            {
+                _logger.Warn($"Unable to find project dependency with name {requiredPackageVersion.Name}; skipping XML update.");
+                continue;
+            }
+
+            var oldVersion = NuGetVersion.Parse(oldVersionString);
+            var requiredVersion = NuGetVersion.Parse(requiredPackageVersion.Version!);
+
+            if (oldVersion == requiredVersion)
+            {
+                _logger.Info($"Dependency {requiredPackageVersion.Name} is already at version {requiredVersion}; no update needed.");
+                updatesPerformed[requiredPackageVersion.Name] = true;
+                continue;
+            }
+
+            // version numbers can be in attributes or elements and we may need to do some complicated navigation
+            // this object is used to perform the update once we've walked back as far as necessary
+            string? currentVersionString = null;
+            Action<string>? updateVersionLocation = null;
+
+            var packageReferenceElementsAndPaths = filesAndContents
+                .SelectMany(kvp =>
+                {
+                    var path = kvp.Key;
+                    var doc = kvp.Value;
+                    var elements = doc.Descendants().Where(e => e.Name == PackageReferenceElementName || e.Name == GlobalPackageReferenceElementName);
+                    var pair = elements.Select(element => KeyValuePair.Create(element, path));
+                    return pair;
+                })
+                .Where(pair =>
+                {
+                    var element = pair.Key;
+
+                    // find the matching <PackageReference> element; if using Central Package Versions don't consider any `Update=` attributes
+                    var attributeValue = element.GetAttributeValue(IncludeAttributeName)
+                        ?? (packageManagementKind == PackageManagementKind.CentralPackageVersions
+                            ? string.Empty
+                            : element.GetAttributeValue(UpdateAttributeName))
+                        ?? string.Empty;
+                    var packageNames = attributeValue.Split(';', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+                    return packageNames.Any(name => name.Equals(requiredPackageVersion.Name, StringComparison.OrdinalIgnoreCase));
+                })
+                .ToArray();
+
+            SyntaxNode ReplaceNode(string filePath, SyntaxNode original, SyntaxNode replacement)
+            {
+                var doc = filesAndContents[filePath];
+
+#if DEBUG
+                if (!doc.DescendantNodes().OfType<XmlNodeSyntax>().Any(n => n == original))
+                {
+                    throw new NotSupportedException("original node was not found");
+                }
+#endif
+
+                var updatedDoc = doc.ReplaceNode(original, replacement);
+#if DEBUG
+                var docFullString = doc.ToFullString();
+                var updatedDocFullString = updatedDoc.ToFullString();
+#endif
+                filesAndContents[filePath] = updatedDoc;
+                var newlyAddedNode = updatedDoc.DescendantNodes().OfType<XmlNodeSyntax>().First(d => d.FullSpan.Start == original.FullSpan.Start);
+                return newlyAddedNode;
+            }
+
+            if (packageReferenceElementsAndPaths.Length == 0)
+            {
+                // no matching `<PackageReference>` elements found; pin it as a transitive dependency
+                updatesPerformed[requiredPackageVersion.Name] = true; // all cases below add the dependency
+
+                // find last `<ItemGroup>` in the project...
+                Action addItemGroup = () => { }; // adding an ItemGroup to the project isn't always necessary, but it's much easier to prepare for it here
+                var projectDocument = filesAndContents[projectRelativePath];
+                var projectRoot = projectDocument.RootSyntax
+                    ?? throw new UnparseableFileException("Project file does not contain a root element", projectRelativePath);
+                var indentation = GetDocumentIndentationCharacters(projectDocument);
+                var itemGroups = projectRoot.Elements
+                    .Where(e => e.Name.Equals(ItemGroupElementName, StringComparison.OrdinalIgnoreCase))
+                    .ToArray();
+                var itemGroupsWithPackageReferences = itemGroups
+                    .Where(e => e.Elements.Any(c => c.Name.Equals(PackageReferenceElementName, StringComparison.OrdinalIgnoreCase)))
+                    .ToArray();
+                var itemGroupForInsertion = itemGroupsWithPackageReferences.LastOrDefault() ?? itemGroups.LastOrDefault();
+                if (itemGroupForInsertion is null)
+                {
+                    _logger.Info($"No `<{ItemGroupElementName}>` element found in project; adding one.");
+                    itemGroupForInsertion = XmlExtensions.CreateOpenCloseXmlElementSyntax(ItemGroupElementName,
+                        new SyntaxList<SyntaxNode>([SyntaxFactory.EndOfLineTrivia("\n"), SyntaxFactory.WhitespaceTrivia(indentation)]),
+                        insertIntermediateNewline: false);
+                    addItemGroup = () =>
+                    {
+                        // add the new element
+                        var updatedRootSyntax = projectRoot.AddChild(itemGroupForInsertion);
+                        var updatedProjectDocument = projectDocument.ReplaceNode(projectRoot.AsNode, updatedRootSyntax.AsNode);
+
+                        // reset well-known variables
+                        projectDocument = updatedProjectDocument;
+                        filesAndContents[projectRelativePath] = updatedProjectDocument;
+                        projectRoot = updatedProjectDocument.RootSyntax
+                            ?? throw new InvalidOperationException("Updated project file does not contain a root element");
+                        itemGroupForInsertion = projectRoot.Elements.Last(e => e.Name.Equals(ItemGroupElementName, StringComparison.OrdinalIgnoreCase));
+                    };
+                }
+
+                // ...find where the new item should go...
+                var elementsBeforeNew = GetOrderedElementsBeforeSpecified(itemGroupForInsertion, PackageReferenceElementName, [IncludeAttributeName, UpdateAttributeName], requiredPackageVersion.Name);
+
+                // ...prepare a new `<PackageReference>` element...
+                var newElement = XmlExtensions.CreateSingleLineXmlElementSyntax(PackageReferenceElementName, leadingTrivia: new SyntaxList<SyntaxNode>())
+                    .WithAttribute(IncludeAttributeName, requiredPackageVersion.Name);
+
+                // ...add the `<PackageReference>` element if and where appropriate...
+                var addPackageReferenceElementForPinnedPackages =
+                    packageManagementKind switch
+                    {
+                        PackageManagementKind.Default or
+                        PackageManagementKind.CentralPackageVersions or
+                        PackageManagementKind.CentralPackageManagement => true,
+                        PackageManagementKind.CentralPackageManagementWithTransitivePinning => false,
+                        _ => throw new NotSupportedException($"Unexpected package management kind {packageManagementKind}"),
+                    };
+                if (addPackageReferenceElementForPinnedPackages)
+                {
+                    addItemGroup();
+                    var lastPriorElement = elementsBeforeNew.LastOrDefault();
+                    if (lastPriorElement is not null)
+                    {
+                        // find line indent of the prior element and mimic it
+                        var lastPriorElementIndent = string.Empty;
+                        for (int i = elementsBeforeNew.Length - 1; i >= 0; i--)
+                        {
+                            var elementIndent = elementsBeforeNew[i].GetLeadingTrivia().ToFullString();
+                            var lastNewlineIndex = elementIndent.LastIndexOf('\n');
+                            if (lastNewlineIndex < 0)
+                            {
+                                // prior element is on the same line as its prior sibling so keep walking backwards
+                                continue;
+                            }
+
+                            var elementLineIndent = elementIndent[(lastNewlineIndex + 1)..];
+                            lastPriorElementIndent = elementLineIndent;
+                            break;
+                        }
+
+                        var newTrivia = new SyntaxTriviaList([SyntaxFactory.EndOfLineTrivia("\n"), SyntaxFactory.WhitespaceTrivia(lastPriorElementIndent)]);
+                        newElement = (IXmlElementSyntax)newElement.AsNode.WithLeadingTrivia(newTrivia);
+                        var parent = lastPriorElement.Parent
+                            ?? throw new InvalidOperationException("Expected package reference element to have a parent");
+                        var replacementParent = parent.InsertNodesAfter(lastPriorElement, [newElement.AsNode]);
+                        var actualReplacementParent = ReplaceNode(projectRelativePath, parent, replacementParent);
+                        var insertionIndex = elementsBeforeNew.Length;
+                        var actualNewElement = ((IXmlElementSyntax)actualReplacementParent).Content[insertionIndex];
+                        newElement = (IXmlElementSyntax)actualNewElement;
+                    }
+                    else
+                    {
+                        // no prior package references; add to the front
+                        var itemGroupTrivia = itemGroupForInsertion.AsNode.GetLeadingTrivia().ToList();
+                        var priorEolIndex = itemGroupTrivia.FindLastIndex(t => t.Kind == SyntaxKind.EndOfLineTrivia);
+                        var indentTrivia = itemGroupTrivia
+                            .Skip(priorEolIndex + 1)
+                            .Select(t => SyntaxFactory.WhitespaceTrivia(t.ToFullString()))
+                            .ToArray();
+                        var newTrivia = new SyntaxTriviaList([SyntaxFactory.EndOfLineTrivia("\n"), SyntaxFactory.WhitespaceTrivia(indentation), .. indentTrivia]);
+                        newElement = (IXmlElementSyntax)newElement.AsNode.WithLeadingTrivia(newTrivia);
+                        var updatedItemGroup = (IXmlElementSyntax)ReplaceNode(
+                            projectRelativePath,
+                            itemGroupForInsertion.AsNode,
+                            itemGroupForInsertion.InsertChild(newElement, 0).AsNode
+                        );
+                        newElement = (IXmlElementSyntax)updatedItemGroup.Content[0];
+                    }
+                }
+
+                // ...find the best place to add the version...
+                var matchingPackageVersionElementsAndPaths = filesAndContents
+                    .SelectMany(kvp =>
+                    {
+                        var path = kvp.Key;
+                        var doc = kvp.Value;
+                        var packageVersionElements = doc.Descendants()
+                            .Where(e => e.Name.Equals(PackageVersionElementName, StringComparison.OrdinalIgnoreCase))
+                            .Where(element => (element.GetAttributeValue(IncludeAttributeName) ?? string.Empty).Trim().Equals(requiredPackageVersion.Name, StringComparison.OrdinalIgnoreCase))
+                            .ToArray();
+                        return packageVersionElements.Select(element => KeyValuePair.Create(element, path));
+                    })
+                    .ToArray();
+                if (matchingPackageVersionElementsAndPaths.Length > 0)
+                {
+                    // found matching `<PackageVersion>` element
+                    var (matchingPackageVersionElement, filePath) = matchingPackageVersionElementsAndPaths.First();
+                    var versionAttribute = matchingPackageVersionElement.GetAttributeCaseInsensitive(VersionMetadataName);
+                    var isVersionOverrideNeeded = false;
+                    if (versionAttribute is not null &&
+                        VersionRange.TryParse(versionAttribute.Value, out var existingVersionRange))
+                    {
+                        if (existingVersionRange.MinVersion == requiredVersion)
+                        {
+                            // version matches; no update needed
+                            _logger.Info($"Dependency {requiredPackageVersion.Name} already set to {requiredVersion} in file {filePath}; no update needed.");
+                        }
+                        else if (existingVersionRange.Satisfies(oldVersion))
+                        {
+                            // found matching old version; update the attribute directly
+                            _logger.Info($"Dependency {requiredPackageVersion.Name} updated from version {oldVersion} to {requiredVersion} in file {filePath}.");
+                            ReplaceNode(
+                                filePath,
+                                matchingPackageVersionElement.AsNode,
+                                matchingPackageVersionElement.ReplaceAttribute(
+                                    versionAttribute,
+                                    versionAttribute.WithValue(requiredVersion.ToString())
+                                ).AsNode
+                            );
+                        }
+                        else
+                        {
+                            // version doesn't match; use `VersionOverride` attribute on new element
+                            isVersionOverrideNeeded = true;
+                        }
+                    }
+                    else
+                    {
+                        // version not found; use `VersionOverride` attribute on new element
+                        isVersionOverrideNeeded = true;
+                    }
+
+                    if (isVersionOverrideNeeded)
+                    {
+                        _logger.Info($"Dependency {requiredPackageVersion.Name} set to {requiredVersion} using `{VersionOverrideMetadataName}` attribute on new element in file {projectRelativePath}.");
+                        ReplaceNode(
+                            projectRelativePath,
+                            newElement.AsNode,
+                            newElement.WithAttribute(VersionOverrideMetadataName, requiredVersion.ToString()).AsNode
+                        );
+                    }
+                }
+                else
+                {
+                    // no matching `<PackageVersion>` element; either add a new one, or directly set the `Version` attribute on the new element
+                    var allPackageVersionElementsAndPaths = filesAndContents
+                        .SelectMany(kvp =>
+                        {
+                            var path = kvp.Key;
+                            var doc = kvp.Value;
+                            return doc.Descendants()
+                                .Where(e => e.Name.Equals(PackageVersionElementName, StringComparison.OrdinalIgnoreCase))
+                                .Select(element => KeyValuePair.Create(element, path));
+                        })
+                        .ToArray();
+                    if (allPackageVersionElementsAndPaths.Length > 0)
+                    {
+                        // add a new `<PackageVersion>` element
+                        var newVersionElement = XmlExtensions.CreateSingleLineXmlElementSyntax(PackageVersionElementName)
+                            .WithAttribute(IncludeAttributeName, requiredPackageVersion.Name)
+                            .WithAttribute(VersionMetadataName, requiredVersion.ToString());
+                        var priorPackageVersionElementsAndPaths = allPackageVersionElementsAndPaths
+                            .TakeWhile(pair => (pair.Key.GetAttributeValue(IncludeAttributeName) ?? string.Empty).Trim().CompareTo(requiredPackageVersion.Name) < 0)
+                            .ToArray();
+                        if (priorPackageVersionElementsAndPaths.Length > 0)
+                        {
+                            _logger.Info($"Adding new `<{PackageVersionElementName}>` element for {requiredPackageVersion.Name} with version {requiredVersion}.");
+                            var (lastPriorPackageVersionElement, filePath) = priorPackageVersionElementsAndPaths.Last();
+                            var trivia = lastPriorPackageVersionElement.AsNode.GetLeadingTrivia().ToList();
+                            var priorEolIndex = trivia.FindLastIndex(t => t.Kind == SyntaxKind.EndOfLineTrivia);
+                            var indentTrivia = trivia
+                                .Skip(priorEolIndex + 1)
+                                .Select(t => SyntaxFactory.WhitespaceTrivia(t.ToFullString()))
+                                .ToArray();
+                            var newTrivia = new SyntaxTriviaList([SyntaxFactory.EndOfLineTrivia("\n"), .. indentTrivia]);
+                            newVersionElement = (IXmlElementSyntax)newVersionElement.AsNode.WithLeadingTrivia(newTrivia).WithoutTrailingTrivia();
+                            var parent = lastPriorPackageVersionElement.Parent
+                                ?? throw new InvalidOperationException("Expected package version element to have a parent");
+                            var insertionIndex = parent.Content.IndexOf(lastPriorPackageVersionElement.AsNode) + 1;
+                            var replacementParent = parent
+                                .InsertChild(newVersionElement, insertionIndex);
+                            var actualReplacementParent = ReplaceNode(filePath, parent.AsNode, replacementParent.AsNode);
+                            var actualNewElement = ((IXmlElementSyntax)actualReplacementParent).Content[insertionIndex];
+                            newVersionElement = (IXmlElementSyntax)actualNewElement;
+                        }
+                        else
+                        {
+                            // no prior package versions; add to the front of the document
+                            _logger.Info($"Adding new `<{PackageVersionElementName}>` element for {requiredPackageVersion.Name} with version {requiredVersion} at the start of the document.");
+                            var (firstPackageVersionElement, filePath) = allPackageVersionElementsAndPaths.First();
+                            var packageVersionGroup = firstPackageVersionElement.Parent
+                                ?? throw new InvalidOperationException("Expected package version element to have a parent");
+                            var itemGroupTrivia = packageVersionGroup.AsNode.GetLeadingTrivia().ToList();
+                            var priorEolIndex = itemGroupTrivia.FindLastIndex(t => t.Kind == SyntaxKind.EndOfLineTrivia);
+                            var indentTrivia = itemGroupTrivia
+                                .Skip(priorEolIndex + 1)
+                                .Select(t => SyntaxFactory.WhitespaceTrivia(t.ToFullString()))
+                                .ToArray();
+                            var packageVersionDocument = filesAndContents[filePath];
+                            var packageVersionIndentation = GetDocumentIndentationCharacters(packageVersionDocument);
+                            var newTrivia = new SyntaxTriviaList([SyntaxFactory.EndOfLineTrivia("\n"), SyntaxFactory.WhitespaceTrivia(packageVersionIndentation), .. indentTrivia]);
+                            newVersionElement = (IXmlElementSyntax)newVersionElement.AsNode.WithLeadingTrivia(newTrivia).WithoutTrailingTrivia();
+                            var insertionIndex = 0;
+                            var replacementPackageVersionGroup = packageVersionGroup
+                                .InsertChild(newVersionElement, insertionIndex);
+                            ReplaceNode(
+                                filePath,
+                                packageVersionGroup.AsNode,
+                                replacementPackageVersionGroup.AsNode
+                            );
+                        }
+                    }
+                    else
+                    {
+                        if (packageManagementKind == PackageManagementKind.CentralPackageVersions)
+                        {
+                            // find or update the matching `<PackageReference Update=...>` element in the central package versions file
+                            var allCpvElementsAndPaths = filesAndContents
+                                .SelectMany(kvp =>
+                                {
+                                    var path = kvp.Key;
+                                    var doc = kvp.Value;
+                                    return doc.Descendants()
+                                        .Where(e => e.Name.Equals(PackageReferenceElementName, StringComparison.OrdinalIgnoreCase))
+                                        .Where(e => e.GetAttributeValue(UpdateAttributeName) is not null)
+                                        .Select(element => KeyValuePair.Create(element, path));
+                                })
+                                .ToArray();
+                            var matchingCpvElementAndPath = allCpvElementsAndPaths
+                                .FirstOrDefault(pair => (pair.Key.GetAttributeValue(UpdateAttributeName) ?? string.Empty).Trim().Equals(requiredPackageVersion.Name, StringComparison.OrdinalIgnoreCase));
+                            if (matchingCpvElementAndPath.Key is not null)
+                            {
+                                // found matching `<PackageReference Update=...>` element; update the version it points at,
+                                // walking back through property references (e.g. `$(SomeVersion)`) so they aren't clobbered
+                                var (cpvElement, cpvFilePath) = matchingCpvElementAndPath;
+                                var cpvVersionAttribute = cpvElement.GetAttributeCaseInsensitive(VersionMetadataName);
+                                if (cpvVersionAttribute is not null)
+                                {
+                                    bool TryUpdateCentralVersion(string startVersionString, Action<string> startUpdater)
+                                    {
+                                        var candidateLocations = new Queue<(string VersionString, Action<string> Updater)>();
+                                        candidateLocations.Enqueue((startVersionString, startUpdater));
+                                        while (candidateLocations.TryDequeue(out var candidate))
+                                        {
+                                            var (candidateVersionString, candidateUpdater) = candidate;
+                                            if (NuGetVersion.TryParse(candidateVersionString, out var candidateVersion))
+                                            {
+                                                if (candidateVersion == requiredVersion)
+                                                {
+                                                    _logger.Info($"Dependency {requiredPackageVersion.Name} already set to {requiredVersion} in file {cpvFilePath}; no update needed.");
+                                                    return true;
+                                                }
+
+                                                if (candidateVersion == oldVersion)
+                                                {
+                                                    _logger.Info($"Dependency {requiredPackageVersion.Name} updated to version {requiredVersion} in file {cpvFilePath}.");
+                                                    candidateUpdater(requiredVersion.ToString());
+                                                    return true;
+                                                }
+                                            }
+                                            else if (VersionRange.TryParse(candidateVersionString, out var candidateRange))
+                                            {
+                                                if (candidateRange.Satisfies(oldVersion))
+                                                {
+                                                    // update the value, preserving the range structure where applicable
+                                                    _logger.Info($"Dependency {requiredPackageVersion.Name} updated to version {requiredVersion} in file {cpvFilePath}.");
+                                                    candidateUpdater(CreateUpdatedVersionRangeString(candidateRange, oldVersion, requiredVersion));
+                                                    return true;
+                                                }
+
+                                                if (candidateRange.MinVersion == requiredVersion || candidateRange.Satisfies(requiredVersion))
+                                                {
+                                                    // the version range (e.g. `[1.1.0]`) already includes the required version; no update needed
+                                                    _logger.Info($"Dependency {requiredPackageVersion.Name} already includes {requiredVersion} in file {cpvFilePath}; no update needed.");
+                                                    return true;
+                                                }
+                                            }
+
+                                            // the value may be (or contain) a property reference; walk back to the property definition(s)
+                                            var propertyInSubstringPattern = new Regex(@"(?<Prefix>[^$]*)\$\((?<PropertyName>[A-Za-z0-9_]+)\)(?<Suffix>.*$)");
+                                            var propertyMatch = propertyInSubstringPattern.Match(candidateVersionString);
+                                            if (propertyMatch.Success)
+                                            {
+                                                var propertyName = propertyMatch.Groups["PropertyName"].Value;
+                                                var propertyDefinitionsAndPaths = filesAndContents
+                                                    .SelectMany(kvp => kvp.Value.Descendants()
+                                                        .Where(e => e.Name.Equals(propertyName, StringComparison.OrdinalIgnoreCase))
+                                                        .Where(e => e.Parent?.Name.Equals(PropertyGroupElementName, StringComparison.OrdinalIgnoreCase) == true)
+                                                        .Select(e => KeyValuePair.Create(e, kvp.Key)))
+                                                    .ToArray();
+                                                foreach (var (propertyDefinition, propertyFilePath) in propertyDefinitionsAndPaths)
+                                                {
+                                                    candidateLocations.Enqueue((propertyDefinition.GetContentValue(), version => ReplaceNode(propertyFilePath, propertyDefinition.AsNode, propertyDefinition.WithContent(version).AsNode)));
+                                                }
+                                            }
+                                        }
+
+                                        return false;
+                                    }
+
+                                    var centralUpdatePerformed = TryUpdateCentralVersion(cpvVersionAttribute.Value, version => ReplaceNode(cpvFilePath, cpvVersionAttribute, cpvVersionAttribute.WithValue(version)));
+                                    if (!centralUpdatePerformed)
+                                    {
+                                        // couldn't find a literal version (or backing property) to update; don't leave a broken pin
+                                        updatesPerformed[requiredPackageVersion.Name] = false;
+                                        _logger.Warn($"Unable to find an appropriate location to set {requiredPackageVersion.Name} to version {requiredVersion} in file {cpvFilePath}; no update performed.");
+                                    }
+                                }
+                                else
+                                {
+                                    // the matched central element has no `Version` attribute, so there's no location to
+                                    // record the version; don't leave a versionless, unresolvable pin
+                                    updatesPerformed[requiredPackageVersion.Name] = false;
+                                    _logger.Warn($"Central element for {requiredPackageVersion.Name} has no `{VersionMetadataName}` attribute to set to version {requiredVersion}; no update performed.");
+                                }
+                            }
+                            else if (allCpvElementsAndPaths.Length > 0)
+                            {
+                                // add a new `<PackageReference Update=...>` element in sorted order
+                                var newCpvElement = XmlExtensions.CreateSingleLineXmlElementSyntax(PackageReferenceElementName)
+                                    .WithAttribute(UpdateAttributeName, requiredPackageVersion.Name)
+                                    .WithAttribute(VersionMetadataName, requiredVersion.ToString());
+                                // sort by the `Update` value so placement is deterministic regardless of document/dictionary
+                                // traversal order; use ordinal (case-insensitive) comparison to match NuGet's package id semantics
+                                var sortedCpvElementsAndPaths = allCpvElementsAndPaths
+                                    .OrderBy(pair => (pair.Key.GetAttributeValue(UpdateAttributeName) ?? string.Empty).Trim(), StringComparer.OrdinalIgnoreCase)
+                                    .ToArray();
+                                var priorCpvElementsAndPaths = sortedCpvElementsAndPaths
+                                    .TakeWhile(pair => string.Compare((pair.Key.GetAttributeValue(UpdateAttributeName) ?? string.Empty).Trim(), requiredPackageVersion.Name, StringComparison.OrdinalIgnoreCase) < 0)
+                                    .ToArray();
+                                if (priorCpvElementsAndPaths.Length > 0)
+                                {
+                                    _logger.Info($"Adding new `<{PackageReferenceElementName}>` element for {requiredPackageVersion.Name} with version {requiredVersion}.");
+                                    var (lastPriorCpvElement, filePath) = priorCpvElementsAndPaths.Last();
+                                    var trivia = lastPriorCpvElement.AsNode.GetLeadingTrivia().ToList();
+                                    var priorEolIndex = trivia.FindLastIndex(t => t.Kind == SyntaxKind.EndOfLineTrivia);
+                                    var indentTrivia = trivia
+                                        .Skip(priorEolIndex + 1)
+                                        .Select(t => SyntaxFactory.WhitespaceTrivia(t.ToFullString()))
+                                        .ToArray();
+                                    var newTrivia = new SyntaxTriviaList([SyntaxFactory.EndOfLineTrivia("\n"), .. indentTrivia]);
+                                    newCpvElement = (IXmlElementSyntax)newCpvElement.AsNode.WithLeadingTrivia(newTrivia).WithoutTrailingTrivia();
+                                    var parent = lastPriorCpvElement.Parent
+                                        ?? throw new InvalidOperationException("Expected central package version element to have a parent");
+                                    var insertionIndex = parent.Content.IndexOf(lastPriorCpvElement.AsNode) + 1;
+                                    var replacementParent = parent
+                                        .InsertChild(newCpvElement, insertionIndex);
+                                    ReplaceNode(filePath, parent.AsNode, replacementParent.AsNode);
+                                }
+                                else
+                                {
+                                    // no prior elements; add to the front of the document
+                                    _logger.Info($"Adding new `<{PackageReferenceElementName}>` element for {requiredPackageVersion.Name} with version {requiredVersion} at the start of the document.");
+                                    var (firstCpvElement, filePath) = sortedCpvElementsAndPaths.First();
+                                    var cpvGroup = firstCpvElement.Parent
+                                        ?? throw new InvalidOperationException("Expected central package version element to have a parent");
+                                    var groupTrivia = cpvGroup.AsNode.GetLeadingTrivia().ToList();
+                                    var priorEolIndex = groupTrivia.FindLastIndex(t => t.Kind == SyntaxKind.EndOfLineTrivia);
+                                    var indentTrivia = groupTrivia
+                                        .Skip(priorEolIndex + 1)
+                                        .Select(t => SyntaxFactory.WhitespaceTrivia(t.ToFullString()))
+                                        .ToArray();
+                                    var cpvDocument = filesAndContents[filePath];
+                                    var cpvIndentation = GetDocumentIndentationCharacters(cpvDocument);
+                                    var newTrivia = new SyntaxTriviaList([SyntaxFactory.EndOfLineTrivia("\n"), SyntaxFactory.WhitespaceTrivia(cpvIndentation), .. indentTrivia]);
+                                    newCpvElement = (IXmlElementSyntax)newCpvElement.AsNode.WithLeadingTrivia(newTrivia).WithoutTrailingTrivia();
+                                    var replacementGroup = cpvGroup.InsertChild(newCpvElement, 0);
+                                    ReplaceNode(filePath, cpvGroup.AsNode, replacementGroup.AsNode);
+                                }
+                            }
+                            else
+                            {
+                                // CPV is in use but there's no existing central `<PackageReference Update=...>` element;
+                                // the package is being pinned as a transitive dependency, so add a new element to the
+                                // central file's last `<ItemGroup>`.  Prefer the central file discovered upstream (the
+                                // `CentralPackagesFile` MSBuild property); fall back to the conventional `Packages.props`
+                                // filename when it wasn't provided or couldn't be matched.
+                                string? packagesPropsPath = null;
+                                if (packageManagementSpecialFileRelativePath is not null)
+                                {
+                                    var lastSeparatorIndex = projectRelativePath.LastIndexOf('/');
+                                    var projectDirectory = lastSeparatorIndex >= 0
+                                        ? projectRelativePath.Substring(0, lastSeparatorIndex + 1)
+                                        : "/";
+                                    var resolvedCentralPath = (projectDirectory + packageManagementSpecialFileRelativePath).FullyNormalizedRootedPath();
+                                    packagesPropsPath = filesAndContents.Keys
+                                        .FirstOrDefault(path => path.FullyNormalizedRootedPath().Equals(resolvedCentralPath, StringComparison.OrdinalIgnoreCase));
+                                    if (packagesPropsPath is null)
+                                    {
+                                        _logger.Warn($"Discovered central package management file `{packageManagementSpecialFileRelativePath}` was not found among the updatable files; falling back to `{PackagesPropsFileName}`.");
+                                    }
+                                }
+
+                                packagesPropsPath ??= filesAndContents.Keys
+                                    .FirstOrDefault(path => Path.GetFileName(path).Equals(PackagesPropsFileName, StringComparison.OrdinalIgnoreCase));
+                                var centralItemGroup = packagesPropsPath is null
+                                    ? null
+                                    : filesAndContents[packagesPropsPath].Descendants()
+                                        .LastOrDefault(e => e.Name.Equals(ItemGroupElementName, StringComparison.OrdinalIgnoreCase));
+                                if (packagesPropsPath is not null && centralItemGroup is not null)
+                                {
+                                    _logger.Info($"Adding new `<{PackageReferenceElementName}>` element for {requiredPackageVersion.Name} with version {requiredVersion} to file {packagesPropsPath}.");
+                                    var newCpvElement = XmlExtensions.CreateSingleLineXmlElementSyntax(PackageReferenceElementName)
+                                        .WithAttribute(UpdateAttributeName, requiredPackageVersion.Name)
+                                        .WithAttribute(VersionMetadataName, requiredVersion.ToString());
+                                    var itemGroupTrivia = centralItemGroup.AsNode.GetLeadingTrivia().ToList();
+                                    var priorEolIndex = itemGroupTrivia.FindLastIndex(t => t.Kind == SyntaxKind.EndOfLineTrivia);
+                                    var indentTrivia = itemGroupTrivia
+                                        .Skip(priorEolIndex + 1)
+                                        .Select(t => SyntaxFactory.WhitespaceTrivia(t.ToFullString()))
+                                        .ToArray();
+                                    var centralIndentation = GetDocumentIndentationCharacters(filesAndContents[packagesPropsPath]);
+                                    var newTrivia = new SyntaxTriviaList([SyntaxFactory.EndOfLineTrivia("\n"), SyntaxFactory.WhitespaceTrivia(centralIndentation), .. indentTrivia]);
+                                    newCpvElement = (IXmlElementSyntax)newCpvElement.AsNode.WithLeadingTrivia(newTrivia).WithoutTrailingTrivia();
+                                    ReplaceNode(packagesPropsPath, centralItemGroup.AsNode, centralItemGroup.InsertChild(newCpvElement, 0).AsNode);
+                                }
+                                else
+                                {
+                                    // there's no central file to record the version; emitting a versionless
+                                    // `<PackageReference Include=...>` would produce an unresolvable reference, so report
+                                    // that no update was performed.
+                                    updatesPerformed[requiredPackageVersion.Name] = false;
+                                    _logger.Warn($"Unable to find a central package management file to set {requiredPackageVersion.Name} to version {requiredVersion}; no update performed.");
+                                }
+                            }
+                        }
+                        else
+                        {
+                            // add a direct `Version` attribute
+                            var newElementWithVersion = newElement.WithAttribute(VersionMetadataName, requiredVersion.ToString());
+                            newElement = (IXmlElementSyntax)ReplaceNode(projectRelativePath, newElement.AsNode, newElementWithVersion.AsNode);
+                        }
+                    }
+                }
+            }
+            else
+            {
+                // found matching `<PackageReference>` elements to update
+                foreach (var (packageReferenceElement, filePath) in packageReferenceElementsAndPaths)
+                {
+                    // first check for matching `Version` attribute
+                    var versionAttribute = packageReferenceElement.GetAttribute(VersionMetadataName, StringComparison.OrdinalIgnoreCase);
+                    if (versionAttribute is not null)
+                    {
+                        currentVersionString = versionAttribute.Value;
+                        updateVersionLocation = version =>
+                        {
+                            var existingAnnotation = versionAttribute.GetAnnotations(UpdaterAnnotationKind).First();
+                            var refoundVersionAttribute = filesAndContents[filePath]
+                                .DescendantNodes()
+                                .OfType<XmlAttributeSyntax>()
+                                .First(a => a.GetAnnotations(UpdaterAnnotationKind).Any(an => an == existingAnnotation));
+                            ReplaceNode(filePath, refoundVersionAttribute, refoundVersionAttribute.WithValue(version));
+                        };
+                        goto doVersionUpdate;
+                    }
+
+                    // next check for `Version` child element
+                    var versionElement = packageReferenceElement.Elements.FirstOrDefault(e => e.Name.Equals(VersionMetadataName, StringComparison.OrdinalIgnoreCase));
+                    if (versionElement is not null)
+                    {
+                        currentVersionString = versionElement.GetContentValue();
+                        updateVersionLocation = version =>
+                        {
+                            var existingAnnotation = versionElement.AsNode.GetAnnotations(UpdaterAnnotationKind).First();
+                            var refoundVersionElement = filesAndContents[filePath]
+                                .DescendantNodes()
+                                .OfType<IXmlElementSyntax>()
+                                .First(e => e.AsNode.GetAnnotations(UpdaterAnnotationKind).Any(an => an == existingAnnotation));
+                            ReplaceNode(filePath, refoundVersionElement.AsNode, refoundVersionElement.WithContent(version).AsNode);
+                        };
+                        goto doVersionUpdate;
+                    }
+
+                    // check for matching `<PackageVersion>` element
+                    var packageVersionElementsAndPaths = filesAndContents
+                        .SelectMany(kvp =>
+                        {
+                            var path = kvp.Key;
+                            var doc = kvp.Value;
+                            return doc.Descendants()
+                                .Where(e => e.Name.Equals(PackageVersionElementName, StringComparison.OrdinalIgnoreCase))
+                                .Where(e => (e.GetAttributeValue(IncludeAttributeName) ?? string.Empty).Trim().Equals(requiredPackageVersion.Name, StringComparison.OrdinalIgnoreCase))
+                                .Select(element => KeyValuePair.Create(element, path));
+                        })
+                        .ToArray();
+                    if (packageVersionElementsAndPaths.Length > 0)
+                    {
+                        var (packageVersionElement, packageVersionFilePath) = packageVersionElementsAndPaths.First();
+                        var packageVersionAttribute = packageVersionElement.GetAttributeCaseInsensitive(VersionMetadataName);
+                        if (packageVersionAttribute is not null)
+                        {
+                            currentVersionString = packageVersionAttribute.Value;
+                            updateVersionLocation = version => ReplaceNode(packageVersionFilePath, packageVersionAttribute, packageVersionAttribute.WithValue(version));
+                            goto doVersionUpdate;
+                        }
+                        else
+                        {
+                            var cpmVersionElement = packageVersionElement.GetElements(VersionMetadataName, StringComparison.OrdinalIgnoreCase).FirstOrDefault();
+                            if (cpmVersionElement is not null)
+                            {
+                                currentVersionString = cpmVersionElement.GetContentValue();
+                                updateVersionLocation = version => ReplaceNode(packageVersionFilePath, cpmVersionElement.AsNode, cpmVersionElement.WithContent(version).AsNode);
+                                goto doVersionUpdate;
+                            }
+                        }
+                    }
+
+                    // check for matching `<PackageReference Update=...>` element (Central Package Versions)
+                    if (packageManagementKind == PackageManagementKind.CentralPackageVersions)
+                    {
+                        var cpvElementAndPath = filesAndContents
+                            .SelectMany(kvp =>
+                            {
+                                var path = kvp.Key;
+                                var doc = kvp.Value;
+                                return doc.Descendants()
+                                    .Where(e => e.Name.Equals(PackageReferenceElementName, StringComparison.OrdinalIgnoreCase))
+                                    .Where(e => (e.GetAttributeValue(UpdateAttributeName) ?? string.Empty).Trim().Equals(requiredPackageVersion.Name, StringComparison.OrdinalIgnoreCase))
+                                    .Select(element => KeyValuePair.Create(element, path));
+                            })
+                            .FirstOrDefault();
+                        if (cpvElementAndPath.Key is not null)
+                        {
+                            var (cpvElement, cpvFilePath) = cpvElementAndPath;
+                            var cpvVersionAttribute = cpvElement.GetAttributeCaseInsensitive(VersionMetadataName);
+                            if (cpvVersionAttribute is not null)
+                            {
+                                currentVersionString = cpvVersionAttribute.Value;
+                                updateVersionLocation = version => ReplaceNode(cpvFilePath, cpvVersionAttribute, cpvVersionAttribute.WithValue(version));
+                                goto doVersionUpdate;
+                            }
+                        }
+                    }
+
+                doVersionUpdate:
+                    if (currentVersionString is not null && updateVersionLocation is not null)
+                    {
+                        var performedUpdate = false;
+                        var candidateUpdateLocations = new Queue<(string VersionString, Action<string> Updater)>();
+                        candidateUpdateLocations.Enqueue((currentVersionString, updateVersionLocation));
+
+                        while (candidateUpdateLocations.TryDequeue(out var candidateUpdateLocation))
+                        {
+                            var candidateUpdateVersionString = candidateUpdateLocation.VersionString;
+                            var candidateUpdater = candidateUpdateLocation.Updater;
+
+                            if (NuGetVersion.TryParse(candidateUpdateVersionString, out var candidateUpdateVersion))
+                            {
+                                // most common: direct update
+                                if (candidateUpdateVersion == requiredVersion)
+                                {
+                                    // already up to date from a previous pass
+                                    updatesPerformed[requiredPackageVersion.Name] = true;
+                                    performedUpdate = true;
+                                    _logger.Info($"Dependency {requiredPackageVersion.Name} already set to {requiredVersion}; no update needed.");
+                                    break;
+                                }
+                                else if (candidateUpdateVersion == oldVersion)
+                                {
+                                    // do the update here and call it good
+                                    candidateUpdater(requiredVersion.ToString());
+                                    updatesPerformed[requiredPackageVersion.Name] = true;
+                                    performedUpdate = true;
+                                    _logger.Info($"Updated dependency {requiredPackageVersion.Name} from version {oldVersion} to {requiredVersion}.");
+                                    break;
+                                }
+                                else
+                                {
+                                    // no exact match found, but this may be a magic SDK package
+                                    var packageMapper = DotNetPackageCorrelationManager.GetPackageMapper();
+                                    var isSdkReplacementPackage = packageMapper.IsSdkReplacementPackage(requiredPackageVersion.Name);
+                                    if (isSdkReplacementPackage &&
+                                        candidateUpdateVersion < oldVersion && // version in XML is older than what was resolved by the SDK
+                                        oldVersion < requiredVersion) // this ensures we don't downgrade the wrong one
+                                    {
+                                        // If we're updating a top level SDK replacement package, the version listed in the project file won't
+                                        // necessarily match the resolved version that caused the update because the SDK might have replaced
+                                        // the package.  To handle this scenario, we pretend the version we're searching for was actually found.
+                                        candidateUpdater(requiredVersion.ToString());
+                                        updatesPerformed[requiredPackageVersion.Name] = true;
+                                        performedUpdate = true;
+                                        _logger.Info($"Updated SDK-managed package {requiredPackageVersion.Name} from version {oldVersion} to {requiredVersion}.");
+                                        break;
+                                    }
+                                }
+                            }
+                            else if (VersionRange.TryParse(candidateUpdateVersionString, out var candidateUpdateVersionRange))
+                            {
+                                // less common: version range
+                                if (candidateUpdateVersionRange.Satisfies(oldVersion))
+                                {
+                                    var updatedVersionRange = CreateUpdatedVersionRangeString(candidateUpdateVersionRange, oldVersion, requiredVersion);
+                                    candidateUpdater(updatedVersionRange);
+                                    updatesPerformed[requiredPackageVersion.Name] = true;
+                                    performedUpdate = true;
+                                    _logger.Info($"Updated dependency {requiredPackageVersion.Name} from version {oldVersion} to {requiredVersion}.");
+                                    break;
+                                }
+                                else if (candidateUpdateVersionRange.Satisfies(requiredVersion))
+                                {
+                                    // already up to date from a previous pass
+                                    updatesPerformed[requiredPackageVersion.Name] = true;
+                                    performedUpdate = true;
+                                    _logger.Info($"Dependency {requiredPackageVersion.Name} version range '{candidateUpdateVersionRange}' already includes {requiredVersion}; no update needed.");
+                                    break;
+                                }
+                            }
+
+                            // find something that looks like it contains a property expansion, even if it's surrounded by other text
+                            var propertyInSubstringPattern = new Regex(@"(?<Prefix>[^$]*)\$\((?<PropertyName>[A-Za-z0-9_]+)\)(?<Suffix>.*$)");
+                            // e.g.,                                    not-a-dollar-sign $ ( alphanumeric-or-underscore    ) everything-else
+                            var propertyMatch = propertyInSubstringPattern.Match(candidateUpdateVersionString);
+                            if (propertyMatch.Success)
+                            {
+                                // this looks like a property; keep walking backwards with all possible elements
+                                var propertyName = propertyMatch.Groups["PropertyName"].Value;
+                                var propertyDefinitionsAndPaths = filesAndContents
+                                    .SelectMany(kvp =>
+                                    {
+                                        var path = kvp.Key;
+                                        var doc = kvp.Value;
+                                        return doc.Descendants()
+                                            .Where(e => e.Name.Equals(propertyName, StringComparison.OrdinalIgnoreCase))
+                                            .Where(e => e.Parent?.Name.Equals(PropertyGroupElementName, StringComparison.OrdinalIgnoreCase) == true)
+                                            .Select(element => KeyValuePair.Create(element, path));
+                                    })
+                                    .ToArray();
+                                foreach (var (propertyDefinition, propertyFilePath) in propertyDefinitionsAndPaths)
+                                {
+                                    var updateAction = new Action<string>(version => ReplaceNode(propertyFilePath, propertyDefinition.AsNode, propertyDefinition.WithContent(version).AsNode));
+                                    candidateUpdateLocations.Enqueue((propertyDefinition.GetContentValue(), updateAction));
+                                }
+                            }
+                        }
+
+                        if (!performedUpdate)
+                        {
+                            _logger.Warn($"Unable to find appropriate location to update package {requiredPackageVersion.Name} to version {requiredPackageVersion.Version}; no update performed");
+                        }
+                    }
+                }
+            }
+        }
+
+        var performedAllUpdates = updatesPerformed.Values.All(v => v);
+        if (performedAllUpdates)
+        {
+            foreach (var (path, contents) in filesAndContents)
+            {
+                await WriteFileContentsAsync(repoContentsPath, path, contents);
+            }
+        }
+
+        return performedAllUpdates;
+    }
+
+    private static ImmutableArray<SyntaxNode> GetOrderedElementsBeforeSpecified(IXmlElementSyntax parentElement, string elementName, IEnumerable<string> attributeNamesToCheck, string attributeValue)
+    {
+        var elementsBeforeNew = parentElement.Content
+            .TakeWhile(
+                e => e is XmlCommentSyntax ||
+                (e is IXmlElementSyntax element &&
+                    element.Name.Equals(elementName, StringComparison.OrdinalIgnoreCase) &&
+                    (attributeNamesToCheck.Select(attributeName => element.GetAttributeValue(attributeName)).FirstOrDefault(value => value is not null) ?? string.Empty)
+                    .CompareTo(attributeValue) < 0))
+            .ToImmutableArray();
+        return elementsBeforeNew;
+    }
+
+    internal static async Task<XmlDocumentSyntax> ReadFileContentsAsync(DirectoryInfo repoContentsPath, string path)
+    {
+        var fullPath = Path.Join(repoContentsPath.FullName, path);
+        var contents = await File.ReadAllTextAsync(fullPath);
+        var document = Parser.ParseText(contents);
+
+        // ensure relevant nodes have a unique annotation so we can do precise edits later
+        var documentWithAllAnnotations = document.ReplaceNodes(
+            document.DescendantNodes(),
+            (_, node) => node switch
+            {
+                var nodeType when nodeType is XmlAttributeSyntax or XmlElementSyntax
+                    => node.WithAnnotations(new SyntaxAnnotation(UpdaterAnnotationKind)),
+                _ => node,
+            });
+
+        return documentWithAllAnnotations;
+    }
+
+    private static async Task WriteFileContentsAsync(DirectoryInfo repoContentsPath, string path, XmlDocumentSyntax document)
+    {
+        var fullPath = Path.Join(repoContentsPath.FullName, path);
+        var content = document.ToFullString();
+        await File.WriteAllTextAsync(fullPath, content);
+    }
+
+    public static string CreateUpdatedVersionRangeString(VersionRange existingRange, NuGetVersion existingVersion, NuGetVersion requiredVersion)
+    {
+        var newMinVersion = requiredVersion;
+        Func<NuGetVersion, NuGetVersion, bool> maxVersionComparer = existingRange.IsMaxInclusive
+            ? (a, b) => a >= b
+            : (a, b) => a > b;
+        var newMaxVersion = existingVersion == existingRange.MaxVersion
+            ? requiredVersion
+            : existingRange.MaxVersion is not null && maxVersionComparer(existingRange.MaxVersion, requiredVersion)
+                ? existingRange.MaxVersion
+                : null;
+        var newRange = new VersionRange(
+            minVersion: newMinVersion,
+            includeMinVersion: true,
+            maxVersion: newMaxVersion,
+            includeMaxVersion: newMaxVersion is not null && existingRange.IsMaxInclusive
+        );
+
+        // special case common scenarios
+
+        // e.g., "[2.0.0, 2.0.0]" => "[2.0.0]"
+        if (newRange.MinVersion == newRange.MaxVersion &&
+            newRange.IsMaxInclusive)
+        {
+            return $"[{newRange.MinVersion}]";
+        }
+
+        // e.g., "[2.0.0, )" => "2.0.0"
+        if (newRange.MaxVersion is null)
+        {
+            var requiredVersionString = requiredVersion.ToString();
+            var isWildcardVersion = existingRange.OriginalString?.Contains('*') == true;
+            if (isWildcardVersion)
+            {
+                var oldRangeParts = existingRange.OriginalString!.Split('.');
+                var newRangeParts = requiredVersion.ToFullString().Split('.');
+                var rebuiltParts = new List<string>();
+                for (int i = 0; i < oldRangeParts.Length; i++)
+                {
+                    if (oldRangeParts[i].Contains('*'))
+                    {
+                        var dashIndex = oldRangeParts[i].IndexOf('-');
+                        var starIndex = oldRangeParts[i].IndexOf('*');
+                        if (dashIndex >= 0 && dashIndex < starIndex)
+                        {
+                            // prerelease wildcard (e.g., "3-*")
+                            if (i < newRangeParts.Length)
+                            {
+                                var newDashIndex = newRangeParts[i].IndexOf('-');
+                                if (newDashIndex >= 0)
+                                {
+                                    var beforeDash = newRangeParts[i][..newDashIndex];
+                                    var fromDash = oldRangeParts[i][dashIndex..];
+                                    rebuiltParts.Add(beforeDash + fromDash);
+                                    rebuiltParts.AddRange(oldRangeParts.Skip(i + 1));
+                                }
+                                else
+                                {
+                                    // new version is stable, drop prerelease wildcard
+                                    rebuiltParts.Add(newRangeParts[i]);
+                                }
+                            }
+                            else
+                            {
+                                rebuiltParts.Add("0");
+                            }
+                        }
+                        else
+                        {
+                            // version wildcard (e.g., "*", "*-*", "*-preview*")
+                            rebuiltParts.AddRange(oldRangeParts.Skip(i));
+                        }
+
+                        break;
+                    }
+                    else
+                    {
+                        rebuiltParts.Add(i < newRangeParts.Length ? newRangeParts[i] : "0");
+                    }
+                }
+
+                requiredVersionString = string.Join(".", rebuiltParts);
+            }
+
+            return requiredVersionString;
+        }
+
+        return newRange.ToString();
+    }
+
+    public static string GetDocumentIndentationCharacters(XmlDocumentSyntax document)
+    {
+        // find the first element with leading whitespace and assume that's the document indentation
+        var nodeLeadingLineTrivias = document.DescendantNodes()
+            .Select(n => n.GetLeadingTrivia().ToList())
+            .Select(l =>
+            {
+                var priorEolIndex = l.FindLastIndex(t => t.Kind == SyntaxKind.EndOfLineTrivia);
+                var leadingTriviaParts = l.Skip(priorEolIndex + 1)
+                    .Select(t => t.ToFullString());
+                var leadingTrivia = string.Concat(leadingTriviaParts);
+                return leadingTrivia;
+            })
+            .ToArray();
+        var nodeLeadingLineTrivia = nodeLeadingLineTrivias
+            .FirstOrDefault(t => !string.IsNullOrEmpty(t));
+        return nodeLeadingLineTrivia ?? "  ";
+    }
+}

@@ -21,17 +21,19 @@ RSpec.describe Dependabot::NpmAndYarn::UpdateChecker::VersionResolver do
   let(:tmp_path) { Dependabot::Utils::BUMP_TMP_DIR_PATH }
   let(:dependency_files) { project_dependency_files(project_name) }
   let(:credentials) do
-    [Dependabot::Credential.new({
-      "type" => "git_source",
-      "host" => "github.com",
-      "username" => "x-access-token",
-      "password" => "token"
-    })]
+    [Dependabot::Credential.new(
+      {
+        "type" => "git_source",
+        "host" => "github.com",
+        "username" => "x-access-token",
+        "password" => "token"
+      }
+    )]
   end
   let(:repo_contents_path) { build_tmp_repo(project_name, path: "projects") }
   let(:group) { nil }
   let(:latest_version_finder) do
-    Dependabot::NpmAndYarn::UpdateChecker::LatestVersionFinder.new(
+    Dependabot::NpmAndYarn::UpdateChecker::PackageLatestVersionFinder.new(
       dependency: dependency,
       dependency_files: dependency_files,
       credentials: credentials,
@@ -60,12 +62,6 @@ RSpec.describe Dependabot::NpmAndYarn::UpdateChecker::VersionResolver do
     fixture("npm_responses", "opentelemetry-context-async-hooks.json")
   end
 
-  # Variable to control the npm fallback version feature flag
-  let(:npm_fallback_version_above_v6_enabled) { true }
-
-  # Variable to control the enabling feature flag for the corepack fix
-  let(:enable_corepack_for_npm_and_yarn) { true }
-
   before do
     stub_request(:get, react_dom_registry_listing_url)
       .to_return(status: 200, body: react_dom_registry_response)
@@ -79,10 +75,6 @@ RSpec.describe Dependabot::NpmAndYarn::UpdateChecker::VersionResolver do
       .to_return(status: 200, body: opentelemetry_api_registry_response)
     stub_request(:get, opentelemetry_context_async_hooks_registry_listing_url)
       .to_return(status: 200, body: opentelemetry_context_async_hooks_registry_response)
-    allow(Dependabot::Experiments).to receive(:enabled?)
-      .with(:npm_fallback_version_above_v6).and_return(npm_fallback_version_above_v6_enabled)
-    allow(Dependabot::Experiments).to receive(:enabled?)
-      .with(:enable_corepack_for_npm_and_yarn).and_return(enable_corepack_for_npm_and_yarn)
   end
 
   after do
@@ -198,7 +190,7 @@ RSpec.describe Dependabot::NpmAndYarn::UpdateChecker::VersionResolver do
       context "when accessing a malformed registry requirements" do
         it "raise a helpful error" do
           expect { latest_resolvable_version }.to raise_error do |error|
-            expect(error.message).to include("bad URI(is not URI?)")
+            expect(error.message).to include("bad URI (is not URI?)")
           end
         end
       end
@@ -242,7 +234,7 @@ RSpec.describe Dependabot::NpmAndYarn::UpdateChecker::VersionResolver do
           )
         end
 
-        it { is_expected.to eq(Gem::Version.new("15.2.0")) }
+        it { is_expected.to eq(Gem::Version.new("16.3.1")) }
       end
 
       describe "updating a dependency with a peer requirement and some badly written peer dependency requirements" do
@@ -265,7 +257,7 @@ RSpec.describe Dependabot::NpmAndYarn::UpdateChecker::VersionResolver do
           fixture("npm_responses", "react-dom-bad-reqs.json")
         end
 
-        it { is_expected.to eq(Gem::Version.new("15.2.0")) }
+        it { is_expected.to eq(Gem::Version.new("16.3.1")) }
       end
 
       describe "updating a dependency with a peer requirement that has (old) peer requirements that aren't included" do
@@ -303,7 +295,7 @@ RSpec.describe Dependabot::NpmAndYarn::UpdateChecker::VersionResolver do
         # This test also checks that the old peer requirement on redux, which
         # is no longer in the package.json, doesn't cause any problems *and*
         # tests that complicated react peer requirements are processed OK.
-        it { is_expected.to eq(Gem::Version.new("2.1.9")) }
+        it { is_expected.to eq(Gem::Version.new("2.2.4")) }
       end
 
       describe "updating a dependency with a peer requirement that previously had the peer dep as a normal dep" do
@@ -360,7 +352,7 @@ RSpec.describe Dependabot::NpmAndYarn::UpdateChecker::VersionResolver do
           )
         end
 
-        it { is_expected.to eq(Gem::Version.new("15.6.2")) }
+        it { is_expected.to eq(Gem::Version.new("16.3.1")) }
       end
 
       describe "updating a dependency that is a peer requirement with two semver constraints" do
@@ -380,7 +372,7 @@ RSpec.describe Dependabot::NpmAndYarn::UpdateChecker::VersionResolver do
           )
         end
 
-        it { is_expected.to eq(Gem::Version.new("1.0.4")) }
+        it { is_expected.to eq(Gem::Version.new("1.1.0")) }
       end
 
       describe "updating a dependency that is a peer requirement of multiple dependencies" do
@@ -400,7 +392,7 @@ RSpec.describe Dependabot::NpmAndYarn::UpdateChecker::VersionResolver do
           )
         end
 
-        it { is_expected.to eq(Gem::Version.new("0.14.9")) }
+        it { is_expected.to eq(Gem::Version.new("16.3.1")) }
 
         context "with a dependency group containing the peer" do
           let(:group) do
@@ -494,7 +486,6 @@ RSpec.describe Dependabot::NpmAndYarn::UpdateChecker::VersionResolver do
         end
 
         context "when it has (old) peer requirements that aren't included" do
-          let(:npm_fallback_version_above_v6_enabled) { false }
           let(:project_name) { "npm6/peer_dependency_changed" }
           let(:latest_allowable_version) { Gem::Version.new("2.2.4") }
           let(:dependency) do
@@ -533,7 +524,6 @@ RSpec.describe Dependabot::NpmAndYarn::UpdateChecker::VersionResolver do
         end
 
         context "when the peer dependency was previously a normal dependency" do
-          let(:npm_fallback_version_above_v6_enabled) { false }
           let(:project_name) { "npm6/peer_dependency_switch" }
           let(:latest_allowable_version) { Gem::Version.new("2.5.4") }
           let(:dependency) do
@@ -630,7 +620,7 @@ RSpec.describe Dependabot::NpmAndYarn::UpdateChecker::VersionResolver do
           )
         end
 
-        it { is_expected.to eq(Gem::Version.new("15.2.0")) }
+        it { is_expected.to eq(Gem::Version.new("16.3.1")) }
       end
     end
 
@@ -730,7 +720,7 @@ RSpec.describe Dependabot::NpmAndYarn::UpdateChecker::VersionResolver do
         end
 
         # We don't handle updates without a lockfile properly yet
-        it { is_expected.to eq(Gem::Version.new("15.2.0")) }
+        it { is_expected.to eq(Gem::Version.new("16.3.1")) }
 
         context "when the version is acceptable" do
           let(:latest_allowable_version) { Gem::Version.new("15.6.2") }
@@ -870,7 +860,7 @@ RSpec.describe Dependabot::NpmAndYarn::UpdateChecker::VersionResolver do
           )
         end
 
-        it { is_expected.to eq(Gem::Version.new("15.2.0")) }
+        it { is_expected.to eq(Gem::Version.new("16.3.1")) }
       end
     end
 
@@ -1215,6 +1205,180 @@ RSpec.describe Dependabot::NpmAndYarn::UpdateChecker::VersionResolver do
         end
 
         it { is_expected.to eq(Gem::Version.new("0.14.9")) }
+
+        context "when pnpm reports a conflicting peer" do
+          before do
+            allow(Dependabot::NpmAndYarn::Helpers).to receive(:run_pnpm_command) do |command, **_kwargs|
+              if command == "--filter . peers check"
+                raise Dependabot::SharedHelpers::HelperSubprocessFailed.new(
+                  message: <<~OUTPUT,
+                    Issues with peer dependencies found
+
+                    ✕ conflicting peer react
+                      Wanted:
+                        ^0.14.0:
+                          react-modal@0.6.1
+                        "^0.14.9 || ^15.3.0":
+                          react-tabs@1.1.0
+                  OUTPUT
+                  error_context: {}
+                )
+              end
+
+              command.include?("@16.3.1") ? 'Run "pnpm peers check" to list them.' : ""
+            end
+          end
+
+          it { is_expected.to eq(Gem::Version.new("0.14.9")) }
+        end
+      end
+
+      describe "when pnpm returns ERR_PNPM_TRUST_DOWNGRADE" do
+        let(:project_name) { "pnpm/pnpm-lock" }
+        let(:latest_allowable_version) { Gem::Version.new("1.3.0") }
+        let(:dependency) do
+          Dependabot::Dependency.new(
+            name: "left-pad",
+            version: "1.0.1",
+            requirements: [{
+              file: "package.json",
+              requirement: "^1.0.1",
+              groups: ["dependencies"],
+              source: { type: "registry", url: "https://registry.npmjs.org" }
+            }],
+            package_manager: "npm_and_yarn"
+          )
+        end
+        let(:left_pad_registry_listing_url) { "https://registry.npmjs.org/left-pad" }
+        let(:left_pad_registry_response) { fixture("npm_responses", "left-pad.json") }
+
+        before do
+          stub_request(:get, left_pad_registry_listing_url)
+            .to_return(status: 200, body: left_pad_registry_response)
+          stub_request(:get, left_pad_registry_listing_url + "/latest")
+            .to_return(status: 200, body: "{}")
+        end
+
+        context "when all versions fail trust downgrade" do
+          before do
+            allow(Dependabot::NpmAndYarn::Helpers).to receive(:run_pnpm_command)
+              .and_raise(
+                Dependabot::SharedHelpers::HelperSubprocessFailed.new(
+                  message: "ERR_PNPM_TRUST_DOWNGRADE  High-risk trust downgrade for " \
+                           "\"left-pad@1.3.0\" (possible package takeover)",
+                  error_context: {}
+                )
+              )
+          end
+
+          it "returns nil when no fallback version passes trust check" do
+            expect(resolver.latest_resolvable_version).to be_nil
+          end
+        end
+
+        context "when an older version passes the trust check" do
+          before do
+            # Only the latest version (1.3.0) fails trust downgrade;
+            # older versions succeed (no error raised).
+            allow(Dependabot::NpmAndYarn::Helpers).to receive(:run_pnpm_command) do |command, **_kwargs|
+              if command.include?("@1.3.0")
+                raise Dependabot::SharedHelpers::HelperSubprocessFailed.new(
+                  message: "ERR_PNPM_TRUST_DOWNGRADE  High-risk trust downgrade for " \
+                           "\"left-pad@1.3.0\" (possible package takeover)",
+                  error_context: {}
+                )
+              end
+              "" # Success for other versions
+            end
+          end
+
+          it "falls back to the highest version without trust downgrade" do
+            result = resolver.latest_resolvable_version
+            expect(result).to eq(Gem::Version.new("1.2.0"))
+          end
+        end
+
+        context "when multiple older versions also fail trust downgrade" do
+          before do
+            # 1.3.0 and 1.2.0 fail trust downgrade; 1.1.3 succeeds
+            allow(Dependabot::NpmAndYarn::Helpers).to receive(:run_pnpm_command) do |command, **_kwargs|
+              if command.include?("@1.3.0") || command.include?("@1.2.0")
+                raise Dependabot::SharedHelpers::HelperSubprocessFailed.new(
+                  message: "ERR_PNPM_TRUST_DOWNGRADE  High-risk trust downgrade for " \
+                           "\"left-pad\" (possible package takeover)",
+                  error_context: {}
+                )
+              end
+              "" # Success for other versions
+            end
+          end
+
+          it "skips failing versions and falls back to the first passing one" do
+            result = resolver.latest_resolvable_version
+            expect(result).to eq(Gem::Version.new("1.1.3"))
+          end
+        end
+
+        context "when fallback limit is exceeded" do
+          before do
+            # Stub the constant to 2 so we only check 2 candidates (1.2.0, 1.1.3)
+            stub_const(
+              "Dependabot::NpmAndYarn::UpdateChecker::VersionResolver::MAX_TRUST_DOWNGRADE_FALLBACK_ATTEMPTS", 2
+            )
+
+            # 1.2.0 and 1.1.3 are checked (within limit) but both fail;
+            # versions below are truncated by the limit.
+            allow(Dependabot::NpmAndYarn::Helpers).to receive(:run_pnpm_command) do |command, **_kwargs|
+              if command.include?("@1.3.0") || command.include?("@1.2.0") || command.include?("@1.1.3")
+                raise Dependabot::SharedHelpers::HelperSubprocessFailed.new(
+                  message: "ERR_PNPM_TRUST_DOWNGRADE  High-risk trust downgrade for " \
+                           "\"left-pad\" (possible package takeover)",
+                  error_context: {}
+                )
+              end
+              "" # Would pass, but not reached due to the limit
+            end
+          end
+
+          it "returns nil after checking only the limited number of versions" do
+            expect(resolver.latest_resolvable_version).to be_nil
+          end
+        end
+
+        context "when the only passing version equals the current version" do
+          let(:dependency) do
+            Dependabot::Dependency.new(
+              name: "left-pad",
+              version: "1.2.0",
+              requirements: [{
+                file: "package.json",
+                requirement: "^1.0.1",
+                groups: ["dependencies"],
+                source: { type: "registry", url: "https://registry.npmjs.org" }
+              }],
+              package_manager: "npm_and_yarn"
+            )
+          end
+
+          before do
+            # All versions above 1.2.0 (only 1.3.0 in this fixture) fail trust downgrade,
+            # and candidates below current version are filtered out.
+            allow(Dependabot::NpmAndYarn::Helpers).to receive(:run_pnpm_command) do |command, **_kwargs|
+              if command.include?("@1.3.0")
+                raise Dependabot::SharedHelpers::HelperSubprocessFailed.new(
+                  message: "ERR_PNPM_TRUST_DOWNGRADE  High-risk trust downgrade for " \
+                           "\"left-pad@1.3.0\" (possible package takeover)",
+                  error_context: {}
+                )
+              end
+              ""
+            end
+          end
+
+          it "returns nil to avoid a no-op update" do
+            expect(resolver.latest_resolvable_version).to be_nil
+          end
+        end
       end
     end
   end
@@ -1446,7 +1610,7 @@ RSpec.describe Dependabot::NpmAndYarn::UpdateChecker::VersionResolver do
         # Support for React 16 gets added to react-modal after a new peer
         # dependency on react-dom is added. Dependabot doesn't know how to
         # handle updating packages with multiple peer dependencies, so bails.
-        it { is_expected.to be(false) }
+        it { is_expected.to be(true) }
       end
     end
 
@@ -1467,7 +1631,7 @@ RSpec.describe Dependabot::NpmAndYarn::UpdateChecker::VersionResolver do
         )
       end
 
-      it { is_expected.to be(false) }
+      it { is_expected.to be(true) }
     end
   end
 
@@ -1520,41 +1684,43 @@ RSpec.describe Dependabot::NpmAndYarn::UpdateChecker::VersionResolver do
 
         it "gets the right list of dependencies to update" do
           expect(resolver.dependency_updates_from_full_unlock)
-            .to contain_exactly({
-              dependency: Dependabot::Dependency.new(
-                name: "vue",
-                version: Dependabot::NpmAndYarn::Version.new("2.5.20"),
-                package_manager: "npm_and_yarn",
-                requirements: [{
-                  file: "package.json",
-                  requirement: "2.5.20",
-                  groups: ["dependencies"],
-                  source: nil
-                }]
-              ),
-              version: Dependabot::NpmAndYarn::Version.new("2.5.21"),
-              previous_version: "2.5.20"
-            }, {
-              dependency: Dependabot::Dependency.new(
-                name: "vue-template-compiler",
-                version: Dependabot::NpmAndYarn::Version.new("2.5.20"),
-                package_manager: "npm_and_yarn",
-                requirements: [{
-                  file: "package.json",
-                  requirement: "2.5.20",
-                  groups: ["dependencies"],
-                  source: nil
-                }]
-              ),
-              version: Dependabot::NpmAndYarn::Version.new("2.5.21"),
-              previous_version: "2.5.20"
-            })
+            .to contain_exactly(
+              {
+                dependency: Dependabot::Dependency.new(
+                  name: "vue",
+                  version: Dependabot::NpmAndYarn::Version.new("2.5.20"),
+                  package_manager: "npm_and_yarn",
+                  requirements: [{
+                    file: "package.json",
+                    requirement: "2.5.20",
+                    groups: ["dependencies"],
+                    source: nil
+                  }]
+                ),
+                version: Dependabot::NpmAndYarn::Version.new("2.5.21"),
+                previous_version: "2.5.20"
+              },
+              {
+                dependency: Dependabot::Dependency.new(
+                  name: "vue-template-compiler",
+                  version: Dependabot::NpmAndYarn::Version.new("2.5.20"),
+                  package_manager: "npm_and_yarn",
+                  requirements: [{
+                    file: "package.json",
+                    requirement: "2.5.20",
+                    groups: ["dependencies"],
+                    source: nil
+                  }]
+                ),
+                version: Dependabot::NpmAndYarn::Version.new("2.5.21"),
+                previous_version: "2.5.20"
+              }
+            )
         end
       end
     end
 
     context "when updating a dependency that is a peer requirement with npm 6" do
-      let(:npm_fallback_version_above_v6_enabled) { false }
       let(:project_name) { "npm6/peer_dependency" }
       let(:latest_allowable_version) { Gem::Version.new("16.3.1") }
       let(:dependency) do
@@ -1573,35 +1739,38 @@ RSpec.describe Dependabot::NpmAndYarn::UpdateChecker::VersionResolver do
 
       it "gets the right list of dependencies to update" do
         expect(resolver.dependency_updates_from_full_unlock)
-          .to contain_exactly({
-            dependency: Dependabot::Dependency.new(
-              name: "react",
-              version: "15.2.0",
-              package_manager: "npm_and_yarn",
-              requirements: [{
-                file: "package.json",
-                requirement: "^15.2.0",
-                groups: ["dependencies"],
-                source: { type: "registry", url: "https://registry.npmjs.org" }
-              }]
-            ),
-            version: Dependabot::NpmAndYarn::Version.new("16.3.1"),
-            previous_version: "15.2.0"
-          }, {
-            dependency: Dependabot::Dependency.new(
-              name: "react-dom",
-              version: "15.2.0",
-              package_manager: "npm_and_yarn",
-              requirements: [{
-                file: "package.json",
-                requirement: "^15.2.0",
-                groups: ["dependencies"],
-                source: { type: "registry", url: "https://registry.npmjs.org" }
-              }]
-            ),
-            version: Dependabot::NpmAndYarn::Version.new("16.6.0"),
-            previous_version: "15.2.0"
-          })
+          .to contain_exactly(
+            {
+              dependency: Dependabot::Dependency.new(
+                name: "react",
+                version: "15.2.0",
+                package_manager: "npm_and_yarn",
+                requirements: [{
+                  file: "package.json",
+                  requirement: "^15.2.0",
+                  groups: ["dependencies"],
+                  source: { type: "registry", url: "https://registry.npmjs.org" }
+                }]
+              ),
+              version: Dependabot::NpmAndYarn::Version.new("16.3.1"),
+              previous_version: "15.2.0"
+            },
+            {
+              dependency: Dependabot::Dependency.new(
+                name: "react-dom",
+                version: "15.2.0",
+                package_manager: "npm_and_yarn",
+                requirements: [{
+                  file: "package.json",
+                  requirement: "^15.2.0",
+                  groups: ["dependencies"],
+                  source: { type: "registry", url: "https://registry.npmjs.org" }
+                }]
+              ),
+              version: Dependabot::NpmAndYarn::Version.new("16.6.0"),
+              previous_version: "15.2.0"
+            }
+          )
       end
     end
 
@@ -1639,20 +1808,6 @@ RSpec.describe Dependabot::NpmAndYarn::UpdateChecker::VersionResolver do
               ),
               version: Dependabot::NpmAndYarn::Version.new("16.3.1"),
               previous_version: "15.2.0"
-            }, {
-              dependency: Dependabot::Dependency.new(
-                name: "react-dom",
-                version: "15.2.0",
-                package_manager: "npm_and_yarn",
-                requirements: [{
-                  file: "package.json",
-                  requirement: "^15.2.0",
-                  groups: ["dependencies"],
-                  source: { type: "registry", url: "https://registry.npmjs.org" }
-                }]
-              ),
-              version: Dependabot::NpmAndYarn::Version.new("16.6.0"),
-              previous_version: "15.2.0"
             }
           )
       end
@@ -1680,35 +1835,38 @@ RSpec.describe Dependabot::NpmAndYarn::UpdateChecker::VersionResolver do
 
       it "gets the right list of dependencies to update" do
         expect(resolver.dependency_updates_from_full_unlock)
-          .to contain_exactly({
-            dependency: Dependabot::Dependency.new(
-              name: "react",
-              version: "15.6.2",
-              package_manager: "npm_and_yarn",
-              requirements: [{
-                file: "packages/package1/package.json",
-                requirement: "15.6.2",
-                groups: ["dependencies"],
-                source: { type: "registry", url: "https://registry.yarnpkg.com" }
-              }]
-            ),
-            version: Dependabot::NpmAndYarn::Version.new("16.3.1"),
-            previous_version: "15.6.2"
-          }, {
-            dependency: Dependabot::Dependency.new(
-              name: "react-dom",
-              version: "15.6.2",
-              package_manager: "npm_and_yarn",
-              requirements: [{
-                file: "packages/package1/package.json",
-                requirement: "15.6.2",
-                groups: ["dependencies"],
-                source: { type: "registry", url: "https://registry.yarnpkg.com" }
-              }]
-            ),
-            version: Dependabot::NpmAndYarn::Version.new("16.6.0"),
-            previous_version: "15.6.2"
-          })
+          .to contain_exactly(
+            {
+              dependency: Dependabot::Dependency.new(
+                name: "react",
+                version: "15.6.2",
+                package_manager: "npm_and_yarn",
+                requirements: [{
+                  file: "packages/package1/package.json",
+                  requirement: "15.6.2",
+                  groups: ["dependencies"],
+                  source: { type: "registry", url: "https://registry.yarnpkg.com" }
+                }]
+              ),
+              version: Dependabot::NpmAndYarn::Version.new("16.3.1"),
+              previous_version: "15.6.2"
+            },
+            {
+              dependency: Dependabot::Dependency.new(
+                name: "react-dom",
+                version: "15.6.2",
+                package_manager: "npm_and_yarn",
+                requirements: [{
+                  file: "packages/package1/package.json",
+                  requirement: "15.6.2",
+                  groups: ["dependencies"],
+                  source: { type: "registry", url: "https://registry.yarnpkg.com" }
+                }]
+              ),
+              version: Dependabot::NpmAndYarn::Version.new("16.6.0"),
+              previous_version: "15.6.2"
+            }
+          )
       end
     end
 
@@ -1734,35 +1892,38 @@ RSpec.describe Dependabot::NpmAndYarn::UpdateChecker::VersionResolver do
 
       it "gets the right list of dependencies to update" do
         expect(resolver.dependency_updates_from_full_unlock)
-          .to contain_exactly({
-            dependency: Dependabot::Dependency.new(
-              name: "react",
-              version: "15.6.2",
-              package_manager: "npm_and_yarn",
-              requirements: [{
-                file: "packages/package1/package.json",
-                requirement: "15.6.2",
-                groups: ["dependencies"],
-                source: { type: "registry", url: "https://registry.yarnpkg.com" }
-              }]
-            ),
-            version: Dependabot::NpmAndYarn::Version.new("16.3.1"),
-            previous_version: "15.6.2"
-          }, {
-            dependency: Dependabot::Dependency.new(
-              name: "react-dom",
-              version: "15.6.2",
-              package_manager: "npm_and_yarn",
-              requirements: [{
-                file: "packages/package1/package.json",
-                requirement: "15.6.2",
-                groups: ["dependencies"],
-                source: { type: "registry", url: "https://registry.yarnpkg.com" }
-              }]
-            ),
-            version: Dependabot::NpmAndYarn::Version.new("16.6.0"),
-            previous_version: "15.6.2"
-          })
+          .to contain_exactly(
+            {
+              dependency: Dependabot::Dependency.new(
+                name: "react",
+                version: "15.6.2",
+                package_manager: "npm_and_yarn",
+                requirements: [{
+                  file: "packages/package1/package.json",
+                  requirement: "15.6.2",
+                  groups: ["dependencies"],
+                  source: { type: "registry", url: "https://registry.yarnpkg.com" }
+                }]
+              ),
+              version: Dependabot::NpmAndYarn::Version.new("16.3.1"),
+              previous_version: "15.6.2"
+            },
+            {
+              dependency: Dependabot::Dependency.new(
+                name: "react-dom",
+                version: "15.6.2",
+                package_manager: "npm_and_yarn",
+                requirements: [{
+                  file: "packages/package1/package.json",
+                  requirement: "15.6.2",
+                  groups: ["dependencies"],
+                  source: { type: "registry", url: "https://registry.yarnpkg.com" }
+                }]
+              ),
+              version: Dependabot::NpmAndYarn::Version.new("16.6.0"),
+              previous_version: "15.6.2"
+            }
+          )
       end
     end
 
@@ -1791,7 +1952,6 @@ RSpec.describe Dependabot::NpmAndYarn::UpdateChecker::VersionResolver do
       it "gets the right list of dependencies to update" do
         resolved_dependencies = resolver.dependency_updates_from_full_unlock
         react = resolved_dependencies.find { |d| d[:dependency].name == "react" }
-        react_dom = resolved_dependencies.find { |d| d[:dependency].name == "react-dom" }
         expect(react[:dependency].requirements).to contain_exactly(
           {
             file: "packages/package1/package.json",
@@ -1806,20 +1966,11 @@ RSpec.describe Dependabot::NpmAndYarn::UpdateChecker::VersionResolver do
             source: nil
           }
         )
-        expect(react_dom[:dependency].requirements).to contain_exactly(
-          {
-            requirement: "15.6.2",
-            file: "packages/package2/package.json",
-            groups: ["dependencies"],
-            source: nil
-          },
-          {
-            requirement: "15.6.2",
-            file: "packages/package1/package.json",
-            groups: ["dependencies"],
-            source: nil
-          }
-        )
+
+        # With npm 10.9.3's improved peer dependency resolution,
+        # react-dom is no longer required to be updated when updating react
+        expect(resolved_dependencies.length).to eq(1)
+        expect(resolved_dependencies.first[:dependency].name).to eq("react")
       end
     end
 
@@ -2149,6 +2300,69 @@ RSpec.describe Dependabot::NpmAndYarn::UpdateChecker::VersionResolver do
         end
 
         it { is_expected.to eq("9ec4acec6abd23f9b23e33b1171e50d41953f00d") }
+      end
+    end
+  end
+
+  describe "integration with npm8 checker and registry override" do
+    let(:project_name) { "npm8/simple" }
+    let(:latest_allowable_version) { Gem::Version.new("4.17.21") }
+    let(:dependency) do
+      Dependabot::Dependency.new(
+        name: "lodash",
+        version: "4.17.0",
+        package_manager: "npm_and_yarn",
+        requirements: [{
+          file: "package.json",
+          requirement: "^4.17.0",
+          groups: ["dependencies"],
+          source: { type: "registry", url: "https://registry.npmjs.org" }
+        }]
+      )
+    end
+
+    before do
+      allow(Dependabot::SharedHelpers).to receive(:run_shell_command).and_return("npm install successful")
+    end
+
+    context "when registry override is configured" do
+      let(:credentials) do
+        [Dependabot::Credential.new(
+          {
+            "type" => "npm_registry",
+            "registry" => "https://artifactory.example.com/artifactory/api/npm/npm/",
+            "replaces-base" => true,
+            "token" => "auth-token"
+          }
+        )]
+      end
+
+      it "does not pass the Corepack registry override to the npm command" do
+        resolver.send(:run_npm8_checker, version: "4.17.21")
+
+        expect(Dependabot::SharedHelpers).to have_received(:run_shell_command)
+          .with(
+            anything, # The actual command
+            hash_including(
+              env: nil
+            )
+          )
+      end
+    end
+
+    context "when no registry override is needed" do
+      let(:credentials) { [] }
+
+      it "calls npm command without env variables" do
+        resolver.send(:run_npm8_checker, version: "4.17.21")
+
+        expect(Dependabot::SharedHelpers).to have_received(:run_shell_command)
+          .with(
+            anything, # The actual command
+            hash_including(
+              env: nil
+            )
+          )
       end
     end
   end

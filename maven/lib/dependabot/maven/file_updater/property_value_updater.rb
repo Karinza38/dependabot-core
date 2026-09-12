@@ -28,14 +28,14 @@ module Dependabot
             updated_value: String
           ).returns(T::Array[DependencyFile])
         end
-        def update_pomfiles_for_property_change(property_name:, callsite_pom:,
-                                                updated_value:)
+        def update_pomfiles_for_property_change(property_name:, callsite_pom:, updated_value:)
           declaration_details = property_value_finder.property_details(
             property_name: property_name,
             callsite_pom: callsite_pom
           )
           node = declaration_details&.fetch(:node)
           filename = declaration_details&.fetch(:file)
+          raise "Property node not found" unless node.is_a?(Nokogiri::XML::Node)
 
           pom_to_update = dependency_files.find { |f| f.name == filename }
           property_re = %r{<#{Regexp.quote(node.name)}>

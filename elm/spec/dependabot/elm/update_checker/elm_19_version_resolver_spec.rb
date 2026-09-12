@@ -1,13 +1,13 @@
-# typed: false
+# typed: strict
 # frozen_string_literal: true
 
 require "spec_helper"
 require "dependabot/dependency"
 require "dependabot/dependency_file"
-require "dependabot/elm/update_checker/elm_19_version_resolver"
+require "dependabot/elm/update_checker/latest_version_finder"
 
 namespace = Dependabot::Elm::UpdateChecker
-RSpec.describe namespace::Elm19VersionResolver do
+RSpec.describe namespace::Elm19LatestVersionFinder do
   def elm_version(version_string)
     Dependabot::Elm::Version.new(version_string)
   end
@@ -15,9 +15,13 @@ RSpec.describe namespace::Elm19VersionResolver do
   let(:resolver) do
     described_class.new(
       dependency: dependency,
-      dependency_files: dependency_files
+      dependency_files: dependency_files,
+      ignored_versions: ignored_versions,
+      cooldown_options: update_cooldown
     )
   end
+  let(:update_cooldown) { nil }
+  let(:ignored_versions) { [] }
   let(:unlock_requirement) { :own }
   let(:dependency_files) { [elm_json] }
   let(:elm_json) do
@@ -45,6 +49,11 @@ RSpec.describe namespace::Elm19VersionResolver do
       resolver.latest_resolvable_version(unlock_requirement: unlock_requirement)
     end
 
+    before do
+      stub_request(:get, "https://package.elm-lang.org/packages/elm/parser/releases.json")
+        .to_return(status: 200, body: fixture("elm_jsons", "elm-parser.json"))
+    end
+
     context "when dealing with an app" do
       context "when no unlocks" do
         let(:unlock_requirement) { :none }
@@ -57,12 +66,66 @@ RSpec.describe namespace::Elm19VersionResolver do
           let(:unlock_requirement) { :own }
 
           it { is_expected.to eq(elm_version("1.1.0")) }
+
+          context "with cooldown and an unavailable release date" do
+            let(:update_cooldown) do
+              Dependabot::Package::ReleaseCooldownOptions.new(default_days: 7)
+            end
+
+            before do
+              stub_request(:get, "https://package.elm-lang.org/packages/elm/parser/releases.json")
+                .to_return(
+                  status: 200,
+                  body: { "1.0.0" => 1_534_772_073, "1.1.0" => nil }.to_json
+                )
+            end
+
+            it "returns the resolved version and marks the dependency" do
+              expect(latest_resolvable_version).to eq(elm_version("1.1.0"))
+              expect(dependency.metadata[:cooldown_date_unavailable]).to be(true)
+            end
+          end
         end
 
         context "when :all unlocks" do
           let(:unlock_requirement) { :all }
 
           it { is_expected.to eq(elm_version("1.1.0")) }
+        end
+
+        context "when the resolved version is ignored" do
+          let(:unlock_requirement) { :own }
+          let(:ignored_versions) { ["> 1.0.0"] }
+
+          it "returns the current version" do
+            expect(latest_resolvable_version).to eq(elm_version("1.0.0"))
+          end
+        end
+
+        context "when a different version is ignored" do
+          let(:unlock_requirement) { :own }
+          let(:ignored_versions) { ["> 2.0.0"] }
+
+          it "returns the resolved version" do
+            expect(latest_resolvable_version).to eq(elm_version("1.1.0"))
+          end
+        end
+
+        context "when the resolved version is ignored but a lower version is allowed" do
+          let(:unlock_requirement) { :own }
+          let(:ignored_versions) { ["> 1.0.5"] }
+
+          before do
+            stub_request(:get, "https://package.elm-lang.org/packages/elm/parser/releases.json")
+              .to_return(
+                status: 200,
+                body: '{"1.0.0": 1534772073, "1.0.5": 1535000000, "1.1.0": 1535657346}'
+              )
+          end
+
+          it "returns the highest non-ignored version" do
+            expect(latest_resolvable_version).to eq(elm_version("1.0.5"))
+          end
         end
       end
 
@@ -104,6 +167,11 @@ RSpec.describe namespace::Elm19VersionResolver do
         let(:dependency_version) { "1.0.0" }
         let(:dependency_requirement) { "1.0.0" }
 
+        before do
+          stub_request(:get, "https://package.elm-lang.org/packages/elm/http/releases.json")
+            .to_return(status: 200, body: fixture("elm_jsons", "elm-http.json"))
+        end
+
         it { is_expected.to eq(elm_version(dependency_version)) }
 
         context "when :all unlocks" do
@@ -119,6 +187,11 @@ RSpec.describe namespace::Elm19VersionResolver do
         let(:dependency_name) { "elm/http" }
         let(:dependency_version) { "1.0.0" }
         let(:dependency_requirement) { "1.0.0" }
+
+        before do
+          stub_request(:get, "https://package.elm-lang.org/packages/elm/http/releases.json")
+            .to_return(status: 200, body: fixture("elm_jsons", "elm-http.json"))
+        end
 
         # TODO: Indirect dependency updates don't work yet!
         # We need to run `elm install` to figure them out, but it's not clear

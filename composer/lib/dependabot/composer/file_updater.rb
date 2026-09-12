@@ -1,4 +1,4 @@
-# typed: true
+# typed: strict
 # frozen_string_literal: true
 
 require "dependabot/file_updaters"
@@ -12,27 +12,21 @@ module Dependabot
       require_relative "file_updater/manifest_updater"
       require_relative "file_updater/lockfile_updater"
 
-      def self.updated_files_regex
-        [
-          /^composer\.json$/,
-          /^composer\.lock$/
-        ]
-      end
-
+      sig { override.returns(T::Array[Dependabot::DependencyFile]) }
       def updated_dependency_files
         updated_files = []
 
-        if file_changed?(composer_json)
+        if file_changed?(T.must(composer_json))
           updated_files <<
             updated_file(
-              file: composer_json,
+              file: T.must(composer_json),
               content: updated_composer_json_content
             )
         end
 
         if lockfile
           updated_files <<
-            updated_file(file: lockfile, content: updated_lockfile_content)
+            updated_file(file: T.must(lockfile), content: updated_lockfile_content)
         end
 
         if updated_files.none? ||
@@ -45,32 +39,42 @@ module Dependabot
 
       private
 
+      sig { override.void }
       def check_required_files
         raise "No #{PackageManager::MANIFEST_FILENAME}!" unless get_original_file(PackageManager::MANIFEST_FILENAME)
       end
 
+      sig { returns(String) }
       def updated_composer_json_content
         ManifestUpdater.new(
           dependencies: dependencies,
-          manifest: composer_json
+          manifest: T.must(composer_json)
         ).updated_manifest_content
       end
 
+      sig { returns(String) }
       def updated_lockfile_content
-        @updated_lockfile_content ||=
+        @updated_lockfile_content ||= T.let(
           LockfileUpdater.new(
             dependencies: dependencies,
             dependency_files: dependency_files,
             credentials: credentials
-          ).updated_lockfile_content
+          ).updated_lockfile_content,
+          T.nilable(String)
+        )
       end
 
+      sig { returns(T.nilable(Dependabot::DependencyFile)) }
       def composer_json
-        @composer_json ||= get_original_file(PackageManager::MANIFEST_FILENAME)
+        @composer_json ||= T.let(
+          get_original_file(PackageManager::MANIFEST_FILENAME),
+          T.nilable(Dependabot::DependencyFile)
+        )
       end
 
+      sig { returns(T.nilable(Dependabot::DependencyFile)) }
       def lockfile
-        @lockfile ||= get_original_file(PackageManager::LOCKFILE_FILENAME)
+        @lockfile ||= T.let(get_original_file(PackageManager::LOCKFILE_FILENAME), T.nilable(Dependabot::DependencyFile))
       end
     end
   end

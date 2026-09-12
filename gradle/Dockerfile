@@ -1,8 +1,33 @@
+# syntax=docker.io/docker/dockerfile:1.20
+# Dependabot should generally handle keeping the Gradle version up to date, though there may be situations where a manual update is required.
+# When updating digests, always use the Multiplatform digest rather than one specific to a single architecture.
+# Tools like `docker buildx imagetools` can help you locate the Multiplatform digest
+# If you perform a manual update, make sure to update the tag as well.
+# Including the tag with the digest is for documentation purposes, as Docker ignores the tag when a digest is provided
+# It is useful because mapping tags to digests is challenging without OCI metadata, and many images do not provide this metadata.
+FROM docker.io/gradle:9.7.1-jdk21-ubi@sha256:61c6012fc6ed6de98705e4f8c1a2dc5a6c59df016210ba71e14ac43bb8633a9e AS gradle
+
 FROM ghcr.io/dependabot/dependabot-updater-core
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    openjdk-17-jdk-headless \
+    openjdk-21-jdk-headless \
+    ca-certificates-java \
+    && chgrp dependabot /etc/ssl/certs/java /etc/ssl/certs/java/cacerts \
+    && chmod g+w /etc/ssl/certs/java /etc/ssl/certs/java/cacerts \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --chmod=755 updater/bin/java-truststore-entrypoint.sh /usr/local/bin/java-truststore-entrypoint.sh
 
 USER dependabot
 
-COPY --chown=dependabot:dependabot maven $DEPENDABOT_HOME/maven
-COPY --chown=dependabot:dependabot gradle $DEPENDABOT_HOME/gradle
-COPY --chown=dependabot:dependabot common $DEPENDABOT_HOME/common
+# We do not need to persist GRADLE_HOME because Gradle does not use it
+# See https://discuss.gradle.org/t/do-we-really-need-gradle-home-docs-site-inconsistency/21671/2
+ARG GRADLE_HOME=/opt/gradle
+ENV PATH=$GRADLE_HOME/bin:$PATH
+
+COPY --from=gradle $GRADLE_HOME $GRADLE_HOME
+COPY --chown=dependabot:dependabot --parents gradle maven common $DEPENDABOT_HOME/
 COPY --chown=dependabot:dependabot updater $DEPENDABOT_HOME/dependabot-updater
+
+ENTRYPOINT ["/usr/local/bin/java-truststore-entrypoint.sh"]

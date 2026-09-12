@@ -1,4 +1,4 @@
-# typed: true
+# typed: strong
 # frozen_string_literal: true
 
 require "dependabot/dependency"
@@ -11,27 +11,72 @@ require "dependabot/npm_and_yarn/sub_dependency_files_filterer"
 require "dependabot/npm_and_yarn/update_checker"
 require "dependabot/npm_and_yarn/update_checker/dependency_files_builder"
 require "dependabot/npm_and_yarn/version"
+require "dependabot/security_advisory"
 require "dependabot/shared_helpers"
+require "sorbet-runtime"
 
 module Dependabot
   module NpmAndYarn
     class UpdateChecker
       class SubdependencyVersionResolver
-        def initialize(dependency:, credentials:, dependency_files:,
-                       ignored_versions:, latest_allowable_version:, repo_contents_path:)
+        extend T::Sig
+
+        sig { returns(Dependency) }
+        attr_reader :dependency
+
+        sig { returns(T::Array[Dependabot::Credential]) }
+        attr_reader :credentials
+
+        sig { returns(T::Array[Dependabot::DependencyFile]) }
+        attr_reader :dependency_files
+
+        sig { returns(T::Array[String]) }
+        attr_reader :ignored_versions
+
+        sig { returns(T.nilable(T.any(String, Gem::Version))) }
+        attr_reader :latest_allowable_version
+
+        sig { returns(T.nilable(String)) }
+        attr_reader :repo_contents_path
+
+        sig { returns(T::Array[Dependabot::SecurityAdvisory]) }
+        attr_reader :security_advisories
+
+        sig do
+          params(
+            dependency: Dependency,
+            credentials: T::Array[Dependabot::Credential],
+            dependency_files: T::Array[Dependabot::DependencyFile],
+            ignored_versions: T::Array[String],
+            latest_allowable_version: T.nilable(T.any(String, Gem::Version)),
+            repo_contents_path: T.nilable(String),
+            security_advisories: T::Array[Dependabot::SecurityAdvisory]
+          ).void
+        end
+        def initialize(
+          dependency:,
+          credentials:,
+          dependency_files:,
+          ignored_versions:,
+          latest_allowable_version:,
+          repo_contents_path:,
+          security_advisories: []
+        )
           @dependency = dependency
           @credentials = credentials
           @dependency_files = dependency_files
           @ignored_versions = ignored_versions
           @latest_allowable_version = latest_allowable_version
           @repo_contents_path = repo_contents_path
+          @security_advisories = security_advisories
         end
 
+        sig { returns(T.nilable(T.any(String, Gem::Version))) }
         def latest_resolvable_version
           raise "Not a subdependency!" if dependency.requirements.any?
           return if bundled_dependency?
 
-          base_dir = dependency_files.first.directory
+          base_dir = T.must(dependency_files.first).directory
           SharedHelpers.in_a_temporary_repo_directory(base_dir, repo_contents_path) do
             dependency_files_builder.write_temporary_dependency_files
 
@@ -53,13 +98,7 @@ module Dependabot
 
         private
 
-        attr_reader :dependency
-        attr_reader :credentials
-        attr_reader :dependency_files
-        attr_reader :ignored_versions
-        attr_reader :latest_allowable_version
-        attr_reader :repo_contents_path
-
+        sig { params(lockfile: Dependabot::DependencyFile).returns(String) }
         def update_subdependency_in_lockfile(lockfile)
           lockfile_name = Pathname.new(lockfile.name).basename.to_s
           path = Pathname.new(lockfile.name).dirname.to_s
@@ -70,7 +109,7 @@ module Dependabot
                             run_yarn_updater(path, lockfile_name)
                           elsif lockfile.name.end_with?("pnpm-lock.yaml")
                             run_pnpm_updater(path, lockfile_name)
-                          elsif !Helpers.npm8?(lockfile)
+                          elsif !Helpers.parse_npm8?(lockfile)
                             run_npm6_updater(path, lockfile_name)
                           else
                             run_npm_updater(path, lockfile_name)
@@ -79,28 +118,71 @@ module Dependabot
           updated_files.fetch(lockfile_name)
         end
 
+        sig { params(updated_lockfiles: T::Array[Dependabot::DependencyFile]).returns(T.nilable(Gem::Version)) }
         def version_from_updated_lockfiles(updated_lockfiles)
           updated_files = dependency_files -
                           dependency_files_builder.lockfiles +
                           updated_lockfiles
 
-          updated_version = NpmAndYarn::FileParser.new(
+          parsed_dep = NpmAndYarn::FileParser.new(
             dependency_files: updated_files,
             source: nil,
             credentials: credentials
-          ).parse.find { |d| d.name == dependency.name }&.version
-          return unless updated_version
+          ).parse.find { |d| d.name == dependency.name }
+          return unless parsed_dep&.version
 
-          version_class.new(updated_version)
+          combined = version_class.new(parsed_dep.version)
+          current_version = dependency.version ? version_class.new(dependency.version) : nil
+          audit_fix_version = audit_fix_best_version(parsed_dep, current_version)
+          audit_fix_version || combined
         end
 
+        sig do
+          params(
+            parsed_dep: Dependabot::Dependency,
+            current_version: T.nilable(Gem::Version)
+          ).returns(T.nilable(Gem::Version))
+        end
+        def audit_fix_best_version(parsed_dep, current_version)
+          return unless Dependabot::Experiments.enabled?(:enable_audit_fix_fallback)
+          return unless current_version
+
+          all_versions = parsed_dep.metadata_dependencies(:all_versions)
+          return unless all_versions&.any?
+
+          best_candidate_version(all_versions, current_version)
+        end
+
+        sig do
+          params(
+            all_versions: T::Array[Dependabot::Dependency],
+            current_version: Gem::Version
+          ).returns(T.nilable(Gem::Version))
+        end
+        def best_candidate_version(all_versions, current_version)
+          allowable = if latest_allowable_version.is_a?(String)
+                        version_class.new(latest_allowable_version)
+                      else
+                        latest_allowable_version
+                      end
+
+          all_versions
+            .filter_map { |d| version_class.new(d.version) if d.version }
+            .select { |v| v > current_version && (allowable.nil? || v <= allowable) }
+            .max
+        end
+
+        sig { params(path: String, lockfile_name: String).returns(T::Hash[String, String]) }
         def run_yarn_updater(path, lockfile_name)
           SharedHelpers.with_git_configured(credentials: credentials) do
             Dir.chdir(path) do
-              SharedHelpers.run_helper_subprocess(
-                command: NativeHelpers.helper_path,
-                function: "yarn:updateSubdependency",
-                args: [Dir.pwd, lockfile_name, [dependency.to_h]]
+              T.cast(
+                SharedHelpers.run_helper_subprocess(
+                  command: NativeHelpers.helper_path,
+                  function: "yarn:updateSubdependency",
+                  args: [Dir.pwd, lockfile_name, [dependency.to_h]]
+                ),
+                T::Hash[String, String]
               )
             end
           end
@@ -119,99 +201,219 @@ module Dependabot
           retry
         end
 
+        sig { params(path: String, lockfile_name: String).returns(T::Hash[String, String]) }
         def run_yarn_berry_updater(path, lockfile_name)
           SharedHelpers.with_git_configured(credentials: credentials) do
             Dir.chdir(path) do
+              original_content = File.read(lockfile_name)
+
               Helpers.run_yarn_command(
                 "up -R #{dependency.name} #{Helpers.yarn_berry_args}".strip,
                 fingerprint: "up -R <dependency_name> #{Helpers.yarn_berry_args}".strip
               )
-              { lockfile_name => File.read(lockfile_name) }
+
+              updated_content = File.read(lockfile_name)
+              if updated_content == original_content && Dependabot::Experiments.enabled?(:enable_audit_fix_fallback)
+                begin
+                  NativeHelpers.run_yarn_audit_fix_command
+                  dependency.metadata[:audit_fix_used] = true
+                rescue SharedHelpers::HelperSubprocessFailed
+                  Dependabot.logger.info(
+                    "yarn npm audit --fix failed or partially fixed — continuing with any changes made"
+                  )
+                end
+                updated_content = File.read(lockfile_name)
+              end
+
+              { lockfile_name => updated_content }
             end
           end
         end
 
+        sig { params(path: String, lockfile_name: String).returns(T::Hash[String, String]) }
         def run_pnpm_updater(path, lockfile_name)
           SharedHelpers.with_git_configured(credentials: credentials) do
             Dir.chdir(path) do
+              original_content = File.read(lockfile_name)
+
               Helpers.run_pnpm_command(
-                "update #{dependency.name} --lockfile-only",
-                fingerprint: "update <dependency_name> --lockfile-only"
+                pnpm_update_command,
+                fingerprint: pnpm_update_fingerprint
               )
-              { lockfile_name => File.read(lockfile_name) }
+
+              updated_content = File.read(lockfile_name)
+              if updated_content == original_content && Dependabot::Experiments.enabled?(:enable_audit_fix_fallback)
+                run_pnpm_deep_update_fallback
+                updated_content = File.read(lockfile_name)
+              end
+
+              if updated_content == original_content && Dependabot::Experiments.enabled?(:enable_audit_fix_fallback)
+                run_pnpm_audit_fix_fallback(lockfile_name, original_content)
+                updated_content = File.read(lockfile_name)
+              end
+
+              { lockfile_name => updated_content }
             end
           end
         end
 
+        sig { returns(String) }
+        def pnpm_update_command
+          if latest_allowable_version
+            "update #{dependency.name}@#{latest_allowable_version} --lockfile-only --no-save -r"
+          else
+            "update #{dependency.name} --lockfile-only"
+          end
+        end
+
+        sig { returns(String) }
+        def pnpm_update_fingerprint
+          if latest_allowable_version
+            "update <dependency_name>@<latest_allowable_version> --lockfile-only --no-save -r"
+          else
+            "update <dependency_name> --lockfile-only"
+          end
+        end
+
+        # First-tier fallback: try `pnpm update --depth Infinity <dep>` to
+        # update transitive dependencies in the lockfile without modifying
+        # manifests or relying on older pnpm audit fixes that may add overrides.
+        sig { void }
+        def run_pnpm_deep_update_fallback
+          recursive = Dir.glob("**/pnpm-workspace.yaml").any?
+          NativeHelpers.run_pnpm_deep_update_command(dependency.name, recursive: recursive)
+          dependency.metadata[:deep_update_used] = true
+        rescue SharedHelpers::HelperSubprocessFailed
+          Dependabot.logger.info(
+            "pnpm update --depth Infinity failed or partially fixed — continuing with any changes made"
+          )
+        end
+
+        # Runs the version-compatible `pnpm audit --fix` strategy when `pnpm update` is a no-op.
+        # pnpm 11 updates the lockfile directly, while older versions may add
+        # `overrides` to package.json. If any manifest changes, revert both the
+        # manifest(s) and lockfile so no inconsistent state is surfaced upstream.
+        sig { params(lockfile_name: String, original_content: String).void }
+        def run_pnpm_audit_fix_fallback(lockfile_name, original_content)
+          package_json_snapshots = Dir.glob("**/package.json").to_h { |f| [f, File.read(f)] }
+
+          begin
+            NativeHelpers.run_pnpm_audit_fix_command
+            Helpers.run_pnpm_command(
+              "install --lockfile-only",
+              fingerprint: "install --lockfile-only"
+            )
+
+            manifest_changed = package_json_snapshots.any? { |f, c| File.read(f) != c }
+            if manifest_changed
+              Dependabot.logger.info(
+                "pnpm audit --fix modified package.json (overrides) — reverting fallback"
+              )
+              package_json_snapshots.each { |f, c| File.write(f, c) }
+              File.write(lockfile_name, original_content)
+            else
+              dependency.metadata[:audit_fix_used] = true
+            end
+          rescue SharedHelpers::HelperSubprocessFailed
+            Dependabot.logger.info(
+              "pnpm audit --fix failed or partially fixed — continuing with any changes made"
+            )
+          end
+        end
+
+        sig { params(path: String, lockfile_name: String).returns(T::Hash[String, String]) }
         def run_npm_updater(path, lockfile_name)
           SharedHelpers.with_git_configured(credentials: credentials) do
             Dir.chdir(path) do
-              NativeHelpers.run_npm8_subdependency_update_command([dependency.name])
+              original_content = File.read(lockfile_name)
 
-              { lockfile_name => File.read(lockfile_name) }
-            end
-          end
-        end
-
-        def run_npm6_updater(path, lockfile_name)
-          SharedHelpers.with_git_configured(credentials: credentials) do
-            Dir.chdir(path) do
-              SharedHelpers.run_helper_subprocess(
-                command: NativeHelpers.helper_path,
-                function: "npm6:updateSubdependency",
-                args: [Dir.pwd, lockfile_name, [dependency.to_h]]
+              NativeHelpers.run_npm8_subdependency_update_command(
+                [dependency.name],
+                min_release_age_arg: security_updates_only? ? "--min-release-age=0" : nil
               )
+
+              updated_content = File.read(lockfile_name)
+              if updated_content == original_content && Dependabot::Experiments.enabled?(:enable_audit_fix_fallback)
+                begin
+                  NativeHelpers.run_npm_audit_fix_command(
+                    min_release_age_arg: security_updates_only? ? "--min-release-age=0" : nil
+                  )
+                  dependency.metadata[:audit_fix_used] = true
+                rescue SharedHelpers::HelperSubprocessFailed
+                  Dependabot.logger.info("npm audit fix failed or partially fixed — continuing with any changes made")
+                end
+                updated_content = File.read(lockfile_name)
+              end
+
+              { lockfile_name => updated_content }
             end
           end
         end
 
+        sig { params(path: String, lockfile_name: String).returns(T::Hash[String, String]) }
+        def run_npm6_updater(path, lockfile_name)
+          T.cast(
+            SharedHelpers.with_git_configured(credentials: credentials) do
+              Dir.chdir(path) do
+                SharedHelpers.run_helper_subprocess(
+                  command: NativeHelpers.helper_path,
+                  function: "npm6:updateSubdependency",
+                  args: [Dir.pwd, lockfile_name, [dependency.to_h]]
+                )
+              end
+            end,
+            T::Hash[String, String]
+          )
+        end
+
+        sig { returns(T.class_of(Dependabot::Version)) }
         def version_class
           dependency.version_class
         end
 
+        # Security fixes must not be blocked by a min-release-age gate the user
+        # configured in .npmrc for regular updates, so the native npm commands
+        # are invoked with --min-release-age=0 when resolving a security fix.
+        sig { returns(T::Boolean) }
+        def security_updates_only?
+          security_advisories.any?
+        end
+
+        sig { returns(Dependabot::Dependency) }
         def updated_dependency
           Dependabot::Dependency.new(
             name: dependency.name,
-            version: latest_allowable_version,
+            version: T.cast(latest_allowable_version, T.nilable(T.any(String, Dependabot::Version))),
             previous_version: dependency.version,
             requirements: [],
             package_manager: dependency.package_manager
           )
         end
 
+        sig { returns(T::Array[Dependabot::DependencyFile]) }
         def filtered_lockfiles
-          @filtered_lockfiles ||=
+          @filtered_lockfiles ||= T.let(
             SubDependencyFilesFilterer.new(
               dependency_files: dependency_files,
               updated_dependencies: [updated_dependency]
-            ).files_requiring_update
+            ).files_requiring_update,
+            T.nilable(T::Array[Dependabot::DependencyFile])
+          )
         end
 
+        sig { returns(Dependabot::NpmAndYarn::UpdateChecker::DependencyFilesBuilder) }
         def dependency_files_builder
-          @dependency_files_builder ||=
+          @dependency_files_builder ||= T.let(
             DependencyFilesBuilder.new(
               dependency: dependency,
               dependency_files: dependency_files,
               credentials: credentials
-            )
+            ),
+            T.nilable(Dependabot::NpmAndYarn::UpdateChecker::DependencyFilesBuilder)
+          )
         end
 
-        # TODO: We should try and fix this by updating the parent that's not
-        # bundled. For this case: `chokidar > fsevents > node-pre-gyp > tar` we
-        # would need to update `fsevents`
-        #
-        # We shouldn't update bundled sub-dependencies as they have been bundled
-        # into the release at an exact version by a parent using
-        # `bundledDependencies`.
-        #
-        # For example, fsevents < 2 bundles node-pre-gyp meaning all it's
-        # sub-dependencies get bundled into the release tarball at publish time
-        # so you always get the same sub-dependency versions if you re-install a
-        # specific version of fsevents.
-        #
-        # Updating the sub-dependency by deleting the entry works but it gets
-        # removed from the bundled set of dependencies and moved top level
-        # resulting in a bunch of package duplication which is pretty confusing.
+        sig { returns(T::Boolean) }
         def bundled_dependency?
           dependency.subdependency_metadata
                     &.any? { |h| h.fetch(:npm_bundled, false) } ||

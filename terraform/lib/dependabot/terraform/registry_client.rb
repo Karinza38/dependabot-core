@@ -1,4 +1,4 @@
-# typed: true
+# typed: strict
 # frozen_string_literal: true
 
 require "dependabot/dependency"
@@ -12,35 +12,45 @@ module Dependabot
     # Terraform::RegistryClient is a basic API client to interact with a
     # terraform registry: https://www.terraform.io/docs/registry/api.html
     class RegistryClient
-      ARCHIVE_EXTENSIONS = %w(.zip .tbz2 .tgz .txz).freeze
-      PUBLIC_HOSTNAME = "registry.terraform.io"
+      extend T::Sig
 
+      # Archive extensions supported by Terraform for HTTP URLs
+      # https://developer.hashicorp.com/terraform/language/modules/sources#http-urls
+      ARCHIVE_EXTENSIONS = %w(.zip .bz2 .tar.bz2 .tar.tbz2 .tbz2 .gz .tar.gz .tgz .xz .tar.xz .txz).freeze
+      PUBLIC_HOSTNAME = "registry.terraform.io"
+      CERTIFICATE_ERROR_KEYWORDS = %w(certificate SSL x509 verify).freeze
+
+      sig { params(hostname: String, credentials: T::Array[Dependabot::Credential]).void }
       def initialize(hostname: PUBLIC_HOSTNAME, credentials: [])
         @hostname = hostname
-        @tokens = credentials.each_with_object({}) do |item, memo|
-          memo[item["host"]] = item["token"] if item["type"] == "terraform_registry"
-        end
+        @tokens = T.let(
+          credentials.each_with_object({}) do |item, memo|
+            memo[item["host"]] = item["token"] if item["type"] == "terraform_registry"
+          end,
+          T::Hash[String, String]
+        )
       end
 
       # rubocop:disable Metrics/PerceivedComplexity
-      # See https://www.terraform.io/docs/modules/sources.html#http-urls for
-      # details of how Terraform handle HTTP(S) sources for modules
       # rubocop:disable Metrics/AbcSize
       # rubocop:disable Metrics/CyclomaticComplexity
+      # See https://www.terraform.io/docs/modules/sources.html#http-urls for
+      # details of how Terraform handle HTTP(S) sources for modules
+      sig { params(raw_source: String).returns(String) }
       def self.get_proxied_source(raw_source)
         return raw_source unless raw_source.start_with?("http")
 
-        uri = URI.parse(raw_source.split(%r{(?<!:)//}).first)
+        uri = URI.parse(T.must(raw_source.split(%r{(?<!:)//}).first))
         return raw_source if ARCHIVE_EXTENSIONS.any? { |ext| uri.path&.end_with?(ext) }
         return raw_source if URI.parse(raw_source).query&.include?("archive=")
 
-        url = raw_source.split(%r{(?<!:)//}).first + "?terraform-get=1"
+        url = T.must(raw_source.split(%r{(?<!:)//}).first) + "?terraform-get=1"
         host = URI.parse(raw_source).host
 
         response = Dependabot::RegistryClient.get(url: url)
         raise PrivateSourceAuthenticationFailure, host if response.status == 401
 
-        return response.headers["X-Terraform-Get"] if response.headers["X-Terraform-Get"]
+        return T.must(response.headers["X-Terraform-Get"]) if response.headers["X-Terraform-Get"]
 
         doc = Nokogiri::XML(response.body)
         doc.css("meta").find do |tag|
@@ -62,6 +72,7 @@ module Dependabot
       # "hashicorp/aws"
       # @return [Array<Dependabot::Terraform::Version>]
       # @raise [Dependabot::DependabotError] when the versions cannot be retrieved
+      sig { params(identifier: String).returns(T::Array[Dependabot::Terraform::Version]) }
       def all_provider_versions(identifier:)
         base_url = service_url_for("providers.v1")
         response = http_get!(URI.join(base_url, "#{identifier}/versions"))
@@ -80,6 +91,7 @@ module Dependabot
       # "hashicorp/consul/aws"
       # @return [Array<Dependabot::Terraform::Version>]
       # @raise [Dependabot::DependabotError] when the versions cannot be retrieved
+      sig { params(identifier: String).returns(T::Array[Dependabot::Terraform::Version]) }
       def all_module_versions(identifier:)
         base_url = service_url_for("modules.v1")
         response = http_get!(URI.join(base_url, "#{identifier}/versions"))
@@ -97,8 +109,9 @@ module Dependabot
       # @param dependency [Dependabot::Dependency] the dependency who's source
       # we're attempting to find
       # @return [nil, Dependabot::Source]
+      sig { params(dependency: Dependabot::Dependency).returns(T.nilable(Dependabot::Source)) }
       def source(dependency:)
-        type = dependency.requirements.first[:source][:type]
+        type = T.must(dependency.source_string("type"))
         base_url = service_url_for(service_key_for(type))
         case type
         # https://www.terraform.io/internals/module-registry-protocol#download-source-code-for-a-specific-module-version
@@ -108,7 +121,7 @@ module Dependabot
           return nil unless response.status == 204
 
           source_url = response.headers.fetch("X-Terraform-Get")
-          source_url = URI.join(download_url, source_url) if
+          source_url = URI.join(download_url, source_url).to_s if
             source_url.start_with?("/", "./", "../")
           source_url = RegistryClient.get_proxied_source(source_url) if source_url
         when "provider", "providers"
@@ -130,6 +143,7 @@ module Dependabot
       # @param service_key [String] the service type described in https://www.terraform.io/docs/internals/remote-service-discovery.html#supported-services
       # @param return String
       # @raise [Dependabot::PrivateSourceAuthenticationFailure] when the service is not available
+      sig { params(service_key: String).returns(String) }
       def service_url_for(service_key)
         url_for(services.fetch(service_key))
       rescue KeyError
@@ -138,26 +152,46 @@ module Dependabot
 
       private
 
+      sig { returns(String) }
       attr_reader :hostname
+
+      sig { returns(T::Hash[String, String]) }
       attr_reader :tokens
 
+      sig { returns(T.class_of(Dependabot::Terraform::Version)) }
       def version_class
         Version
       end
 
+      sig { params(hostname: String).returns(T::Hash[String, String]) }
       def headers_for(hostname)
         token = tokens[hostname]
         token ? { "Authorization" => "Bearer #{token}" } : {}
       end
 
+      sig { returns(T::Hash[String, String]) }
       def services
-        @services ||=
+        @services ||= T.let(
           begin
             response = http_get(url_for("/.well-known/terraform.json"))
-            response.status == 200 ? JSON.parse(response.body) : {}
-          end
+            if response.status == 200
+              response.body.empty? ? {} : JSON.parse(response.body)
+            elsif response.status == 404
+              {}
+            elsif response.status == 401
+              raise PrivateSourceAuthenticationFailure, hostname
+            else
+              raise PrivateSourceBadResponse, hostname
+            end
+          rescue JSON::ParserError => e
+            Dependabot.logger.warn("Failed to parse Terraform registry services: #{e.message}")
+            {}
+          end,
+          T.nilable(T::Hash[String, String])
+        )
       end
 
+      sig { params(type: String).returns(String) }
       def service_key_for(type)
         case type
         when "module", "modules", "registry"
@@ -169,34 +203,53 @@ module Dependabot
         end
       end
 
+      sig { params(url: T.any(String, URI::Generic)).returns(Excon::Response) }
       def http_get(url)
         Dependabot::RegistryClient.get(
           url: url.to_s,
           headers: headers_for(hostname)
         )
+      rescue Excon::Error::Socket => e
+        raise PrivateSourceCertificateFailure, hostname if certificate_error?(e.message)
+
+        raise PrivateSourceBadResponse, hostname
+      rescue Excon::Error::Timeout
+        raise PrivateSourceBadResponse, hostname
       end
 
+      sig { params(url: URI::Generic).returns(Excon::Response) }
       def http_get!(url)
         response = http_get(url)
 
         raise Dependabot::PrivateSourceAuthenticationFailure, hostname if response.status == 401
+        raise Dependabot::DependencyNotFound, url.to_s if response.status == 404
         raise error("Response from registry was #{response.status}") unless response.status == 200
 
         response
       end
 
+      sig { params(path: String).returns(String) }
       def url_for(path)
         uri = URI.parse(path)
         return uri.to_s if uri.scheme == "https"
         raise error("Unsupported scheme provided") if uri.host && uri.scheme
 
-        uri.host = hostname
+        parsed_hostname = URI.parse("https://#{hostname}")
+        uri.host = parsed_hostname.host
         uri.scheme = "https"
+        # Only set port explicitly when it differs from the default HTTPS port
+        uri.port = parsed_hostname.port unless parsed_hostname.port == URI::HTTPS.default_port
         uri.to_s
       end
 
+      sig { params(message: String).returns(Dependabot::DependabotError) }
       def error(message)
         Dependabot::DependabotError.new(message)
+      end
+
+      sig { params(message: String).returns(T::Boolean) }
+      def certificate_error?(message)
+        CERTIFICATE_ERROR_KEYWORDS.any? { |keyword| message.index(keyword) }
       end
     end
   end

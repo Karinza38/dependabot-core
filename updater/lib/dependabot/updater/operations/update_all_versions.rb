@@ -42,7 +42,7 @@ module Dependabot
           # A list of notices that will be used in PR messages and/or sent to the dependabot github alerts.
           @notices = T.let([], T::Array[Dependabot::Notice])
 
-          return unless job.source.directory.nil? && job.source.directories&.count == 1
+          return unless job.source.directory.nil? && job.source.directories&.one?
 
           job.source.directory = job.source.directories&.first
         end
@@ -63,14 +63,19 @@ module Dependabot
 
         sig { returns(Dependabot::Job) }
         attr_reader :job
-        sig { returns(Dependabot::Service) }
+
+        sig { override.returns(Dependabot::Service) }
         attr_reader :service
+
         sig { returns(Dependabot::DependencySnapshot) }
         attr_reader :dependency_snapshot
+
         sig { returns(Dependabot::Updater::ErrorHandler) }
         attr_reader :error_handler
+
         sig { returns(T::Array[PullRequest]) }
         attr_reader :created_pull_requests
+
         # A list of notices that will be used in PR messages and/or sent to the dependabot github alerts.
         sig { returns(T::Array[Dependabot::Notice]) }
         attr_reader :notices
@@ -108,6 +113,7 @@ module Dependabot
           process_dependency_error(e, dependency)
         ensure
           service.record_ecosystem_meta(dependency_snapshot.ecosystem)
+          service.record_cooldown_meta(job)
         end
 
         # rubocop:disable Metrics/AbcSize
@@ -118,15 +124,18 @@ module Dependabot
           checker = update_checker_for(dependency, raise_on_ignored: raise_on_ignored?(dependency))
 
           log_checking_for_update(dependency)
+          record_blocked_version_ignored(
+            job: job, dependency: dependency, operation: BlockedVersionsOperation::VERSION_UPDATE
+          )
 
           return if all_versions_ignored?(dependency, checker)
           return log_up_to_date(dependency) if checker.up_to_date?
 
           if pr_exists_for_latest_version?(checker)
-            return Dependabot.logger.info(
-              "Pull request already exists for #{checker.dependency.name} " \
-              "with latest version #{checker.latest_version}"
-            )
+            latest_version = checker.latest_version&.to_s
+            return false if latest_version.nil?
+
+            return log_existing_pr_for_latest_version(checker.dependency.name, latest_version, checker.latest_version)
           end
 
           requirements_to_unlock = requirements_to_unlock(checker)
@@ -186,6 +195,27 @@ module Dependabot
 
           create_pull_request(dependency_change)
         end
+        sig do
+          params(
+            dependency_name: String,
+            latest_version: String,
+            latest_version_obj: T.nilable(T.any(String, Gem::Version))
+          ).void
+        end
+        def log_existing_pr_for_latest_version(dependency_name, latest_version, latest_version_obj)
+          existing_pr = job.existing_pull_requests.find do |pr|
+            pr.contains_dependency?(dependency_name, latest_version, T.must(job.source.directory))
+          end
+
+          pr_number = existing_pr&.pr_number
+          pr_number_text = pr_number ? "##{pr_number} " : ""
+
+          Dependabot.logger.info(
+            "Pull request #{pr_number_text}already exists for #{dependency_name} " \
+            "with latest version #{latest_version_obj}"
+          )
+        end
+
         # rubocop:enable Metrics/PerceivedComplexity
         # rubocop:enable Metrics/MethodLength
         # rubocop:enable Metrics/AbcSize
@@ -216,6 +246,7 @@ module Dependabot
             security_advisories: job.security_advisories_for(dependency),
             raise_on_ignored: raise_on_ignored,
             requirements_update_strategy: job.requirements_update_strategy,
+            update_cooldown: job.security_updates_only? ? nil : job.cooldown,
             options: job.experiments
           )
         end
@@ -228,7 +259,7 @@ module Dependabot
           job.log_ignore_conditions_for(dependency)
         end
 
-        sig { params(error: StandardError, dependency: Dependabot::Dependency).returns(T.untyped) }
+        sig { params(error: StandardError, dependency: Dependabot::Dependency).void }
         def process_dependency_error(error, dependency)
           if error.class.to_s.include?("RegistryError")
             ex = Dependabot::DependencyFileNotResolvable.new(error.message)
@@ -255,9 +286,15 @@ module Dependabot
           latest_version = checker.latest_version&.to_s
           return false if latest_version.nil?
 
-          job.existing_pull_requests
-             .any? { |pr| pr.contains_dependency?(checker.dependency.name, latest_version) } ||
-            created_pull_requests.any? { |pr| pr.contains_dependency?(checker.dependency.name, latest_version) }
+          return true if job.existing_pull_requests.any? do |pr|
+            pr.contains_dependency?(checker.dependency.name, latest_version, T.must(job.source.directory))
+          end
+
+          return true if created_pull_requests.any? do |pr|
+            pr.contains_dependency?(checker.dependency.name, latest_version, T.must(job.source.directory))
+          end
+
+          false
         end
 
         sig do
@@ -320,8 +357,10 @@ module Dependabot
 
         sig { params(dependency_change: Dependabot::DependencyChange).void }
         def create_pull_request(dependency_change)
-          Dependabot.logger.info("Submitting #{dependency_change.updated_dependencies.map(&:name).join(', ')} " \
-                                 "pull request for creation")
+          Dependabot.logger.info(
+            "Submitting #{dependency_change.updated_dependencies.map(&:name).join(', ')} " \
+            "pull request for creation"
+          )
 
           service.create_pull_request(dependency_change, dependency_snapshot.base_commit_sha)
 

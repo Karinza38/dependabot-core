@@ -1,8 +1,10 @@
-# typed: true
+# typed: strong
 # frozen_string_literal: true
 
 require "dependabot/errors"
+require "dependabot/sentry/error_fingerprint"
 require "dependabot/updater/errors"
+require "dependabot/updater/security_update_helpers"
 require "octokit"
 
 # This class is responsible for determining how to present a Dependabot::Error
@@ -14,7 +16,7 @@ require "octokit"
 # against it from Rubocop we aren't addressing right now.
 #
 # It feels like this concern could be slimmed down if each Dependabot::Error
-# class implemented a "presenter" method to generate it's own `error-type` and
+# class implemented a "presenter" method to generate its own `error-type` and
 # `error-detail` since this never draws attributes from the Updater context.
 #
 # For now, let's just extract it and set it aside as a tangent from the critical
@@ -22,93 +24,155 @@ require "octokit"
 module Dependabot
   class Updater
     class ErrorHandler
+      extend T::Sig
+      include PullRequestHelpers
+
       # These are errors that halt the update run and are handled in the main
       # backend. They do *not* raise a sentry.
-      RUN_HALTING_ERRORS = {
-        Dependabot::OutOfDisk => "out_of_disk",
-        Dependabot::OutOfMemory => "out_of_memory",
-        Dependabot::AllVersionsIgnored => "all_versions_ignored",
-        Dependabot::UnexpectedExternalCode => "unexpected_external_code",
-        Errno::ENOSPC => "out_of_disk",
-        Octokit::Unauthorized => "octokit_unauthorized"
-      }.freeze
+      RUN_HALTING_ERRORS = T.let(
+        {
+          Dependabot::OutOfDisk => "out_of_disk",
+          Dependabot::OutOfMemory => "out_of_memory",
+          Dependabot::AllVersionsIgnored => "all_versions_ignored",
+          Dependabot::UnexpectedExternalCode => "unexpected_external_code",
+          Errno::ENOSPC => "out_of_disk",
+          Octokit::Unauthorized => "octokit_unauthorized"
+        }.freeze,
+        T::Hash[T::Module[T.anything], String]
+      )
 
-      def initialize(service:, job:)
+      # Translates the canonical operation identifier (Operation.tag_name) into
+      # the curated `operation` label shared by the blocked_versions.* metrics.
+      # The label vocabulary itself lives in
+      # PullRequestHelpers::BlockedVersionsOperation so the "soft"
+      # (`blocked_versions.ignored`) and "hard" (`blocked_versions.enforced`)
+      # statuses stay in lockstep on a single `operation` tag. Operations absent
+      # from this map fall back to their raw tag name so we never drop the
+      # dimension entirely.
+      BLOCKED_VERSIONS_OPERATIONS = T.let(
+        {
+          "update_all_versions" => PullRequestHelpers::BlockedVersionsOperation::VERSION_UPDATE,
+          "create_security_pr" => PullRequestHelpers::BlockedVersionsOperation::SECURITY_UPDATE,
+          "update_security_pr" => PullRequestHelpers::BlockedVersionsOperation::REFRESH_SECURITY_UPDATE,
+          "update_version_pr" => PullRequestHelpers::BlockedVersionsOperation::REFRESH_VERSION_UPDATE,
+          "create_version_group_pr" => PullRequestHelpers::BlockedVersionsOperation::GROUP_UPDATE,
+          "update_version_group_pr" => PullRequestHelpers::BlockedVersionsOperation::GROUP_UPDATE,
+          "group_update_all_versions" => PullRequestHelpers::BlockedVersionsOperation::GROUP_UPDATE
+        }.freeze,
+        T::Hash[String, String]
+      )
+
+      sig { params(service: Service, job: Job, operation_name: String).void }
+      def initialize(service:, job:, operation_name: "unknown")
         @service = service
         @job = job
+        @operation_name = operation_name
       end
 
       # This method handles errors where there is a dependency in the current
       # context. This should be used by preference where possible.
+      sig do
+        params(
+          error: StandardError,
+          dependency: T.nilable(Dependabot::Dependency),
+          dependency_group: T.nilable(Dependabot::DependencyGroup)
+        ).void
+      end
       def handle_dependency_error(error:, dependency:, dependency_group: nil)
         # If the error is fatal for the run, we should re-raise it rather than
         # pass it back to the service.
         raise error if RUN_HALTING_ERRORS.keys.any? { |err| error.is_a?(err) }
 
+        increment_blocked_versions_enforced_metric(error)
+
         error_details = error_details_for(error, dependency: dependency, dependency_group: dependency_group)
         service.record_update_job_error(
-          error_type: error_details.fetch(:"error-type"),
-          error_details: error_details[:"error-detail"],
+          error_type: error_details.error_type,
+          error_details: error_details.error_detail,
           dependency: dependency
         )
         # We don't set this flag in GHES because there older GHES version does not support reporting unknown errors.
         if Experiments.enabled?(:record_update_job_unknown_error) &&
-           error_details.fetch(:"error-type") == "unknown_error"
+           error_details.error_type == "unknown_error"
           log_unknown_error_with_backtrace(error)
         end
 
         log_dependency_error(
           dependency: dependency,
           error: error,
-          error_type: error_details.fetch(:"error-type"),
-          error_detail: error_details.fetch(:"error-detail", nil)
+          error_type: error_details.error_type,
+          error_detail: error_details.error_detail
         )
       end
 
       # Provides logging for errors that occur when processing a dependency
+      sig do
+        params(
+          dependency: T.nilable(Dependabot::Dependency),
+          error: StandardError,
+          error_type: String,
+          error_detail: T.nilable(Dependabot::ErrorDetails::Detail)
+        ).void
+      end
       def log_dependency_error(dependency:, error:, error_type:, error_detail: nil)
+        dependency_name = dependency&.name || "unknown dependency"
         if error_type == "unknown_error"
-          Dependabot.logger.error "Error processing #{dependency.name} (#{error.class.name})"
+          Dependabot.logger.error "Error processing #{dependency_name} (#{error.class.name})"
           Dependabot.logger.error error.message
-          error.backtrace.each { |line| Dependabot.logger.error line }
+          error.backtrace&.each { |line| Dependabot.logger.error line }
         else
           Dependabot.logger.info(
-            "Handled error whilst updating #{dependency.name}: #{error_type} #{error_detail}"
+            "Handled error whilst updating #{dependency_name}: #{error_type} #{error_detail}"
           )
         end
       end
 
       # This method handles errors where there is no dependency in the current
       # context.
+      sig do
+        params(
+          error: StandardError,
+          dependency_group: T.nilable(Dependabot::DependencyGroup)
+        ).void
+      end
       def handle_job_error(error:, dependency_group: nil)
         # If the error is fatal for the run, we should re-raise it rather than
         # pass it back to the service.
         raise error if RUN_HALTING_ERRORS.keys.any? { |err| error.is_a?(err) }
 
+        increment_blocked_versions_enforced_metric(error)
+
         error_details = error_details_for(error, dependency_group: dependency_group)
         service.record_update_job_error(
-          error_type: error_details.fetch(:"error-type"),
-          error_details: error_details[:"error-detail"]
+          error_type: error_details.error_type,
+          error_details: error_details.error_detail
         )
         # We don't set this flag in GHES because there older GHES version does not support reporting unknown errors.
         if Experiments.enabled?(:record_update_job_unknown_error) &&
-           error_details.fetch(:"error-type") == "unknown_error"
+           error_details.error_type == "unknown_error"
           log_unknown_error_with_backtrace(error)
         end
 
         log_job_error(
           error: error,
-          error_type: error_details.fetch(:"error-type"),
-          error_detail: error_details.fetch(:"error-detail", nil)
+          error_type: error_details.error_type,
+          error_detail: error_details.error_detail
         )
       end
 
       # Provides logging for errors that occur outside of a dependency context
+      sig do
+        params(
+          error: StandardError,
+          error_type: String,
+          error_detail: T.nilable(Dependabot::ErrorDetails::Detail)
+        ).void
+      end
       def log_job_error(error:, error_type:, error_detail: nil)
         if error_type == "unknown_error"
           Dependabot.logger.error "Error processing job (#{error.class.name})"
           Dependabot.logger.error error.message
-          error.backtrace.each { |line| Dependabot.logger.error line }
+          error.backtrace&.each { |line| Dependabot.logger.error line }
         else
           Dependabot.logger.info(
             "Handled error whilst processing job: #{error_type} #{error_detail}"
@@ -118,8 +182,31 @@ module Dependabot
 
       private
 
+      # Implements the abstract `service` reader required by PullRequestHelpers.
+      sig { override.returns(Service) }
       attr_reader :service
+
+      sig { returns(Job) }
       attr_reader :job
+
+      sig { returns(String) }
+      attr_reader :operation_name
+
+      # Records the "hard" block status when a selected update is rejected because
+      # a blocked transitive version was about to ship in the regenerated files.
+      # The metric emission lives in PullRequestHelpers#record_blocked_version_enforced
+      # so it sits alongside its "soft" sibling `blocked_versions.ignored`.
+      #
+      # Recording is guarded and fire-and-forget: it can never affect an update.
+      sig { params(error: StandardError).void }
+      def increment_blocked_versions_enforced_metric(error)
+        return unless error.is_a?(Dependabot::BlockedDependencyVersion)
+
+        record_blocked_version_enforced(
+          job: job,
+          operation: BLOCKED_VERSIONS_OPERATIONS.fetch(operation_name, operation_name)
+        )
+      end
 
       # This method accepts an error class and returns an appropriate `error_details` hash
       # to be reported to the backend service.
@@ -127,6 +214,13 @@ module Dependabot
       # For some specific errors, it also passes additional information to the
       # exception service to aid in debugging, the optional arguments provide
       # context to pass through in these cases.
+      sig do
+        params(
+          error: StandardError,
+          dependency: T.nilable(Dependabot::Dependency),
+          dependency_group: T.nilable(Dependabot::DependencyGroup)
+        ).returns(Dependabot::ErrorDetails)
+      end
       def error_details_for(error, dependency: nil, dependency_group: nil)
         error_details = Dependabot.updater_error_details(error)
         return error_details if error_details
@@ -150,26 +244,41 @@ module Dependabot
           )
         end
 
-        { "error-type": "unknown_error" }
+        Dependabot::ErrorDetails.new(error_type: "unknown_error", error_detail: nil)
       end
 
+      sig { params(error: StandardError).void }
       def log_unknown_error_with_backtrace(error)
         error_details = {
           ErrorAttributes::CLASS => error.class.to_s,
           ErrorAttributes::MESSAGE => error.message,
-          ErrorAttributes::BACKTRACE => error.backtrace.join("\n"),
-          ErrorAttributes::FINGERPRINT => error.respond_to?(:sentry_context) ? error.sentry_context[:fingerprint] : nil,
+          ErrorAttributes::BACKTRACE => error.backtrace&.join("\n"),
+          ErrorAttributes::FINGERPRINT => extract_fingerprint(error),
           ErrorAttributes::PACKAGE_MANAGER => job.package_manager,
           ErrorAttributes::JOB_ID => job.id,
           ErrorAttributes::DEPENDENCIES => job.dependencies,
-          ErrorAttributes::DEPENDENCY_GROUPS => job.dependency_groups
+          ErrorAttributes::DEPENDENCY_GROUPS => job.dependency_groups.map(&:to_h)
         }.compact
 
-        service.increment_metric("updater.update_job_unknown_error", tags: {
-          package_manager: job.package_manager,
-          class_name: error.class.name
-        })
+        service.increment_metric(
+          "updater.update_job_unknown_error",
+          tags: {
+            package_manager: job.package_manager,
+            class_name: error.class.name
+          }
+        )
         service.record_update_job_unknown_error(error_type: "unknown_error", error_details: error_details)
+      end
+
+      sig { params(error: StandardError).returns(T.nilable(T::Array[String])) }
+      def extract_fingerprint(error)
+        if error.respond_to?(:sentry_context)
+          context = T.cast(error, Dependabot::HasSentryContext).sentry_context
+          fingerprint = T.cast(context[:fingerprint], Object)
+          return fingerprint.map { |value| T.cast(value, Object).to_s } if fingerprint.is_a?(Array)
+        end
+
+        Dependabot::Sentry::ErrorFingerprint.for(error: error, package_manager: job.package_manager)
       end
     end
   end

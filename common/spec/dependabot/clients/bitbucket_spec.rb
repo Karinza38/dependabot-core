@@ -8,12 +8,14 @@ RSpec.describe Dependabot::Clients::Bitbucket do
   let(:current_user_url) { "https://api.bitbucket.org/2.0/user?fields=uuid" }
   let(:access_token) { "access_token" }
   let(:credentials) do
-    [Dependabot::Credential.new({
-      "type" => "git_source",
-      "host" => "bitbucket.org",
-      "username" => nil,
-      "token" => access_token
-    })]
+    [Dependabot::Credential.new(
+      {
+        "type" => "git_source",
+        "host" => "bitbucket.org",
+        "username" => nil,
+        "token" => access_token
+      }
+    )]
   end
   let(:branch) { "master" }
   let(:repo) { "test/repo" }
@@ -28,6 +30,60 @@ RSpec.describe Dependabot::Clients::Bitbucket do
     stub_request(:get, current_user_url)
       .with(headers: { "Authorization" => "Bearer #{access_token}" })
       .to_return(status: 200, body: fixture("bitbucket", "current_user.json"))
+  end
+
+  describe "#fetch_commit" do
+    subject(:fetch_commit) { client.fetch_commit(repo, branch) }
+
+    let(:branch_url) { "#{api_base_url}#{repo}/refs/branches/#{branch}" }
+
+    context "when the branch response is valid" do
+      before do
+        stub_request(:get, branch_url)
+          .to_return(status: 200, body: fixture("bitbucket", "other_branch.json"))
+      end
+
+      it { is_expected.to eq("4c2ea65f2eb932c438557cb6ec29b984794c6108") }
+    end
+
+    context "when the branch response has a malformed target" do
+      before do
+        stub_request(:get, branch_url)
+          .to_return(status: 200, body: '{"target":[]}')
+      end
+
+      it "raises a bad response error" do
+        expect { fetch_commit }
+          .to raise_error(Dependabot::PrivateSourceBadResponse, /Malformed Bitbucket response for branch/)
+      end
+    end
+  end
+
+  describe "#compare" do
+    subject(:compare) { client.compare(repo, "v1.0.0", "v2.0.0") }
+
+    let(:compare_url) { "#{api_base_url}#{repo}/commits/?include=v2.0.0&exclude=v1.0.0" }
+
+    context "when the comparison response is valid" do
+      before do
+        stub_request(:get, compare_url)
+          .to_return(status: 200, body: fixture("bitbucket", "business_compare_commits.json"))
+      end
+
+      it { is_expected.not_to be_empty }
+    end
+
+    context "when a comparison commit is malformed" do
+      before do
+        stub_request(:get, compare_url)
+          .to_return(status: 200, body: '{"values":[{"hash":"abc"}]}')
+      end
+
+      it "raises a bad response error" do
+        expect { compare }
+          .to raise_error(Dependabot::PrivateSourceBadResponse, /Malformed Bitbucket response for commit comparison/)
+      end
+    end
   end
 
   describe "#default_reviewers" do
@@ -155,27 +211,29 @@ RSpec.describe Dependabot::Clients::Bitbucket do
       specify { expect { pull_requests }.not_to raise_error }
 
       it {
-        expect(pull_requests).to eq([
-          {
-            "author" => {
-              "display_name" => "Author"
-            },
-            "description" => "Second pull request",
-            "destination" => {
-              "branch" => {
-                "name" => "target_branch"
-              }
-            },
-            "id" => 27,
-            "source" => {
-              "branch" => {
-                "name" => "source_branch"
-              }
-            },
-            "state" => "OPEN",
-            "title" => "Second pull request"
-          }
-        ])
+        expect(pull_requests).to eq(
+          [
+            {
+              "author" => {
+                "display_name" => "Author"
+              },
+              "description" => "Second pull request",
+              "destination" => {
+                "branch" => {
+                  "name" => "target_branch"
+                }
+              },
+              "id" => 27,
+              "source" => {
+                "branch" => {
+                  "name" => "source_branch"
+                }
+              },
+              "state" => "OPEN",
+              "title" => "Second pull request"
+            }
+          ]
+        )
       }
     end
 
@@ -195,27 +253,29 @@ RSpec.describe Dependabot::Clients::Bitbucket do
       specify { expect { pull_requests }.not_to raise_error }
 
       it {
-        expect(pull_requests).to eq([
-          {
-            "author" => {
-              "display_name" => "Author"
-            },
-            "description" => "Second pull request",
-            "destination" => {
-              "branch" => {
-                "name" => "target_branch"
-              }
-            },
-            "id" => 27,
-            "source" => {
-              "branch" => {
-                "name" => "source_branch"
-              }
-            },
-            "state" => "OPEN",
-            "title" => "Second pull request"
-          }
-        ])
+        expect(pull_requests).to eq(
+          [
+            {
+              "author" => {
+                "display_name" => "Author"
+              },
+              "description" => "Second pull request",
+              "destination" => {
+                "branch" => {
+                  "name" => "target_branch"
+                }
+              },
+              "id" => 27,
+              "source" => {
+                "branch" => {
+                  "name" => "source_branch"
+                }
+              },
+              "state" => "OPEN",
+              "title" => "Second pull request"
+            }
+          ]
+        )
       }
     end
 
@@ -235,29 +295,31 @@ RSpec.describe Dependabot::Clients::Bitbucket do
       specify { expect { pull_requests }.not_to raise_error }
 
       it {
-        expect(pull_requests).to eq([
-          {
-            "author" => {
-              "display_name" => "Pull request Author"
-            },
-            "created_on" => "2021-05-17T14:52:37.237653+00:00",
-            "description" => "Pull request description",
-            "destination" => {
-              "branch" => {
-                "name" => "target_branch"
-              }
-            },
-            "id" => 7,
-            "source" => {
-              "branch" => {
-                "name" => "branch_1"
-              }
-            },
-            "state" => "OPEN",
-            "title" => "Pull request title",
-            "updated_on" => "2021-05-17T14:52:37.237653+00:00"
-          }
-        ])
+        expect(pull_requests).to eq(
+          [
+            {
+              "author" => {
+                "display_name" => "Pull request Author"
+              },
+              "created_on" => "2021-05-17T14:52:37.237653+00:00",
+              "description" => "Pull request description",
+              "destination" => {
+                "branch" => {
+                  "name" => "target_branch"
+                }
+              },
+              "id" => 7,
+              "source" => {
+                "branch" => {
+                  "name" => "branch_1"
+                }
+              },
+              "state" => "OPEN",
+              "title" => "Pull request title",
+              "updated_on" => "2021-05-17T14:52:37.237653+00:00"
+            }
+          ]
+        )
       }
     end
   end

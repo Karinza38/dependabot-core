@@ -1,6 +1,9 @@
 # typed: strong
 # frozen_string_literal: true
 
+require "dependabot/security_advisory"
+require "dependabot/package/package_release"
+require "dependabot/git_tag_details"
 require "sorbet-runtime"
 
 module Dependabot
@@ -19,7 +22,9 @@ module Dependabot
             versions_array: T::Array[
               T.any(
                 T.all(T.type_parameter(:T), Gem::Version),
-                T.all(T.type_parameter(:T), T::Hash[Symbol, Gem::Version])
+                T.all(T.type_parameter(:T), T::Hash[Symbol, Gem::Version]),
+                T.all(T.type_parameter(:T), Dependabot::GitTagDetails),
+                T.all(T.type_parameter(:T), Dependabot::Package::PackageRelease)
               )],
             security_advisories: T::Array[SecurityAdvisory]
           )
@@ -30,6 +35,11 @@ module Dependabot
           security_advisories.any? do |a|
             if v.is_a?(Gem::Version)
               a.vulnerable?(v)
+            elsif v.is_a?(Dependabot::Package::PackageRelease)
+              a.vulnerable?(v.version)
+            elsif v.is_a?(Dependabot::GitTagDetails)
+              version = v.version
+              version ? a.vulnerable?(version) : false
             else
               a.vulnerable?(v.fetch(:version))
             end

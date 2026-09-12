@@ -1,7 +1,8 @@
-# typed: strict
+# typed: strong
 # frozen_string_literal: true
 
 require "dependabot/shared_helpers"
+require "dependabot/npm_and_yarn/constraint_helper"
 
 module Dependabot
   module NpmAndYarn
@@ -9,27 +10,34 @@ module Dependabot
       extend T::Sig
       extend T::Helpers
 
-      # For limited testing, allowing only specific versions defined in engines in package.json
-      # such as "20.8.7", "8.1.2", "8.21.2",
-      NODE_ENGINE_SUPPORTED_REGEX = /^\d+(?:\.\d+)*$/
-
-      sig { params(manifest_json: T::Hash[String, T.untyped], name: String).returns(T::Hash[Symbol, T.untyped]) }
-      def setup(manifest_json, name)
-        engine_versions = manifest_json["engines"]
-
+      # Sets up the requested engine version from the manifest engines.
+      #
+      # @param engine_versions [Hash] The manifest engine constraints.
+      # @param name [String] The engine name to match.
+      # @return [Hash] A hash with selected versions, if found.
+      sig do
+        params(
+          engine_versions: T.nilable(T::Hash[String, String]),
+          name: String,
+          dependabot_versions: T.nilable(T::Array[Dependabot::Version])
+        )
+          .returns(T::Hash[String, T.nilable(String)])
+      end
+      def setup(engine_versions, name, dependabot_versions = nil)
+        # Return an empty hash if no engine versions are specified
         return {} if engine_versions.nil?
 
-        # Only keep matching specs versions i.e. "20.21.2", "7.1.2",
-        # Additional specs can be added later
-        engine_versions.delete_if { |_key, value| !valid_extracted_version?(value) }
-        version = engine_versions.select { |engine, _value| engine.to_s.match(name) }
+        versions = T.let({}, T::Hash[String, T.nilable(String)])
 
-        version
-      end
+        engine_versions.each do |engine, value|
+          next unless engine == name
 
-      sig { params(version: String).returns(T::Boolean) }
-      def valid_extracted_version?(version)
-        version.match?(NODE_ENGINE_SUPPORTED_REGEX)
+          versions[name] = ConstraintHelper.find_highest_version_from_constraint_expression(
+            value, dependabot_versions
+          )
+        end
+
+        versions
       end
     end
   end

@@ -10,6 +10,7 @@ require "dependabot/dependency_snapshot"
 require "dependabot/service"
 require "dependabot/updater/error_handler"
 require "dependabot/updater/operations/create_group_update_pull_request"
+require "dependabot/updater/group_dependency_selector"
 require "dependabot/dependency_change_builder"
 require "dependabot/notices"
 
@@ -38,7 +39,8 @@ RSpec.describe Dependabot::Updater::Operations::CreateGroupUpdatePullRequest do
       record_update_job_error: nil,
       create_pull_request: nil,
       record_update_job_warning: nil,
-      record_ecosystem_meta: nil
+      record_ecosystem_meta: nil,
+      record_cooldown_meta: nil
     )
   end
   let(:mock_error_handler) { instance_double(Dependabot::Updater::ErrorHandler) }
@@ -50,22 +52,19 @@ RSpec.describe Dependabot::Updater::Operations::CreateGroupUpdatePullRequest do
   let(:job) do
     Dependabot::Job.new_update_job(
       job_id: "1558782000",
-      job_definition: job_definition_with_fetched_files
+      job_definition:
     )
   end
 
   let(:dependency_snapshot) do
     Dependabot::DependencySnapshot.create_from_job_definition(
-      job: job,
-      job_definition: job_definition_with_fetched_files
+      job:,
+      fetched_files:
     )
   end
 
-  let(:job_definition_with_fetched_files) do
-    job_definition.merge({
-      "base_commit_sha" => "mock-sha",
-      "base64_dependency_files" => encode_dependency_files(dependency_files)
-    })
+  let(:fetched_files) do
+    Dependabot::FetchedFiles.new(base_commit_sha: "mock-sha", dependency_files:)
   end
 
   let(:dependency_files) do
@@ -152,6 +151,167 @@ RSpec.describe Dependabot::Updater::Operations::CreateGroupUpdatePullRequest do
     Dependabot::Experiments.reset!
   end
 
+  describe "#perform" do
+    let(:failed_dependency) do
+      Dependabot::Dependency.new(
+        name: "dummy-pkg-b",
+        version: "1.0.0",
+        requirements: [],
+        package_manager: "bundler"
+      )
+    end
+
+    let(:dependency_group) do
+      instance_double(
+        Dependabot::DependencyGroup,
+        name: "dummy-group",
+        dependencies: [dependency, failed_dependency]
+      )
+    end
+
+    let(:dependency_change) do
+      instance_double(Dependabot::DependencyChange, updated_dependencies: updated_dependencies)
+    end
+
+    before do
+      allow(job).to receive_messages(
+        dependencies: [dependency.name, failed_dependency.name],
+        security_updates_only?: true
+      )
+      allow(create_group_update_pull_request).to receive(:dependency_change).and_return(dependency_change)
+    end
+
+    context "when the group has an updated dependency" do
+      let(:updated_dependencies) { [dependency] }
+
+      it "reports unhandled dependencies that failed to update" do
+        expect(mock_error_handler).to receive(:handle_dependency_error)
+          .with(
+            error: kind_of(Dependabot::DependabotError),
+            dependency: failed_dependency,
+            dependency_group: dependency_group
+          )
+
+        perform
+      end
+    end
+
+    context "when the group has no updated dependencies" do
+      let(:updated_dependencies) { [] }
+
+      before do
+        allow(dependency_snapshot).to receive(:all_handled_dependencies).and_return(Set[dependency.name])
+      end
+
+      it "does not report dependencies handled under different casing" do
+        allow(dependency_snapshot).to receive(:all_handled_dependencies)
+          .and_return(Set[dependency.name.upcase, failed_dependency.name.upcase])
+        expect(mock_error_handler).not_to receive(:handle_dependency_error)
+
+        perform
+      end
+
+      it "reports unhandled dependencies that failed to update" do
+        expect(mock_error_handler).to receive(:handle_dependency_error)
+          .with(
+            error: kind_of(Dependabot::DependabotError),
+            dependency: failed_dependency,
+            dependency_group: dependency_group
+          )
+
+        perform
+      end
+    end
+  end
+
+  describe "#perform with deferred security errors" do
+    let(:dependency) do
+      dependency_snapshot.all_dependencies.find { |candidate| candidate.name == "dummy-pkg-a" }
+    end
+    let(:dependency_group) do
+      Dependabot::DependencyGroup.new(name: "security", rules: { "patterns" => ["*"] }).tap do |group|
+        group.dependencies.push(dependency, successful_dependency)
+      end
+    end
+    let(:successful_dependency) do
+      dependency_snapshot.all_dependencies.find { |candidate| candidate.name == "dummy-git-dependency" }
+    end
+    let(:successful_update) do
+      Dependabot::Dependency.new(
+        name: successful_dependency.name,
+        version: "2.0.0",
+        previous_version: successful_dependency.version,
+        requirements: successful_dependency.requirements,
+        previous_requirements: successful_dependency.requirements,
+        package_manager: "bundler"
+      )
+    end
+    let(:stub_dependency_change) do
+      Dependabot::DependencyChange.new(
+        job: job,
+        updated_dependencies: [successful_update],
+        updated_dependency_files: dependency_files
+      )
+    end
+    let(:successful_checker) do
+      instance_double(
+        Dependabot::UpdateCheckers::Base,
+        dependency: successful_dependency,
+        lowest_security_fix_version: "2.0.0",
+        up_to_date?: false,
+        requirements_unlocked_or_can_be?: true,
+        can_update?: true,
+        updated_dependencies: [successful_update]
+      )
+    end
+
+    before do
+      allow(job).to receive_messages(
+        security_updates_only?: true,
+        updating_a_pull_request?: false,
+        dependencies: %w(dummy-pkg-a dummy-git-dependency),
+        allowed_update?: true,
+        security_advisories_for: [{}]
+      )
+      allow(stub_update_checker).to receive_messages(
+        can_update?: false,
+        lowest_resolvable_security_fix_version: nil
+      )
+      allow(stub_update_checker_class).to receive(:new) do |**arguments|
+        arguments.fetch(:dependency).name == dependency.name ? stub_update_checker : successful_checker
+      end
+    end
+
+    it "resolves the error details once and reports the captured payload" do
+      expect(stub_update_checker).to receive(:conflicting_dependencies).once.and_return([])
+      expect(mock_service).to receive(:record_update_job_error).with(
+        error_type: "security_update_not_possible",
+        error_details: {
+          "dependency-name": dependency.name,
+          "latest-resolvable-version": dependency.version,
+          "lowest-non-vulnerable-version": "2.0.0",
+          "conflicting-dependencies": []
+        },
+        dependency: nil
+      )
+      expect(mock_service).to receive(:create_pull_request)
+
+      perform
+    end
+
+    it "still creates a PR when resolving another dependency's error details fails" do
+      resolver_error = RuntimeError.new("resolver failed")
+      allow(stub_update_checker).to receive(:lowest_resolvable_security_fix_version).and_raise(resolver_error)
+      expect(mock_error_handler).to receive(:handle_dependency_error)
+        .with(error: resolver_error, dependency: dependency, dependency_group: dependency_group)
+      expect(mock_service).to receive(:create_pull_request) do |change, _base_commit|
+        expect(change.updated_dependencies.map(&:name)).to eq([successful_dependency.name])
+      end
+
+      expect { perform }.not_to raise_error
+    end
+  end
+
   describe "#dependency_change" do
     before do
       allow(dependency).to receive(:all_versions).and_return(["4.0.0", "4.1.0", "4.2.0"])
@@ -170,6 +330,93 @@ RSpec.describe Dependabot::Updater::Operations::CreateGroupUpdatePullRequest do
             .to include(warning_deprecation_notice)
 
           create_group_update_pull_request.perform
+        end
+      end
+
+      context "when GroupDependencySelector filtering is enabled" do
+        let(:dependency_b) do
+          Dependabot::Dependency.new(
+            name: "dummy-pkg-b",
+            version: "1.0.0",
+            requirements: [{
+              file: "Gemfile",
+              requirement: "~> 1.0.0",
+              groups: ["default"],
+              source: nil
+            }],
+            package_manager: "bundler",
+            metadata: { all_versions: ["1.0.0"] }
+          )
+        end
+
+        let(:dependency_group) do
+          Dependabot::DependencyGroup.new(
+            name: "dummy-group",
+            rules: { "patterns" => ["dummy-pkg-a"] }
+          )
+        end
+
+        let(:stub_dependency_change_with_multiple_deps) do
+          Dependabot::DependencyChange.new(
+            job: job,
+            updated_dependencies: [dependency, dependency_b],
+            updated_dependency_files: []
+          )
+        end
+
+        before do
+          # Mock the job to allow all updates for simplicity
+          allow(job).to receive(:allowed_update?).and_return(true)
+        end
+
+        it "filters out dependencies not in the group" do
+          # Override the dependency change builder to return our test change
+          allow(create_group_update_pull_request).to receive(:compile_all_dependency_changes_for)
+            .with(dependency_group)
+            .and_return(stub_dependency_change_with_multiple_deps)
+
+          result = create_group_update_pull_request.send(:dependency_change)
+
+          # Only dummy-pkg-a should remain after filtering (dummy-pkg-b should be filtered out)
+          expect(result.updated_dependencies.map(&:name)).to eq(["dummy-pkg-a"])
+        end
+
+        it "handles empty dependency changes gracefully" do
+          empty_change = Dependabot::DependencyChange.new(
+            job: job,
+            updated_dependencies: [],
+            updated_dependency_files: []
+          )
+
+          allow(create_group_update_pull_request).to receive(:compile_all_dependency_changes_for)
+            .with(dependency_group)
+            .and_return(empty_change)
+
+          result = create_group_update_pull_request.send(:dependency_change)
+
+          expect(result.updated_dependencies).to be_empty
+        end
+
+        it "preserves dependency files during filtering" do
+          dependency_file = instance_double(
+            Dependabot::DependencyFile,
+            name: "Gemfile.lock",
+            directory: "."
+          )
+          change_with_files = Dependabot::DependencyChange.new(
+            job: job,
+            updated_dependencies: [dependency, dependency_b],
+            updated_dependency_files: [dependency_file]
+          )
+
+          allow(create_group_update_pull_request).to receive(:compile_all_dependency_changes_for)
+            .with(dependency_group)
+            .and_return(change_with_files)
+
+          result = create_group_update_pull_request.send(:dependency_change)
+
+          # Files should be preserved even after dependency filtering
+          expect(result.updated_dependency_files).to eq([dependency_file])
         end
       end
     end

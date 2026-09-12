@@ -1,4 +1,4 @@
-# typed: true
+# typed: strong
 # frozen_string_literal: true
 
 require "sorbet-runtime"
@@ -14,8 +14,12 @@ module Dependabot
 
       abstract!
 
-      sig { returns(Dependabot::Service) }
-      attr_reader :service
+      private
+
+      sig { abstract.returns(Dependabot::Service) }
+      def service; end
+
+      public
 
       sig { params(dependency: Dependabot::Dependency).void }
       def record_security_update_not_needed_error(dependency)
@@ -65,12 +69,25 @@ module Dependabot
 
       sig { params(checker: Dependabot::UpdateCheckers::Base).void }
       def record_security_update_not_possible_error(checker)
+        service.record_update_job_error(
+          error_type: "security_update_not_possible",
+          error_details: security_update_not_possible_error_details(checker)
+        )
+      end
+
+      sig do
+        params(
+          checker: Dependabot::UpdateCheckers::Base,
+          conflicting_dependencies: T.nilable(T::Array[Dependabot::UpdateCheckers::Conflict])
+        ).returns(Dependabot::ErrorDetails::Detail)
+      end
+      def security_update_not_possible_error_details(checker, conflicting_dependencies: nil)
         latest_allowed_version =
           (checker.lowest_resolvable_security_fix_version ||
            checker.dependency.version)&.to_s
         lowest_non_vulnerable_version =
-          checker.lowest_security_fix_version.to_s
-        conflicting_dependencies = checker.conflicting_dependencies
+          checker.lowest_security_fix_version&.to_s
+        conflicting_dependencies ||= checker.conflicting_dependencies
 
         Dependabot.logger.info(
           security_update_not_possible_message(checker, T.must(latest_allowed_version), conflicting_dependencies)
@@ -79,15 +96,12 @@ module Dependabot
           earliest_fixed_version_message(lowest_non_vulnerable_version)
         )
 
-        service.record_update_job_error(
-          error_type: "security_update_not_possible",
-          error_details: {
-            "dependency-name": checker.dependency.name,
-            "latest-resolvable-version": latest_allowed_version,
-            "lowest-non-vulnerable-version": lowest_non_vulnerable_version,
-            "conflicting-dependencies": conflicting_dependencies
-          }
-        )
+        {
+          "dependency-name": checker.dependency.name,
+          "latest-resolvable-version": latest_allowed_version,
+          "lowest-non-vulnerable-version": lowest_non_vulnerable_version,
+          "conflicting-dependencies": conflicting_dependencies
+        }
       end
 
       sig { params(checker: Dependabot::UpdateCheckers::Base).void }
@@ -126,7 +140,7 @@ module Dependabot
           {
             "dependency-name": dep.name,
             "dependency-version": dep.version,
-            "dependency-removed": dep.removed? ? true : nil
+            "dependency-removed": dep.removed? || nil
           }.compact
         end
 
@@ -148,10 +162,10 @@ module Dependabot
 
       sig { params(lowest_non_vulnerable_version: T.nilable(String)).returns(String) }
       def earliest_fixed_version_message(lowest_non_vulnerable_version)
-        if lowest_non_vulnerable_version
+        if lowest_non_vulnerable_version && !lowest_non_vulnerable_version.empty?
           "The earliest fixed version is #{lowest_non_vulnerable_version}."
         else
-          "Dependabot could not find a non-vulnerable version"
+          "Dependabot could not find an allowed non-vulnerable version"
         end
       end
 
@@ -159,14 +173,14 @@ module Dependabot
         params(
           checker: Dependabot::UpdateCheckers::Base,
           latest_allowed_version: String,
-          conflicting_dependencies: T::Array[T::Hash[String, String]]
+          conflicting_dependencies: T::Array[Dependabot::UpdateCheckers::Conflict]
         )
           .returns(String)
       end
       def security_update_not_possible_message(checker, latest_allowed_version, conflicting_dependencies)
         if conflicting_dependencies.any?
           dep_messages = conflicting_dependencies.map do |dep|
-            "  #{dep['explanation']}"
+            "  #{T.cast(dep['explanation'], String)}"
           end.join("\n")
 
           dependencies_pluralized =
@@ -186,10 +200,26 @@ module Dependabot
       extend T::Sig
       extend T::Helpers
 
-      sig { returns(Dependabot::Service) }
-      attr_reader :service
-
       abstract!
+
+      # Curated `operation` tag values shared by the `blocked_versions.*` metrics.
+      # Defined once here so the "soft" (ignored) per-operation call sites and the
+      # "hard" (enforced) ErrorHandler translation stay in lockstep on one label
+      # set rather than re-listing the same strings in two places.
+      module BlockedVersionsOperation
+        VERSION_UPDATE = "version_update"
+        SECURITY_UPDATE = "security_update"
+        REFRESH_SECURITY_UPDATE = "refresh_security_update"
+        REFRESH_VERSION_UPDATE = "refresh_version_update"
+        GROUP_UPDATE = "group_update"
+      end
+
+      private
+
+      sig { abstract.returns(Dependabot::Service) }
+      def service; end
+
+      public
 
       sig { params(notices: T.nilable(T::Array[Dependabot::Notice])).void }
       def record_warning_notices(notices)
@@ -202,15 +232,15 @@ module Dependabot
           # If alert is enabled, sending the deprecation notice to the service for showing on the UI insight page
           send_alert_notice(notice) if notice.show_alert
         end
-        rescue StandardError => e
-          Dependabot.logger.error(
-            "Failed to send notice warning: #{e.message}"
-          )
+      rescue StandardError => e
+        Dependabot.logger.error(
+          "Failed to send notice warning: #{e.message}"
+        )
       end
 
       private
 
-      # Resurns unique warning notices which are going to be shown on insight page.
+      # Returns unique warning notices which are going to be shown on insight page.
       sig { params(notices: T::Array[Dependabot::Notice]).returns(T::Array[Dependabot::Notice]) }
       def unique_warn_notices(notices)
         notices
@@ -225,6 +255,57 @@ module Dependabot
           warn_type: notice.type,
           warn_title: notice.title,
           warn_description: notice.description
+        )
+      end
+
+      # Emits a counter when a GitHub Security blocklist entry applies to a
+      # dependency Core is actively checking for updates.
+      #
+      # This is the "soft" block status. When a block applies, the blocked
+      # versions are folded into the resolver's ignore conditions so they can't
+      # be selected - but they sit alongside the user's own ignores (dependabot.yml
+      # ignore rules and allow update-types), all merged into `ignore_conditions_for`.
+      # Because of that merge, the downstream `AllVersionsIgnored` outcome can't be
+      # attributed to blocking vs ignoring without re-resolving. We therefore only
+      # measure the one block-specific fact Core can observe cleanly: that a Security
+      # block was in effect for this dependency check (presence), not that it
+      # excluded a specific candidate version (causation).
+      #
+      # This pairs with the "hard" status `blocked_versions.enforced` (the
+      # transitive-enforcement path that rejects PR creation) under the shared
+      # `blocked_versions.*` namespace.
+      sig { params(job: Dependabot::Job, dependency: Dependabot::Dependency, operation: String).void }
+      def record_blocked_version_ignored(job:, dependency:, operation:)
+        return unless job.blocked_versions_for?(dependency)
+
+        record_blocked_versions_metric(status: "ignored", job: job, operation: operation)
+      end
+
+      # Emits a counter when a GitHub Security blocklist entry causes a selected
+      # update to be rejected outright: regenerating the lockfile would have
+      # introduced a blocked transitive version, so the whole change is dropped.
+      #
+      # This is the "hard" block status. It pairs with the "soft" status
+      # `blocked_versions.ignored` (recorded at check time when a block is folded
+      # into the resolver's ignore conditions) under the shared `blocked_versions.*`
+      # namespace, so the two correlate cleanly on the service side.
+      sig { params(job: Dependabot::Job, operation: String).void }
+      def record_blocked_version_enforced(job:, operation:)
+        record_blocked_versions_metric(status: "enforced", job: job, operation: operation)
+      end
+
+      # Shared emitter for the `blocked_versions.*` counter family. Both the
+      # "soft" (ignored) and "hard" (enforced) statuses report the same
+      # `operation` and `package_manager` dimensions, differing only in the
+      # status suffix, so callers correlate cleanly on the service side.
+      sig { params(status: String, job: Dependabot::Job, operation: String).void }
+      def record_blocked_versions_metric(status:, job:, operation:)
+        service.increment_metric(
+          "blocked_versions.#{status}",
+          tags: {
+            operation: operation,
+            package_manager: job.package_manager
+          }
         )
       end
     end

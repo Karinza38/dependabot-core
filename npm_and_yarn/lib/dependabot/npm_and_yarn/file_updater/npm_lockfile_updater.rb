@@ -1,6 +1,7 @@
 # typed: strict
 # frozen_string_literal: true
 
+require "json"
 require "sorbet-runtime"
 
 require "dependabot/errors"
@@ -10,10 +11,10 @@ require "dependabot/npm_and_yarn/file_parser"
 require "dependabot/npm_and_yarn/file_updater"
 require "dependabot/npm_and_yarn/helpers"
 require "dependabot/npm_and_yarn/native_helpers"
-require "dependabot/npm_and_yarn/update_checker/registry_finder"
+require "dependabot/npm_and_yarn/package/registry_finder"
 require "dependabot/shared_helpers"
 
-# rubocop:disable Metrics/ClassLength
+# rubocop:disable-next Metrics/ClassLength
 module Dependabot
   module NpmAndYarn
     class FileUpdater < Dependabot::FileUpdaters::Base
@@ -28,15 +29,26 @@ module Dependabot
             lockfile: Dependabot::DependencyFile,
             dependencies: T::Array[Dependabot::Dependency],
             dependency_files: T::Array[Dependabot::DependencyFile],
-            credentials: T::Array[Credential]
+            credentials: T::Array[Credential],
+            security_updates_only: T::Boolean,
+            release_age_days: T.nilable(Integer)
           )
             .void
         end
-        def initialize(lockfile:, dependencies:, dependency_files:, credentials:)
+        def initialize(
+          lockfile:,
+          dependencies:,
+          dependency_files:,
+          credentials:,
+          security_updates_only: false,
+          release_age_days: nil
+        )
           @lockfile = lockfile
           @dependencies = dependencies
           @dependency_files = dependency_files
           @credentials = credentials
+          @security_updates_only = security_updates_only
+          @release_age_days = release_age_days
         end
 
         sig { returns(Dependabot::DependencyFile) }
@@ -44,6 +56,12 @@ module Dependabot
           updated_file = lockfile.dup
           updated_file.content = updated_lockfile_content
           updated_file
+        end
+
+        sig { returns(T::Hash[Dependabot::DependencyFile, String]) }
+        def updated_package_json_files
+          updated_lockfile_content
+          @updated_package_json_files || {}
         end
 
         sig { params(response: Exception).returns(T.noreturn) }
@@ -65,6 +83,11 @@ module Dependabot
         sig { returns(T::Array[Credential]) }
         attr_reader :credentials
 
+        sig { returns(T::Boolean) }
+        def security_updates_only?
+          @security_updates_only
+        end
+
         UNREACHABLE_GIT = /fatal: repository '(?<url>.*)' not found/
         FORBIDDEN_GIT = /fatal: Authentication failed for '(?<url>.*)'/
         FORBIDDEN_PACKAGE = %r{(?<package_req>[^/]+) - (Forbidden|Unauthorized)}
@@ -84,8 +107,11 @@ module Dependabot
         NPM_PACKAGE_REGISTRY = "https://npm.pkg.github.com"
         EOVERRIDE = /EOVERRIDE\n *.* Override for (?<deps>.*) conflicts with direct dependency/
         NESTED_ALIAS = /nested aliases not supported/
-        PEER_DEPS_PATTERNS = T.let([/Cannot read properties of null/,
-                                    /ERESOLVE overriding peer dependency/].freeze, T::Array[Regexp])
+        PEER_DEPS_PATTERNS = T.let(
+          [/Cannot read properties of null/,
+           /ERESOLVE overriding peer dependency/].freeze,
+          T::Array[Regexp]
+        )
         PREMATURE_CLOSE = /premature close/
         EMPTY_OBJECT_ERROR = /Object for dependency "(?<package>.*)" is empty/
         ERROR_E401 = /code E401/
@@ -93,10 +119,13 @@ module Dependabot
         REQUEST_ERROR_E403 = /Request "(?<pkg>.*)" returned a 403/
         ERROR_EAI_AGAIN = /request to (?<url>.*) failed, reason: getaddrinfo EAI_AGAIN/
 
-        NPM_PACKAGE_NOT_FOUND_CODES = T.let([
-          /Couldn't find package "(?<pkg>.*)" on the "(?<regis>.*)" registry./,
-          /Couldn't find package "(?<pkg>.*)" required by "(?<dep>.*)" on the "(?<regis>.*)" registry./
-        ].freeze, T::Array[Regexp])
+        NPM_PACKAGE_NOT_FOUND_CODES = T.let(
+          [
+            /Couldn't find package "(?<pkg>.*)" on the "(?<regis>.*)" registry./,
+            /Couldn't find package "(?<pkg>.*)" required by "(?<dep>.*)" on the "(?<regis>.*)" registry./
+          ].freeze,
+          T::Array[Regexp]
+        )
 
         # dependency access protocol not supported by packagemanager
         UNSUPPORTED_PROTOCOL = /EUNSUPPORTEDPROTOCOL\n(.*?)Unsupported URL Type "(?<access_method>.*)"/
@@ -113,6 +142,13 @@ module Dependabot
         # Invalid version format found for dependency in package.json file
         INVALID_VERSION = /Invalid Version: (?<ver>.*)/
 
+        # Invalid package manager specification in package.json
+        INVALID_PACKAGE_MANAGER_SPEC = /Invalid package manager specification/
+
+        # Invalid npm authentication configuration
+        ERR_INVALID_AUTH = /npm error code ERR_INVALID_AUTH/
+        INVALID_AUTH_CONFIG = /Invalid auth configuration found.*_auth.*must be renamed to/
+
         # TODO: look into fixing this in npm, seems like a bug in the git
         # downloader introduced in npm 7
         #
@@ -126,10 +162,18 @@ module Dependabot
           return lockfile.content if npmrc_disables_lockfile?
           return lockfile.content unless updatable_dependencies.any?
 
+          # Set dependency files and credentials for automatic env variable injection
+          Helpers.dependency_files = dependency_files
+          Helpers.credentials = credentials
+
           @updated_lockfile_content ||= T.let(
             SharedHelpers.in_a_temporary_directory do
               write_temporary_dependency_files
               updated_files = Dir.chdir(lockfile_directory) { run_current_npm_update }
+              @updated_package_json_files = T.let(
+                capture_updated_package_json_files,
+                T.nilable(T::Hash[Dependabot::DependencyFile, String])
+              )
               updated_lockfile_content = updated_files.fetch(lockfile_basename)
               post_process_npm_lockfile(updated_lockfile_content)
             end,
@@ -222,8 +266,10 @@ module Dependabot
             )
           end
 
-          run_npm_updater(top_level_dependencies: previous_top_level_dependencies,
-                          sub_dependencies: previous_sub_dependencies)
+          run_npm_updater(
+            top_level_dependencies: previous_top_level_dependencies,
+            sub_dependencies: previous_sub_dependencies
+          )
         end
 
         sig do
@@ -248,22 +294,7 @@ module Dependabot
 
         sig { params(top_level_dependencies: T::Array[Dependabot::Dependency]).returns(T::Hash[String, String]) }
         def run_npm_top_level_updater(top_level_dependencies:)
-          if npm8?
-            run_npm8_top_level_updater(top_level_dependencies: top_level_dependencies)
-          else
-            T.cast(
-              SharedHelpers.run_helper_subprocess(
-                command: NativeHelpers.helper_path,
-                function: "npm6:update",
-                args: [
-                  Dir.pwd,
-                  lockfile_basename,
-                  top_level_dependencies.map(&:to_h)
-                ]
-              ),
-              T::Hash[String, String]
-            )
-          end
+          run_npm8_top_level_updater(top_level_dependencies: top_level_dependencies)
         end
 
         sig { params(top_level_dependencies: T::Array[Dependabot::Dependency]).returns(T::Hash[String, String]) }
@@ -272,26 +303,36 @@ module Dependabot
             dependency_in_package_json?(dependency)
           end
 
-          unless dependencies_in_current_package_json
-            # NOTE: When updating a dependency in a nested workspace project, npm
-            # will add the dependency as a new top-level dependency to the root
-            # lockfile. To overcome this, we save the content before the update,
-            # and then re-run `npm install` after the update against the previous
-            # content to remove that
-            previous_package_json = File.read(T.must(package_json).name)
-          end
+          previous_package_json = File.read(T.must(package_json).name) unless dependencies_in_current_package_json
 
           # TODO: Update the npm 6 updater to use these args as we currently
           # do the same in the js updater helper, we've kept it separate for
           # the npm 7 rollout
-          install_args = top_level_dependencies.map { |dependency| npm_install_args(dependency) }
 
-          run_npm_install_lockfile_only(install_args)
+          top_level_dependencies.each do |dependency|
+            install_args = [npm_install_args(dependency)]
+            is_optional = optional_dependency?(dependency)
+
+            # When the dependency lives in a workspace package (not the root
+            # package.json), pass --workspace so npm installs it in the correct
+            # context. Without this, npm temporarily adds the dependency to the
+            # root, which strips dev flags and can remove nested optional peer
+            # dependencies during tree resolution (see GitHub issue #14110).
+            unless dependency_in_package_json?(dependency)
+              workspace_directories_for(dependency).each do |dir|
+                install_args << "--workspace=#{dir}"
+              end
+            end
+
+            run_npm_install_lockfile_only(install_args, has_optional_dependencies: is_optional)
+          end
 
           unless dependencies_in_current_package_json
             File.write(T.must(package_json).name, previous_package_json)
 
-            run_npm_install_lockfile_only
+            # Clean up any remaining side effects from the workspace install:
+            # spurious root lockfile entries and removed optional peer deps.
+            cleanup_workspace_lockfile(previous_package_json)
           end
 
           { lockfile_basename => File.read(lockfile_basename) }
@@ -301,25 +342,36 @@ module Dependabot
           params(sub_dependencies: T::Array[Dependabot::Dependency]).returns(T.nilable(T::Hash[String, String]))
         end
         def run_npm_subdependency_updater(sub_dependencies:)
-          if npm8?
-            run_npm8_subdependency_updater(sub_dependencies: sub_dependencies)
-          else
-            T.cast(
-              SharedHelpers.run_helper_subprocess(
-                command: NativeHelpers.helper_path,
-                function: "npm6:updateSubdependency",
-                args: [Dir.pwd, lockfile_basename, sub_dependencies.map(&:to_h)]
-              ),
-              T.nilable(T::Hash[String, String])
-            )
-          end
+          run_npm8_subdependency_updater(sub_dependencies: sub_dependencies)
         end
 
         sig { params(sub_dependencies: T::Array[Dependabot::Dependency]).returns(T::Hash[String, String]) }
         def run_npm8_subdependency_updater(sub_dependencies:)
           dependency_names = sub_dependencies.map(&:name)
-          NativeHelpers.run_npm8_subdependency_update_command(dependency_names)
-          { lockfile_basename => File.read(lockfile_basename) }
+          original_content = File.read(lockfile_basename)
+
+          NativeHelpers.run_npm8_subdependency_update_command(
+            dependency_names,
+            min_release_age_arg: effective_min_release_age_arg
+          )
+
+          updated_content = File.read(lockfile_basename)
+          if updated_content == original_content && Dependabot::Experiments.enabled?(:enable_audit_fix_fallback)
+            # `npm update` is a no-op for transitive dependencies not listed in
+            # any package.json (common in workspace repos). Fall back to
+            # `npm audit fix` which can update these in the lockfile.
+            # npm audit fix exits non-zero when vulnerabilities remain, so we
+            # rescue and use whatever lockfile changes it managed to make.
+            begin
+              NativeHelpers.run_npm_audit_fix_command(min_release_age_arg: effective_min_release_age_arg)
+              sub_dependencies.each { |dep| dep.metadata[:audit_fix_used] = true }
+            rescue SharedHelpers::HelperSubprocessFailed
+              Dependabot.logger.info("npm audit fix failed or partially fixed — continuing with any changes made")
+            end
+            updated_content = File.read(lockfile_basename)
+          end
+
+          { lockfile_basename => updated_content }
         end
 
         sig { params(dependency: Dependabot::Dependency).returns(T.nilable(String)) }
@@ -346,38 +398,99 @@ module Dependabot
         #
         # Other npm flags:
         # - `--force` ignores checks for platform (os, cpu) and engines
-        # - `--dry-run=false` the updater sets a global .npmrc with `dry-run: true`
-        #   to work around an issue in npm 6, we don't want that here
         # - `--ignore-scripts` disables prepare and prepack scripts which are
         #   run when installing git dependencies
-        sig { params(install_args: T::Array[String]).returns(String) }
-        def run_npm_install_lockfile_only(install_args = [])
-          command = [
+        # - `--save-optional` when updating optional dependencies to ensure they
+        #   stay in optionalDependencies section and allow version upgrades
+        sig { params(install_args: T::Array[String], has_optional_dependencies: T::Boolean).returns(String) }
+        def run_npm_install_lockfile_only(install_args = [], has_optional_dependencies: false)
+          command_args = [
             "install",
             *install_args,
             "--force",
-            "--dry-run",
-            "false",
             "--ignore-scripts",
             "--package-lock-only"
-          ].join(" ")
+          ]
 
-          fingerprint = [
+          command_args << "--save-optional" if has_optional_dependencies
+          min_release_age_arg = effective_min_release_age_arg
+          command_args << min_release_age_arg if min_release_age_arg
+
+          command = command_args.join(" ")
+
+          fingerprint_args = [
             "install",
             install_args.empty? ? "" : "<install_args>",
             "--force",
-            "--dry-run",
-            "false",
             "--ignore-scripts",
             "--package-lock-only"
-          ].join(" ")
+          ]
+
+          fingerprint_args << "--save-optional" if has_optional_dependencies
+          # The cooldown day value varies per job, so keep it out of the fingerprint.
+          fingerprint_args << fingerprint_min_release_age_arg(min_release_age_arg) if min_release_age_arg
+
+          fingerprint = fingerprint_args.join(" ")
 
           Helpers.run_npm_command(command, fingerprint: fingerprint)
         end
 
+        # Returns the `--min-release-age` argument to pass to npm (`install`,
+        # `update`, or `audit fix`), or nil when none applies. Security updates pass
+        # `=0` so a release-age gate never blocks a fix (this intentionally
+        # overrides any `.npmrc` gate). Regular updates pass the dependabot.yml
+        # cooldown floor (in days) so npm holds transitive dependencies back to
+        # versions at least that old. Requires npm >= 11.10 (the updater image
+        # ships a supporting version).
+        #
+        # When the repo also sets an explicit `min-release-age` in `.npmrc`, the
+        # longest release-age wins: the cooldown floor is only injected on the CLI
+        # when it exceeds the user's configured value, otherwise the user's (equal
+        # or longer) gate is left untouched so neither policy is silently weakened.
+        sig { returns(T.nilable(String)) }
+        def effective_min_release_age_arg
+          return nil unless npm_supports_min_release_age?
+
+          return "--min-release-age=0" if security_updates_only?
+
+          effective = Helpers.higher_release_age_gate(@release_age_days, npmrc_min_release_age)
+          return nil unless effective
+
+          "--min-release-age=#{effective}"
+        end
+
+        # Whether the npm that will run supports `--min-release-age` (npm 11.10+).
+        # npm runs through Corepack, so a repo pinned to an older npm via
+        # `packageManager` would reject the flag; gate it out for those. Memoized so
+        # the version subprocess runs at most once per update.
+        sig { returns(T::Boolean) }
+        def npm_supports_min_release_age?
+          @npm_supports_min_release_age = T.let(@npm_supports_min_release_age, T.nilable(T::Boolean))
+          return @npm_supports_min_release_age unless @npm_supports_min_release_age.nil?
+
+          @npm_supports_min_release_age = Helpers.npm_supports_min_release_age?
+        end
+
+        sig { params(arg: String).returns(String) }
+        def fingerprint_min_release_age_arg(arg)
+          arg == "--min-release-age=0" ? arg : "--min-release-age=<days>"
+        end
+
+        # The `min-release-age` (in days) configured across the repo's `.npmrc`
+        # files, or nil when unset. A value we cannot parse as a bare integer is
+        # reported as Float::INFINITY so an explicit-but-non-numeric user gate is
+        # never overridden by the cooldown floor.
+        sig { returns(T.nilable(T.any(Integer, Float))) }
+        def npmrc_min_release_age
+          Helpers.max_configured_release_age(
+            dependency_files,
+            [Helpers::ReleaseAgeGateSetting.new(filename: ".npmrc", key: "min-release-age", separator: "=")]
+          )
+        end
+
         sig { params(dependency: Dependabot::Dependency).returns(String) }
         def npm_install_args(dependency)
-          git_requirement = dependency.requirements.find { |req| req[:source] && req[:source][:type] == "git" }
+          git_requirement = dependency.requirements.find { |req| req.source_string("type") == "git" }
 
           if git_requirement
             # NOTE: For git dependencies we loose some information about the
@@ -386,7 +499,7 @@ module Dependabot
             # `dependabot/depeendabot-core#semver:^0.1` - this is required to
             # pass the correct install argument to `npm install`
             updated_version_requirement = updated_version_requirement_for_dependency(dependency)
-            updated_version_requirement ||= git_requirement[:source][:url]
+            updated_version_requirement ||= T.must(git_requirement.source_string("url"))
 
             # NOTE: Git is configured to auth over https while updating
             updated_version_requirement = updated_version_requirement.gsub(
@@ -395,7 +508,7 @@ module Dependabot
 
             # NOTE: Keep any semver range that has already been updated by the
             # PackageJsonUpdater when installing the new version
-            if updated_version_requirement.include?(dependency.version)
+            if updated_version_requirement.include?(T.must(dependency.version))
               "#{dependency.name}@#{updated_version_requirement}"
             else
               "#{dependency.name}@#{updated_version_requirement.sub(/#.*/, '')}##{dependency.version}"
@@ -408,7 +521,7 @@ module Dependabot
         sig { params(dependency: Dependabot::Dependency).returns(T::Boolean) }
         def dependency_in_package_json?(dependency)
           dependency.requirements.any? do |req|
-            req[:file] == T.must(package_json).name
+            req.file == T.must(package_json).name
           end
         end
 
@@ -417,6 +530,38 @@ module Dependabot
           lockfile_dependencies.any? do |dep|
             dep.name == dependency.name
           end
+        end
+
+        sig { params(dependency: Dependabot::Dependency).returns(T::Boolean) }
+        def optional_dependency?(dependency)
+          dependency.requirements.any? do |req|
+            req.groups&.include?("optionalDependencies") || false
+          end
+        end
+
+        # Returns the workspace directories (relative to root) that contain
+        # the given dependency. Reads the actual package files on disk rather
+        # than the requirement :file paths, which may not match the workspace
+        # directory layout exactly.
+        sig { params(dependency: Dependabot::Dependency).returns(T::Array[String]) }
+        def workspace_directories_for(dependency)
+          root_pkg_name = T.must(package_json).name
+
+          package_files
+            .reject { |f| f.name == root_pkg_name }
+            .select { |f| package_json_contains_dependency?(f, dependency) }
+            .map { |f| File.dirname(f.name) }
+        end
+
+        sig { params(file: Dependabot::DependencyFile, dependency: Dependabot::Dependency).returns(T::Boolean) }
+        def package_json_contains_dependency?(file, dependency)
+          content = File.read(file.name)
+          pkg = JSON.parse(content)
+          %w(dependencies devDependencies peerDependencies optionalDependencies).any? do |dep_type|
+            pkg.fetch(dep_type, {}).key?(dependency.name)
+          end
+        rescue JSON::ParserError
+          false
         end
 
         # rubocop:disable Metrics/AbcSize
@@ -631,6 +776,20 @@ module Dependabot
             raise Dependabot::DependencyFileNotResolvable, msg
           end
 
+          # Handle invalid package manager specification in package.json
+          if error_message.match?(INVALID_PACKAGE_MANAGER_SPEC)
+            msg = "Invalid package manager specification in package.json. " \
+                  "The packageManager field must specify a valid semver version"
+            raise Dependabot::DependencyFileNotResolvable, msg
+          end
+
+          if error_message.match?(ERR_INVALID_AUTH) || error_message.match?(INVALID_AUTH_CONFIG)
+            msg = "Invalid npm authentication configuration found " \
+                  "The _auth setting in .npmrc needs to be scoped to the specific registry." \
+                  "Please update your .npmrc configuration to use registry-specific auth settings."
+            raise Dependabot::PrivateSourceAuthenticationFailure, msg
+          end
+
           raise error
         end
         # rubocop:enable Metrics/AbcSize
@@ -669,15 +828,15 @@ module Dependabot
 
           raise_resolvability_error(error_message) unless missing_dep
 
-          reg = NpmAndYarn::UpdateChecker::RegistryFinder.new(
+          reg = Package::RegistryFinder.new(
             dependency: missing_dep,
             credentials: credentials,
-            npmrc_file: dependency_files. find { |f| f.name.end_with?(".npmrc") },
-            yarnrc_file: dependency_files. find { |f| f.name.end_with?(".yarnrc") },
+            npmrc_file: dependency_files.find { |f| f.name.end_with?(".npmrc") },
+            yarnrc_file: dependency_files.find { |f| f.name.end_with?(".yarnrc") },
             yarnrc_yml_file: dependency_files.find { |f| f.name.end_with?(".yarnrc.yml") }
           ).registry
 
-          return if UpdateChecker::RegistryFinder.central_registry?(reg) && !package_name.start_with?("@")
+          return if Package::RegistryFinder.central_registry?(reg) && !package_name.start_with?("@")
 
           raise Dependabot::PrivateSourceAuthenticationFailure, reg
         end
@@ -715,6 +874,11 @@ module Dependabot
 
           File.write(File.join(lockfile_directory, ".npmrc"), npmrc_content)
 
+          @pre_npm_package_json_contents = T.let(
+            {},
+            T.nilable(T::Hash[String, String])
+          )
+
           package_files.each do |file|
             path = file.name
             FileUtils.mkdir_p(Pathname.new(path).dirname)
@@ -740,7 +904,23 @@ module Dependabot
 
             updated_content = package_json_preparer.remove_invalid_characters(updated_content)
 
+            T.must(@pre_npm_package_json_contents)[file.name] = updated_content
             File.write(file.name, updated_content)
+          end
+        end
+
+        sig { returns(T::Hash[Dependabot::DependencyFile, String]) }
+        def capture_updated_package_json_files
+          pre_npm_contents = @pre_npm_package_json_contents || {}
+          package_files.each_with_object({}) do |file, updates|
+            next if file.name == T.must(package_json).name
+            next unless File.exist?(file.name)
+
+            updated_content = File.read(file.name)
+            pre_npm_content = pre_npm_contents[file.name] || file.content
+            next if updated_content == pre_npm_content
+
+            updates[file] = updated_content
           end
         end
 
@@ -894,8 +1074,6 @@ module Dependabot
             .returns(String)
         end
         def restore_packages_name(updated_lockfile_content, parsed_updated_lockfile_content)
-          return updated_lockfile_content unless npm8?
-
           current_name = parsed_updated_lockfile_content.dig("packages", "", "name")
           original_name = parsed_lockfile.dig("packages", "", "name")
 
@@ -973,8 +1151,6 @@ module Dependabot
             .returns(String)
         end
         def restore_locked_package_dependencies(updated_lockfile_content, parsed_updated_lockfile_content)
-          return updated_lockfile_content unless npm8?
-
           dependency_names_to_restore = (dependencies.map(&:name) + git_dependencies_to_lock.keys).uniq
 
           NpmAndYarn::FileParser.each_dependency(parsed_package_json) do |dependency_name, original_requirement, type|
@@ -1014,14 +1190,8 @@ module Dependabot
             # updates the lockfile "from" field to the new git commit when we
             # run npm install
             original_from = %("from": "#{details[:from]}")
-            if npm8?
-              # NOTE: The `from` syntax has changed in npm 7 to include the dependency name
-              npm8_locked_from = %("from": "#{dependency_name}@#{details[:version]}")
-              updated_lockfile_content = updated_lockfile_content.gsub(npm8_locked_from, original_from)
-            else
-              npm6_locked_from = %("from": "#{details[:version]}")
-              updated_lockfile_content = updated_lockfile_content.gsub(npm6_locked_from, original_from)
-            end
+            npm8_locked_from = %("from": "#{dependency_name}@#{details[:version]}")
+            updated_lockfile_content = updated_lockfile_content.gsub(npm8_locked_from, original_from)
           end
 
           updated_lockfile_content
@@ -1103,19 +1273,92 @@ module Dependabot
           npmrc_content.match?(/^package-lock\s*=\s*false/)
         end
 
-        sig { returns(T::Boolean) }
-        def npm8?
-          return T.must(@npm8) if defined?(@npm8)
-
-          @npm8 ||= T.let(
-            Dependabot::NpmAndYarn::Helpers.npm8?(lockfile),
-            T.nilable(T::Boolean)
-          )
-        end
-
         sig { params(package_name: String).returns(String) }
         def sanitize_package_name(package_name)
           package_name.gsub("%2f", "/").gsub("%2F", "/")
+        end
+
+        # Cleans up the lockfile after a workspace dependency update:
+        # 1. Removes any dependencies npm added to packages[""] that aren't
+        #    in the original root package.json.
+        # 2. Restores optional peer dependencies that npm's tree resolution
+        #    may have removed (see GitHub issue #14110).
+        sig { params(original_package_json_content: String).void }
+        def cleanup_workspace_lockfile(original_package_json_content)
+          lockfile_content = File.read(lockfile_basename)
+          parsed = JSON.parse(lockfile_content)
+          original_pkg = JSON.parse(original_package_json_content)
+          original_lockfile = JSON.parse(T.must(lockfile.content))
+
+          changed = remove_spurious_root_deps(parsed, original_pkg)
+          changed = restore_optional_peer_deps(parsed, original_lockfile) || changed
+
+          return unless changed
+
+          indent = detect_indentation(lockfile_content)
+          File.write(lockfile_basename, "#{JSON.pretty_generate(parsed, indent: indent)}\n")
+        rescue JSON::ParserError => e
+          Dependabot.logger.warn("Failed to clean up workspace lockfile: #{e.message}")
+        end
+
+        sig do
+          params(
+            parsed_lockfile: T::Hash[String, T.untyped],
+            original_pkg: T::Hash[String, T.untyped]
+          ).returns(T::Boolean)
+        end
+        def remove_spurious_root_deps(parsed_lockfile, original_pkg)
+          root_entry = parsed_lockfile.dig("packages", "")
+          return false unless root_entry
+
+          changed = T.let(false, T::Boolean)
+
+          %w(dependencies devDependencies peerDependencies optionalDependencies).each do |dep_type|
+            next unless root_entry[dep_type]
+
+            unless original_pkg[dep_type]
+              root_entry.delete(dep_type)
+              changed = true
+              next
+            end
+
+            root_entry[dep_type].each_key do |dep_name|
+              unless original_pkg[dep_type].key?(dep_name)
+                root_entry[dep_type].delete(dep_name)
+                changed = true
+              end
+            end
+
+            if root_entry[dep_type].empty?
+              root_entry.delete(dep_type)
+              changed = true
+            end
+          end
+
+          changed
+        end
+
+        sig do
+          params(
+            updated_lockfile: T::Hash[String, T.untyped],
+            original_lockfile: T::Hash[String, T.untyped]
+          ).returns(T::Boolean)
+        end
+        def restore_optional_peer_deps(updated_lockfile, original_lockfile)
+          original_packages = original_lockfile["packages"] || {}
+          updated_packages = updated_lockfile["packages"] || {}
+          changed = T.let(false, T::Boolean)
+
+          original_packages.each do |path, pkg_info|
+            next if updated_packages.key?(path)
+            next unless pkg_info.is_a?(Hash) && pkg_info["optional"] == true && pkg_info["peer"] == true
+
+            Dependabot.logger.info("Restoring optional peer dependency removed during workspace update: #{path}")
+            updated_packages[path] = pkg_info
+            changed = true
+          end
+
+          changed
         end
 
         sig { returns(String) }
@@ -1183,4 +1426,3 @@ module Dependabot
     end
   end
 end
-# rubocop:enable Metrics/ClassLength

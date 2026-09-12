@@ -1,0 +1,600 @@
+# typed: false
+# frozen_string_literal: true
+
+require "spec_helper"
+require "support/dummy_pkg_helpers"
+require "support/dependency_file_helpers"
+
+require "dependabot/dependency_change"
+require "dependabot/dependency_snapshot"
+require "dependabot/service"
+require "dependabot/fetched_files"
+require "dependabot/updater/error_handler"
+require "dependabot/updater/operations/group_update_all_versions"
+require "dependabot/updater/operations/create_group_update_pull_request"
+require "dependabot/updater/operations/update_all_versions"
+require "dependabot/dependency_change_builder"
+require "dependabot/notices"
+
+require "dependabot/bundler"
+
+RSpec.describe Dependabot::Updater::Operations::GroupUpdateAllVersions do
+  include DependencyFileHelpers
+  include DummyPkgHelpers
+
+  subject(:perform) { group_update_all_versions.perform }
+
+  let(:group_update_all_versions) do
+    described_class.new(
+      service: mock_service,
+      job: job,
+      dependency_snapshot: dependency_snapshot,
+      error_handler: mock_error_handler
+    )
+  end
+
+  let(:mock_service) do
+    instance_double(
+      Dependabot::Service,
+      increment_metric: nil,
+      record_update_job_error: nil,
+      create_pull_request: nil,
+      record_update_job_warning: nil,
+      record_ecosystem_meta: nil,
+      record_cooldown_meta: nil
+    )
+  end
+
+  let(:mock_error_handler) { instance_double(Dependabot::Updater::ErrorHandler) }
+
+  let(:job_definition) do
+    job_definition_fixture("bundler/version_updates/pull_request_simple")
+  end
+
+  let(:job) do
+    Dependabot::Job.new_update_job(
+      job_id: "1558782000",
+      job_definition:
+    )
+  end
+
+  let(:dependency_snapshot) do
+    Dependabot::DependencySnapshot.create_from_job_definition(
+      job:,
+      fetched_files:
+    )
+  end
+
+  let(:fetched_files) do
+    Dependabot::FetchedFiles.new(base_commit_sha: "mock-sha", dependency_files:)
+  end
+
+  let(:dependency_files) do
+    original_bundler_files(fixture: "bundler_simple")
+  end
+
+  let(:dependency) do
+    Dependabot::Dependency.new(
+      name: "dummy-pkg-a",
+      version: "4.0.0",
+      requirements: [{
+        file: "Gemfile",
+        requirement: "~> 4.0.0",
+        groups: ["default"],
+        source: nil
+      }],
+      package_manager: "bundler",
+      metadata: { all_versions: ["4.0.0"] }
+    )
+  end
+
+  let(:mock_source) do
+    instance_double(
+      Dependabot::Source,
+      directories: nil,
+      directory: "/",
+      repo: "test/repo",
+      "directory=": nil,
+      "directories=": nil
+    )
+  end
+
+  let(:mock_source_with_multiple_dirs) do
+    instance_double(
+      Dependabot::Source,
+      directories: ["/", "/subdir"],
+      directory: "/",
+      repo: "test/repo",
+      "directory=": nil,
+      "directories=": nil
+    )
+  end
+
+  let(:mock_source_single_dir) do
+    instance_double(
+      Dependabot::Source,
+      directories: nil,
+      directory: "/single",
+      repo: "test/repo",
+      "directory=": nil,
+      "directories=": nil
+    )
+  end
+
+  let(:dependency_group) do
+    instance_double(
+      Dependabot::DependencyGroup,
+      name: "dummy-group",
+      dependencies: [dependency],
+      rules: { "update-types" => ["all"] }
+    )
+  end
+
+  describe ".applies_to?" do
+    context "when job is multi-ecosystem update" do
+      before do
+        allow(job).to receive(:multi_ecosystem_update?).and_return(true)
+      end
+
+      it "returns true" do
+        expect(described_class.applies_to?(job: job)).to be true
+      end
+    end
+
+    context "when job is updating a pull request" do
+      before do
+        allow(job).to receive_messages(multi_ecosystem_update?: false, updating_a_pull_request?: true)
+      end
+
+      it "returns false" do
+        expect(described_class.applies_to?(job: job)).to be false
+      end
+    end
+
+    context "when job is security updates only" do
+      before do
+        allow(job).to receive_messages(
+          multi_ecosystem_update?: false,
+          updating_a_pull_request?: false,
+          security_updates_only?: true
+        )
+      end
+
+      context "with multiple dependencies" do
+        before do
+          allow(job).to receive(:dependencies).and_return([dependency, dependency])
+        end
+
+        it "returns true" do
+          expect(described_class.applies_to?(job: job)).to be true
+        end
+      end
+
+      context "with dependency groups that apply to security updates" do
+        before do
+          allow(job).to receive_messages(
+            dependencies: [dependency],
+            dependency_groups: [
+              Dependabot::Job::DependencyGroupDefinition.from_hash({ "applies-to" => "security-updates" })
+            ]
+          )
+        end
+
+        it "returns true" do
+          expect(described_class.applies_to?(job: job)).to be true
+        end
+      end
+
+      context "with single dependency and no applicable groups" do
+        before do
+          allow(job).to receive_messages(
+            dependencies: [dependency],
+            dependency_groups: [
+              Dependabot::Job::DependencyGroupDefinition.from_hash({ "applies-to" => "version-updates" })
+            ]
+          )
+        end
+
+        it "returns false" do
+          expect(described_class.applies_to?(job: job)).to be false
+        end
+      end
+    end
+
+    context "when job is not security updates only" do
+      before do
+        allow(job).to receive_messages(
+          multi_ecosystem_update?: false,
+          updating_a_pull_request?: false,
+          security_updates_only?: false
+        )
+      end
+
+      it "returns true" do
+        expect(described_class.applies_to?(job: job)).to be true
+      end
+    end
+  end
+
+  describe ".tag_name" do
+    it "returns the correct tag name" do
+      expect(described_class.tag_name).to eq(:group_update_all_versions)
+    end
+  end
+
+  describe "#perform when all requested dependencies are missing" do
+    let(:requested_dependencies) { %w(missing-one missing-two) }
+
+    before do
+      allow(job).to receive_messages(
+        security_updates_only?: true,
+        updating_a_pull_request?: false,
+        dependencies: requested_dependencies,
+        dependency_groups: %w(first second).map do |name|
+          Dependabot::Job::DependencyGroupDefinition.from_hash(
+            "name" => name, "applies-to" => "security-updates", "rules" => { "patterns" => ["*"] }
+          )
+        end
+      )
+    end
+
+    it "reports one job error even when every group is empty" do
+      expect(mock_error_handler).to receive(:handle_job_error)
+        .with(error: kind_of(Dependabot::DependencyNotFound)).once
+
+      perform
+    end
+
+    context "with no configured groups" do
+      before do
+        allow(job).to receive(:dependency_groups).and_return([])
+      end
+
+      it "still reports the missing targets" do
+        expect(mock_error_handler).to receive(:handle_job_error)
+          .with(error: kind_of(Dependabot::DependencyNotFound)).once
+
+        perform
+      end
+    end
+
+    context "when a requested dependency is present" do
+      let(:requested_dependencies) { %w(dummy-pkg-a missing-one) }
+
+      before do
+        allow(Dependabot::Updater::Operations::CreateGroupUpdatePullRequest).to receive(:new)
+          .and_return(instance_double(Dependabot::Updater::Operations::CreateGroupUpdatePullRequest, perform: nil))
+      end
+
+      it "does not report a missing-dependency error for a partial match" do
+        expect(mock_error_handler).not_to receive(:handle_job_error)
+
+        perform
+      end
+
+      context "with different casing" do
+        let(:requested_dependencies) { %w(DUMMY-PKG-A missing-one) }
+
+        let(:checker) do
+          instance_double(Dependabot::UpdateCheckers::Base, lowest_security_fix_version: nil, up_to_date?: true)
+        end
+
+        before do
+          allow(Dependabot::Updater::Operations::CreateGroupUpdatePullRequest).to receive(:new).and_call_original
+          allow(Dependabot::Bundler::UpdateChecker).to receive(:new).and_return(checker)
+        end
+
+        it "checks the manifest dependency through the real grouped operation" do
+          expect(mock_error_handler).not_to receive(:handle_job_error)
+
+          perform
+
+          expect(Dependabot::Bundler::UpdateChecker).to have_received(:new)
+            .with(hash_including(dependency: have_attributes(name: "dummy-pkg-a"))).once
+        end
+      end
+    end
+  end
+
+  describe "#perform" do
+    let(:mock_create_group_update) do
+      instance_double(Dependabot::Updater::Operations::CreateGroupUpdatePullRequest)
+    end
+
+    let(:mock_update_all_versions) do
+      instance_double(Dependabot::Updater::Operations::UpdateAllVersions)
+    end
+
+    let(:mock_dependency_change) do
+      instance_double(Dependabot::DependencyChange)
+    end
+
+    before do
+      allow(Dependabot::Updater::Operations::CreateGroupUpdatePullRequest)
+        .to receive(:new).and_return(mock_create_group_update)
+      allow(Dependabot::Updater::Operations::UpdateAllVersions)
+        .to receive(:new).and_return(mock_update_all_versions)
+      allow(mock_create_group_update).to receive(:perform).and_return(mock_dependency_change)
+      allow(mock_update_all_versions).to receive(:perform)
+    end
+
+    context "when there are dependency groups" do
+      before do
+        allow(dependency_snapshot).to receive(:groups).and_return([dependency_group])
+        allow(dependency_snapshot).to receive(:mark_group_handled)
+        allow(job).to receive_messages(
+          existing_group_pull_requests: [],
+          multi_ecosystem_update?: false,
+          source: mock_source
+        )
+        allow(dependency_snapshot).to receive(:current_directory=)
+        allow(dependency_snapshot).to receive_messages(dependencies: [dependency], ungrouped_dependencies: [dependency])
+      end
+
+      it "runs grouped dependency updates" do
+        allow(mock_create_group_update).to receive(:perform).and_return(mock_dependency_change)
+
+        perform
+
+        expect(mock_create_group_update).to have_received(:perform)
+      end
+
+      context "when PR already exists for dependency group" do
+        before do
+          allow(job).to receive(:existing_group_pull_requests).and_return(
+            [
+              { "dependency-group-name" => "dummy-group", "pr_number" => 123 }
+            ].map { |pr| Dependabot::Job::ExistingGroupPullRequest.from_hash(pr) }
+          )
+        end
+
+        it "skips the group and marks it as handled" do
+          expect(mock_create_group_update).not_to receive(:perform)
+          expect(dependency_snapshot).to receive(:mark_group_handled).with(dependency_group)
+          perform
+        end
+
+        it "logs the PR number when it exists" do
+          allow(Dependabot.logger).to receive(:info).and_call_original
+          expect(Dependabot.logger).to receive(:info).once
+                                                     .with("Detected existing pull request #123 for the dependency group 'dummy-group'.") # rubocop:disable Layout/LineLength
+          perform
+        end
+      end
+
+      context "when PR exists for same group but different directory" do
+        before do
+          allow(job).to receive_messages(
+            existing_group_pull_requests: [
+              {
+                "dependency-group-name" => "dummy-group",
+                "pr_number" => 123,
+                "dependencies" => [
+                  {
+                    "dependency-name" => "rollup",
+                    "dependency-version" => "2.79.2",
+                    "directory" => "/packages/corelib"
+                  }
+                ]
+              }
+            ].map { |pr| Dependabot::Job::ExistingGroupPullRequest.from_hash(pr) },
+            source: mock_source
+          )
+          allow(mock_source).to receive(:directory).and_return("/")
+        end
+
+        it "creates a new PR for the different directory" do
+          allow(mock_create_group_update).to receive(:perform).and_return(mock_dependency_change)
+          expect(mock_create_group_update).to receive(:perform)
+          expect(dependency_snapshot).not_to receive(:mark_group_handled).with(dependency_group)
+          perform
+        end
+      end
+
+      context "when PR exists for same group and same directory" do
+        before do
+          allow(job).to receive_messages(
+            existing_group_pull_requests: [
+              {
+                "dependency-group-name" => "dummy-group",
+                "pr_number" => 123,
+                "dependencies" => [
+                  {
+                    "dependency-name" => "rollup",
+                    "dependency-version" => "2.79.2",
+                    "directory" => "/"
+                  }
+                ]
+              }
+            ].map { |pr| Dependabot::Job::ExistingGroupPullRequest.from_hash(pr) },
+            source: mock_source
+          )
+          allow(mock_source).to receive(:directory).and_return("/")
+        end
+
+        it "skips creating a new PR" do
+          expect(mock_create_group_update).not_to receive(:perform)
+          expect(dependency_snapshot).to receive(:mark_group_handled).with(dependency_group)
+          perform
+        end
+      end
+
+      context "when PR covers a subset of the job's directories" do
+        before do
+          allow(job).to receive_messages(
+            existing_group_pull_requests: [
+              {
+                "dependency-group-name" => "dummy-group",
+                "pr_number" => 123,
+                "dependencies" => [
+                  {
+                    "dependency-name" => "rollup",
+                    "dependency-version" => "2.79.2",
+                    "directory" => "/"
+                  }
+                ]
+              }
+            ].map { |pr| Dependabot::Job::ExistingGroupPullRequest.from_hash(pr) },
+            source: mock_source_with_multiple_dirs
+          )
+        end
+
+        it "skips creating a new PR" do
+          expect(mock_create_group_update).not_to receive(:perform)
+          expect(dependency_snapshot).to receive(:mark_group_handled).with(dependency_group)
+          perform
+        end
+      end
+
+      context "when PR covers directories outside the job's directories" do
+        before do
+          allow(job).to receive_messages(
+            existing_group_pull_requests: [
+              {
+                "dependency-group-name" => "dummy-group",
+                "pr_number" => 123,
+                "dependencies" => [
+                  {
+                    "dependency-name" => "rollup",
+                    "dependency-version" => "2.79.2",
+                    "directory" => "/"
+                  },
+                  {
+                    "dependency-name" => "rollup",
+                    "dependency-version" => "2.79.2",
+                    "directory" => "/packages/corelib"
+                  }
+                ]
+              }
+            ].map { |pr| Dependabot::Job::ExistingGroupPullRequest.from_hash(pr) },
+            source: mock_source
+          )
+          allow(mock_source).to receive(:directory).and_return("/")
+        end
+
+        it "creates a new PR" do
+          allow(mock_create_group_update).to receive(:perform).and_return(mock_dependency_change)
+          expect(mock_create_group_update).to receive(:perform)
+          expect(dependency_snapshot).not_to receive(:mark_group_handled).with(dependency_group)
+          perform
+        end
+      end
+
+      context "when existing PR has no directory info" do
+        before do
+          allow(job).to receive_messages(
+            existing_group_pull_requests: [
+              {
+                "dependency-group-name" => "dummy-group",
+                "pr_number" => 123,
+                "dependencies" => [
+                  { "dependency-name" => "rollup", "dependency-version" => "2.79.2" }
+                ]
+              }
+            ].map { |pr| Dependabot::Job::ExistingGroupPullRequest.from_hash(pr) },
+            source: mock_source
+          )
+          allow(mock_source).to receive(:directory).and_return("/")
+        end
+
+        it "treats the existing PR as a match" do
+          expect(mock_create_group_update).not_to receive(:perform)
+          expect(dependency_snapshot).to receive(:mark_group_handled).with(dependency_group)
+          perform
+        end
+      end
+
+      context "when group update fails" do
+        before do
+          allow(mock_create_group_update).to receive(:perform).and_return(nil)
+        end
+
+        it "marks the group as handled" do
+          expect(dependency_snapshot).to receive(:mark_group_handled).with(dependency_group)
+          perform
+        end
+      end
+    end
+
+    context "when there are no dependency groups" do
+      before do
+        allow(job).to receive_messages(multi_ecosystem_update?: false, source: mock_source)
+        allow(dependency_snapshot).to receive(:current_directory=)
+        allow(dependency_snapshot).to receive_messages(
+          groups: [],
+          dependencies: [dependency],
+          ungrouped_dependencies: [dependency]
+        )
+      end
+
+      it "runs ungrouped dependency updates" do
+        expect(mock_update_all_versions).to receive(:perform)
+        perform
+      end
+    end
+
+    context "when job is multi-ecosystem update" do
+      before do
+        allow(dependency_snapshot).to receive(:groups).and_return([dependency_group])
+        allow(dependency_snapshot).to receive(:mark_group_handled)
+        allow(job).to receive_messages(existing_group_pull_requests: [], multi_ecosystem_update?: true)
+      end
+
+      it "does not run ungrouped dependency updates" do
+        expect(mock_update_all_versions).not_to receive(:perform)
+        perform
+      end
+    end
+
+    context "with multiple directories" do
+      before do
+        allow(job).to receive_messages(multi_ecosystem_update?: false, source: mock_source_with_multiple_dirs)
+        allow(dependency_snapshot).to receive(:current_directory=)
+        allow(dependency_snapshot).to receive_messages(
+          groups: [],
+          dependencies: [dependency],
+          ungrouped_dependencies: [dependency]
+        )
+      end
+
+      it "processes each directory" do
+        expect(dependency_snapshot).to receive(:current_directory=).with("/")
+        expect(dependency_snapshot).to receive(:current_directory=).with("/subdir")
+        expect(mock_update_all_versions).to receive(:perform).twice
+        perform
+      end
+    end
+
+    context "when directory has no dependencies" do
+      before do
+        allow(job).to receive_messages(multi_ecosystem_update?: false, source: mock_source)
+        allow(dependency_snapshot).to receive(:current_directory=)
+        allow(dependency_snapshot).to receive_messages(groups: [], dependencies: [])
+      end
+
+      it "skips the directory" do
+        expect(mock_update_all_versions).not_to receive(:perform)
+        perform
+      end
+    end
+
+    context "when directory has no ungrouped dependencies" do
+      before do
+        allow(job).to receive_messages(multi_ecosystem_update?: false, source: mock_source)
+        allow(dependency_snapshot).to receive(:current_directory=)
+        allow(dependency_snapshot).to receive_messages(
+          groups: [],
+          dependencies: [dependency],
+          ungrouped_dependencies: []
+        )
+      end
+
+      it "skips the directory and logs a message" do
+        expect(Dependabot.logger).to receive(:info)
+          .with("Found no dependencies to update after filtering allowed updates in /")
+        expect(mock_update_all_versions).not_to receive(:perform)
+        perform
+      end
+    end
+  end
+end

@@ -1,9 +1,11 @@
 # typed: false
 # frozen_string_literal: true
 
+require "json"
 require "spec_helper"
 require "dependabot/dependency"
 require "dependabot/dependency_file"
+require "dependabot/experiments"
 require "dependabot/swift/file_updater"
 require_common_spec "file_updaters/shared_examples_for_file_updaters"
 
@@ -26,46 +28,6 @@ RSpec.describe Dependabot::Swift::FileUpdater do
   let(:project_name) { "Example" }
 
   it_behaves_like "a dependency file updater"
-
-  describe "#updated_files_regex" do
-    subject(:updated_files_regex) { described_class.updated_files_regex }
-
-    it "is not empty" do
-      expect(updated_files_regex).not_to be_empty
-    end
-
-    context "when files match the regex patterns" do
-      it "returns true for files that should be updated" do
-        matching_files = [
-          "Package.swift",
-          "Package@swift-5.swift",
-          "Package@swift-5.0.swift",
-          "Package@swift-5.0.1.swift",
-          "Package.resolved"
-        ]
-
-        matching_files.each do |file_name|
-          expect(updated_files_regex).to(be_any { |regex| file_name.match?(regex) })
-        end
-      end
-
-      it "returns false for files that should not be updated" do
-        non_matching_files = [
-          "README.md",
-          ".github/workflow/main.yml",
-          "some_random_file.rb",
-          "package-lock.json",
-          "package.json",
-          "Gemfile",
-          "Gemfile.lock"
-        ]
-
-        non_matching_files.each do |file_name|
-          expect(updated_files_regex).not_to(be_any { |regex| file_name.match?(regex) })
-        end
-      end
-    end
-  end
 
   describe "#updated_dependency_files" do
     subject(:updated_dependency_files) { updater.updated_dependency_files }
@@ -197,6 +159,340 @@ RSpec.describe Dependabot::Swift::FileUpdater do
             }
           },
         RESOLVED
+      end
+    end
+  end
+
+  context "with Xcode SPM projects" do
+    describe "#updated_dependency_files" do
+      subject(:updated_dependency_files) { updater.updated_dependency_files }
+
+      let(:project_name) { "xcode_project" }
+      let(:repo_contents_path) { build_tmp_repo(project_name, path: "projects") }
+      let(:files) do
+        [
+          Dependabot::DependencyFile.new(
+            name: "MyApp.xcodeproj/project.pbxproj",
+            content: fixture("projects", project_name, "MyApp.xcodeproj", "project.pbxproj"),
+            support_file: true
+          ),
+          Dependabot::DependencyFile.new(
+            name: "MyApp.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved",
+            content: fixture(
+              "projects",
+              project_name,
+              "MyApp.xcodeproj",
+              "project.xcworkspace",
+              "xcshareddata",
+              "swiftpm",
+              "Package.resolved"
+            )
+          )
+        ]
+      end
+
+      context "when updating a dependency version" do
+        let(:dependencies) do
+          [
+            Dependabot::Dependency.new(
+              name: "github.com/apple/swift-nio",
+              version: "2.55.0",
+              previous_version: "2.54.0",
+              requirements: [{
+                requirement: ">= 2.55.0, < 3.0.0",
+                groups: ["dependencies"],
+                file: "MyApp.xcodeproj/project.pbxproj",
+                source: {
+                  type: "git",
+                  url: "https://github.com/apple/swift-nio.git",
+                  ref: "abc123newrevision",
+                  branch: nil
+                },
+                metadata: {
+                  requirement_string: "from: \"2.55.0\""
+                }
+              }],
+              previous_requirements: [{
+                requirement: ">= 2.54.0, < 3.0.0",
+                groups: ["dependencies"],
+                file: "MyApp.xcodeproj/project.pbxproj",
+                source: {
+                  type: "git",
+                  url: "https://github.com/apple/swift-nio.git",
+                  ref: "6213ba7a06febe8fef60563a4a7d26a4085783cf",
+                  branch: nil
+                },
+                metadata: {
+                  requirement_string: "from: \"2.54.0\""
+                }
+              }],
+              package_manager: "swift",
+              metadata: { identity: "swift-nio" }
+            )
+          ]
+        end
+
+        it "returns the updated Package.resolved and project.pbxproj files" do
+          expect(updated_dependency_files.length).to eq(2)
+
+          resolved = updated_dependency_files.find { |f| f.name.end_with?("Package.resolved") }
+          expect(resolved.name).to eq(
+            "MyApp.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved"
+          )
+
+          pbxproj = updated_dependency_files.find { |f| f.name.end_with?("project.pbxproj") }
+          expect(pbxproj.name).to eq("MyApp.xcodeproj/project.pbxproj")
+          expect(pbxproj.support_file).to be false
+        end
+
+        it "updates the version in the resolved file" do
+          resolved = updated_dependency_files.find { |f| f.name.end_with?("Package.resolved") }
+          expect(resolved.content).to include('"version" : "2.55.0"')
+          expect(resolved.content).not_to include('"version" : "2.54.0"')
+        end
+
+        it "updates the minimumVersion in the pbxproj file" do
+          pbxproj = updated_dependency_files.find { |f| f.name.end_with?("project.pbxproj") }
+          expect(pbxproj.content).to include("minimumVersion = 2.55.0;")
+          expect(pbxproj.content).not_to include("minimumVersion = 2.54.0;")
+        end
+
+        it "preserves the schema version" do
+          resolved = updated_dependency_files.find { |f| f.name.end_with?("Package.resolved") }
+          parsed = JSON.parse(resolved.content)
+          expect(parsed["version"]).to eq(2)
+        end
+      end
+
+      context "with workspace-scoped Package.resolved" do
+        let(:project_name) { "xcode_workspace" }
+        let(:files) do
+          [
+            Dependabot::DependencyFile.new(
+              name: "MyApp.xcworkspace/contents.xcworkspacedata",
+              content: fixture("projects", project_name, "MyApp.xcworkspace", "contents.xcworkspacedata"),
+              support_file: true
+            ),
+            Dependabot::DependencyFile.new(
+              name: "AppA.xcodeproj/project.pbxproj",
+              content: fixture("projects", project_name, "AppA.xcodeproj", "project.pbxproj"),
+              support_file: true
+            ),
+            Dependabot::DependencyFile.new(
+              name: "MyApp.xcworkspace/xcshareddata/swiftpm/Package.resolved",
+              content: fixture(
+                "projects",
+                project_name,
+                "MyApp.xcworkspace",
+                "xcshareddata",
+                "swiftpm",
+                "Package.resolved"
+              )
+            )
+          ]
+        end
+
+        let(:dependencies) do
+          [
+            Dependabot::Dependency.new(
+              name: "github.com/apple/swift-nio",
+              version: "2.55.0",
+              previous_version: "2.54.0",
+              requirements: [{
+                requirement: ">= 2.55.0, < 3.0.0",
+                groups: ["dependencies"],
+                file: "AppA.xcodeproj/project.pbxproj",
+                source: {
+                  type: "git",
+                  url: "https://github.com/apple/swift-nio.git",
+                  ref: "abc123newrevision",
+                  branch: nil
+                },
+                metadata: {
+                  requirement_string: "from: \"2.55.0\""
+                }
+              }],
+              previous_requirements: [{
+                requirement: ">= 2.54.0, < 3.0.0",
+                groups: ["dependencies"],
+                file: "AppA.xcodeproj/project.pbxproj",
+                source: {
+                  type: "git",
+                  url: "https://github.com/apple/swift-nio.git",
+                  ref: "1234567890abcdef1234567890abcdef12345678",
+                  branch: nil
+                },
+                metadata: {
+                  requirement_string: "from: \"2.54.0\""
+                }
+              }],
+              package_manager: "swift",
+              metadata: { identity: "swift-nio" }
+            )
+          ]
+        end
+
+        it "updates workspace Package.resolved and project.pbxproj" do
+          expect(updated_dependency_files.length).to eq(2)
+
+          resolved = updated_dependency_files.find { |f| f.name.end_with?("Package.resolved") }
+          expect(resolved.name).to eq("MyApp.xcworkspace/xcshareddata/swiftpm/Package.resolved")
+          expect(resolved.content).to include('"version" : "2.55.0"')
+
+          pbxproj = updated_dependency_files.find { |f| f.name.end_with?("project.pbxproj") }
+          expect(pbxproj.name).to eq("AppA.xcodeproj/project.pbxproj")
+          expect(pbxproj.content).to include("minimumVersion = 2.55.0;")
+        end
+      end
+
+      context "with multiple Xcode projects" do
+        let(:project_name) { "xcode_project_multiple" }
+        let(:files) do
+          [
+            Dependabot::DependencyFile.new(
+              name: "AppA.xcodeproj/project.pbxproj",
+              content: fixture("projects", project_name, "AppA.xcodeproj", "project.pbxproj"),
+              support_file: true
+            ),
+            Dependabot::DependencyFile.new(
+              name: "AppA.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved",
+              content: fixture(
+                "projects",
+                project_name,
+                "AppA.xcodeproj",
+                "project.xcworkspace",
+                "xcshareddata",
+                "swiftpm",
+                "Package.resolved"
+              )
+            ),
+            Dependabot::DependencyFile.new(
+              name: "AppB.xcodeproj/project.pbxproj",
+              content: fixture("projects", project_name, "AppB.xcodeproj", "project.pbxproj"),
+              support_file: true
+            ),
+            Dependabot::DependencyFile.new(
+              name: "AppB.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved",
+              content: fixture(
+                "projects",
+                project_name,
+                "AppB.xcodeproj",
+                "project.xcworkspace",
+                "xcshareddata",
+                "swiftpm",
+                "Package.resolved"
+              )
+            )
+          ]
+        end
+
+        context "when updating dependency in AppA only" do
+          let(:dependencies) do
+            [
+              Dependabot::Dependency.new(
+                name: "github.com/apple/swift-nio",
+                version: "2.55.0",
+                previous_version: "2.54.0",
+                requirements: [{
+                  requirement: ">= 2.55.0, < 3.0.0",
+                  groups: ["dependencies"],
+                  file: "AppA.xcodeproj/project.pbxproj",
+                  source: {
+                    type: "git",
+                    url: "https://github.com/apple/swift-nio.git",
+                    ref: "newrevision",
+                    branch: nil
+                  }
+                }],
+                previous_requirements: [{
+                  requirement: ">= 2.54.0, < 3.0.0",
+                  groups: ["dependencies"],
+                  file: "AppA.xcodeproj/project.pbxproj",
+                  source: {
+                    type: "git",
+                    url: "https://github.com/apple/swift-nio.git",
+                    ref: "oldrevision",
+                    branch: nil
+                  }
+                }],
+                package_manager: "swift",
+                metadata: { identity: "swift-nio" }
+              )
+            ]
+          end
+
+          it "updates AppA's Package.resolved and project.pbxproj" do
+            expect(updated_dependency_files.length).to eq(2)
+            expect(updated_dependency_files.map(&:name)).to all(include("AppA.xcodeproj"))
+          end
+
+          it "does not modify AppB's files" do
+            expect(updated_dependency_files.map(&:name)).not_to include(
+              a_string_matching(/AppB\.xcodeproj/)
+            )
+          end
+        end
+      end
+
+      context "with v1 Package.resolved format" do
+        let(:project_name) { "xcode_project_v1_resolved" }
+        let(:files) do
+          [
+            Dependabot::DependencyFile.new(
+              name: "MyApp.xcodeproj/project.pbxproj",
+              content: fixture("projects", project_name, "MyApp.xcodeproj", "project.pbxproj"),
+              support_file: true
+            ),
+            Dependabot::DependencyFile.new(
+              name: "MyApp.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved",
+              content: fixture(
+                "projects",
+                project_name,
+                "MyApp.xcodeproj",
+                "project.xcworkspace",
+                "xcshareddata",
+                "swiftpm",
+                "Package.resolved"
+              )
+            )
+          ]
+        end
+
+        let(:dependencies) do
+          [
+            Dependabot::Dependency.new(
+              name: "github.com/apple/swift-nio",
+              version: "2.55.0",
+              previous_version: "2.54.0",
+              requirements: [{
+                requirement: ">= 2.55.0, < 3.0.0",
+                groups: ["dependencies"],
+                file: "MyApp.xcodeproj/project.pbxproj",
+                source: {
+                  type: "git",
+                  url: "https://github.com/apple/swift-nio.git",
+                  ref: "newrevision",
+                  branch: nil
+                }
+              }],
+              package_manager: "swift",
+              metadata: { identity: "swift-nio" }
+            )
+          ]
+        end
+
+        it "preserves v1 format while updating" do
+          resolved = updated_dependency_files.find { |f| f.name.end_with?("Package.resolved") }
+          parsed = JSON.parse(resolved.content)
+          expect(parsed["version"]).to eq(1)
+          expect(parsed["object"]["pins"].first["state"]["version"]).to eq("2.55.0")
+        end
+
+        it "also updates the project.pbxproj" do
+          pbxproj = updated_dependency_files.find { |f| f.name.end_with?("project.pbxproj") }
+          expect(pbxproj).not_to be_nil
+          expect(pbxproj.content).to include("minimumVersion = 2.55.0;")
+        end
       end
     end
   end

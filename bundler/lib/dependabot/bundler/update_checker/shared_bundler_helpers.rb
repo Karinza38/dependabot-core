@@ -1,4 +1,4 @@
-# typed: true
+# typed: strict
 # frozen_string_literal: true
 
 require "excon"
@@ -8,6 +8,7 @@ require "uri"
 require "dependabot/bundler/update_checker"
 require "dependabot/bundler/native_helpers"
 require "dependabot/bundler/helpers"
+require "dependabot/logger"
 require "dependabot/registry_client"
 require "dependabot/shared_helpers"
 require "dependabot/errors"
@@ -23,12 +24,29 @@ module Dependabot
 
         abstract!
 
-        sig { returns(T::Hash[Symbol, T.untyped]) }
-        attr_reader :options
+        sig { abstract.returns(T::Hash[Symbol, T.untyped]) }
+        def options; end
+
+        sig { abstract.returns(T::Array[Dependabot::DependencyFile]) }
+        def dependency_files; end
+
+        sig { abstract.returns(T.nilable(String)) }
+        def repo_contents_path; end
+
+        sig { abstract.returns(T::Array[Dependabot::Credential]) }
+        def credentials; end
 
         GIT_REGEX = /reset --hard [^\s]*` in directory (?<path>[^\s]*)/
         GIT_REF_REGEX = /not exist in the repository (?<path>[^\s]*)\./
         PATH_REGEX = /The path `(?<path>.*)` does not exist/
+        # Raised by Bundler when a registry's compact index (`/info/<gem>`) returns
+        # gem metadata it can't parse (e.g. an illformed `ruby:`/`rubygems:`
+        # requirement). This means the *registry* served bad data, not that the
+        # user's dependency files are broken. The trailing `detail` capture keeps
+        # Bundler's own explanation (e.g. `Illformed requirement [...]`) so the
+        # exact parse failure is preserved rather than discarded.
+        REGISTRY_METADATA_ERROR_REGEX =
+          /error parsing the metadata for the gem (?<gem>\S+) \((?<version>[^)]+)\):?\s*(?<detail>.*)/m
 
         module BundlerErrorPatterns
           MISSING_AUTH_REGEX = /bundle config set --global (?<source>.*) username:password/
@@ -51,21 +69,24 @@ module Dependabot
           Bundler::Fetcher::FallbackError
         ).freeze
 
-        attr_reader :dependency_files
-        attr_reader :repo_contents_path
-        attr_reader :credentials
-
         #########################
         # Bundler context setup #
         #########################
 
-        def in_a_native_bundler_context(error_handling: true)
+        sig do
+          params(
+            error_handling: T::Boolean,
+            _blk: T.proc.params(arg0: String).returns(T.untyped)
+          )
+            .returns(T.untyped)
+        end
+        def in_a_native_bundler_context(error_handling: true, &_blk)
           SharedHelpers
             .in_a_temporary_repo_directory(base_directory,
                                            repo_contents_path) do |tmp_dir|
             write_temporary_dependency_files
 
-            yield(tmp_dir)
+            yield(tmp_dir.to_s)
           end
         rescue SharedHelpers::HelperSubprocessFailed => e
           retry_count ||= 0
@@ -75,10 +96,12 @@ module Dependabot
           error_handling ? handle_bundler_errors(e) : raise
         end
 
+        sig { returns(String) }
         def base_directory
-          dependency_files.first.directory
+          T.must(dependency_files.first).directory
         end
 
+        sig { params(error: Dependabot::SharedHelpers::HelperSubprocessFailed).returns(T::Boolean) }
         def retryable_error?(error)
           return true if error.error_class == "JSON::ParserError"
           return true if RETRYABLE_ERRORS.include?(error.error_class)
@@ -92,6 +115,7 @@ module Dependabot
         # rubocop:disable Metrics/PerceivedComplexity
         # rubocop:disable Metrics/AbcSize
         # rubocop:disable Metrics/MethodLength
+        sig { params(error: Dependabot::SharedHelpers::HelperSubprocessFailed).void }
         def handle_bundler_errors(error)
           if error.error_class == "JSON::ParserError"
             msg = "Error evaluating your dependency files: #{error.message}"
@@ -103,27 +127,24 @@ module Dependabot
           case error.error_class
           when "Bundler::Dsl::DSLError", "Bundler::GemspecError"
             # We couldn't evaluate the Gemfile, let alone resolve it
-            raise Dependabot::DependencyFileNotEvaluatable, msg
+            raise registry_metadata_error(error) || Dependabot::DependencyFileNotEvaluatable.new(msg)
           when "Bundler::Source::Git::MissingGitRevisionError"
-            gem_name =
-              error.message.match(GIT_REF_REGEX)
-                   .named_captures["path"]
-                   .split("/").last
-            raise GitDependencyReferenceNotFound, gem_name
+            match_data = error.message.match(GIT_REF_REGEX)
+            gem_name = T.must(T.must(match_data).named_captures["path"])
+                        .split("/").last
+            raise GitDependencyReferenceNotFound, T.must(gem_name)
           when "Bundler::PathError"
-            gem_name =
-              error.message.match(PATH_REGEX)
-                   .named_captures["path"]
-                   .split("/").last.split("-")[0..-2].join
+            match_data = error.message.match(PATH_REGEX)
+            path = T.must(T.must(match_data).named_captures["path"])
+            gem_name = T.must(T.must(path.split("/").last).split("-")[0..-2]).join
             raise Dependabot::PathDependenciesNotReachable, [gem_name]
           when "Bundler::Source::Git::GitCommandError"
             if error.message.match?(GIT_REGEX)
               # We couldn't find the specified branch / commit (or the two
               # weren't compatible).
-              gem_name =
-                error.message.match(GIT_REGEX)
-                     .named_captures["path"]
-                     .split("/").last.split("-")[0..-2].join
+              match_data = error.message.match(GIT_REGEX)
+              path = T.must(T.must(match_data).named_captures["path"])
+              gem_name = T.must(T.must(path.split("/").last).split("-")[0..-2]).join
               raise GitDependencyReferenceNotFound, gem_name
             end
 
@@ -144,24 +165,24 @@ module Dependabot
             raise Dependabot::DependencyFileNotResolvable, msg
           when "Bundler::Fetcher::AuthenticationRequiredError"
             regex = BundlerErrorPatterns::MISSING_AUTH_REGEX
-            source = error.message.match(regex)[:source]
+            source = T.must(T.must(error.message.match(regex))[:source])
             raise Dependabot::PrivateSourceAuthenticationFailure, source
           when "Bundler::Fetcher::AuthenticationForbiddenError"
             regex = BundlerErrorPatterns::FORBIDDEN_AUTH_REGEX
-            source = error.message.match(regex)[:source]
+            source = T.must(T.must(error.message.match(regex))[:source])
             raise Dependabot::PrivateSourceAuthenticationFailure, source
           when "Bundler::Fetcher::BadAuthenticationError"
             regex = BundlerErrorPatterns::BAD_AUTH_REGEX
-            source = error.message.match(regex)[:source]
+            source = T.must(T.must(error.message.match(regex))[:source])
             raise Dependabot::PrivateSourceAuthenticationFailure, source
           when "Bundler::Fetcher::CertificateFailureError"
             regex = BundlerErrorPatterns::BAD_CERT_REGEX
-            source = error.message.match(regex)[:source]
+            source = T.must(T.must(error.message.match(regex))[:source])
             raise Dependabot::PrivateSourceCertificateFailure, source
           when "Bundler::HTTPError"
             regex = BundlerErrorPatterns::HTTP_ERR_REGEX
             if error.message.match?(regex)
-              source = error.message.match(regex)[:source]
+              source = T.must(T.must(error.message.match(regex))[:source])
               raise if [
                 "rubygems.org",
                 "www.rubygems.org"
@@ -184,6 +205,46 @@ module Dependabot
         # rubocop:enable Metrics/AbcSize
         # rubocop:enable Metrics/MethodLength
 
+        # When Bundler fails to parse gem metadata served by a registry's compact
+        # index, surface it as a private source error (the registry returned bad
+        # data) rather than blaming the user's dependency files. Returns nil when
+        # the error isn't a registry metadata error so the caller can fall back.
+        sig do
+          params(error: Dependabot::SharedHelpers::HelperSubprocessFailed)
+            .returns(T.nilable(Dependabot::PrivateSourceBadResponse))
+        end
+        def registry_metadata_error(error)
+          match = error.message.match(REGISTRY_METADATA_ERROR_REGEX)
+          return nil unless match
+
+          source = private_registry_source
+          return nil unless source
+
+          # Bundler's original message identifies which gem/version the registry
+          # served unparseable metadata for, and why (e.g. the illformed
+          # requirement string). The structured job error only records the source
+          # host, so log the full message here to keep the offending gem
+          # diagnosable from the updater logs.
+          Dependabot.logger.error(
+            "Registry #{source} returned unparseable compact-index metadata for " \
+            "#{match[:gem]} (#{match[:version]}); raising PrivateSourceBadResponse. " \
+            "Original Bundler error: #{error.message.strip}"
+          )
+
+          parse_detail = match[:detail].to_s.strip.gsub(/\s*\n\s*/, "; ")
+          detail = "Invalid gem metadata returned for #{match[:gem]} (#{match[:version]}) " \
+                   "by the source: #{source}"
+          detail += " (#{parse_detail})" unless parse_detail.empty?
+
+          Dependabot::PrivateSourceBadResponse.new(source, detail)
+        end
+
+        sig { returns(T.nilable(String)) }
+        def private_registry_source
+          private_registry_credentials.filter_map { |cred| cred["host"] }.first
+        end
+
+        sig { returns(T::Array[T::Hash[String, T.untyped]]) }
         def inaccessible_git_dependencies
           in_a_native_bundler_context(error_handling: false) do |tmp_dir|
             git_specs = NativeHelpers.run_bundler_subprocess(
@@ -192,7 +253,7 @@ module Dependabot
               options: options,
               args: {
                 dir: tmp_dir,
-                gemfile_name: gemfile.name,
+                gemfile_name: T.must(gemfile).name,
                 credentials: credentials
               }
             )
@@ -210,8 +271,10 @@ module Dependabot
           end
         end
 
+        sig { returns(T.nilable(String)) }
         def jfrog_source
-          return @jfrog_source unless defined?(@jfrog_source)
+          @jfrog_source = T.let(@jfrog_source, T.nilable(String)) if @jfrog_source.nil?
+          return @jfrog_source unless @jfrog_source.nil?
 
           @jfrog_source = in_a_native_bundler_context(error_handling: false) do |dir|
             NativeHelpers.run_bundler_subprocess(
@@ -220,16 +283,14 @@ module Dependabot
               options: options,
               args: {
                 dir: dir,
-                gemfile_name: gemfile.name,
+                gemfile_name: T.must(gemfile).name,
                 credentials: credentials
               }
             )
           end
         end
 
-        sig { abstract.returns(String) }
-        def bundler_version; end
-
+        sig { void }
         def write_temporary_dependency_files
           dependency_files.each do |file|
             path = file.name
@@ -237,23 +298,32 @@ module Dependabot
             File.write(path, file.content)
           end
 
-          File.write(lockfile.name, lockfile.content) if lockfile
+          lockfile_obj = lockfile
+          File.write(lockfile_obj.name, lockfile_obj.content) if lockfile_obj
         end
 
+        sig { returns(T::Array[Dependabot::Credential]) }
         def private_registry_credentials
           credentials
             .select { |cred| cred["type"] == "rubygems_server" }
         end
 
+        sig { returns(T.nilable(Dependabot::DependencyFile)) }
         def gemfile
           dependency_files.find { |f| f.name == "Gemfile" } ||
             dependency_files.find { |f| f.name == "gems.rb" }
         end
 
+        sig { returns(T.nilable(Dependabot::DependencyFile)) }
         def lockfile
           dependency_files.find { |f| f.name == "Gemfile.lock" } ||
             dependency_files.find { |f| f.name == "gems.locked" }
         end
+
+        private
+
+        sig { abstract.returns(String) }
+        def bundler_version; end
       end
     end
   end

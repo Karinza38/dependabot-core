@@ -61,9 +61,12 @@ RSpec.describe Dependabot::Maven::UpdateChecker do
       dependency_files: dependency_files,
       credentials: credentials,
       ignored_versions: ignored_versions,
-      security_advisories: security_advisories
+      security_advisories: security_advisories,
+      update_cooldown: cooldown_options
     )
   end
+
+  let(:cooldown_options) { nil }
 
   before do
     stub_request(:get, maven_central_metadata_url)
@@ -187,6 +190,151 @@ RSpec.describe Dependabot::Maven::UpdateChecker do
 
         it { is_expected.to eq(version_class.new("23.0")) }
       end
+    end
+
+    context "when checking updates for a dependency that references ${project.parent.version}" do
+      let(:pom_body) { fixture("poms", "parent_with_processor_referencing_it.xml") }
+
+      context "when checking updates for the annotation processor" do
+        let(:dependency_name) { "com.example:annotation-processor" }
+        let(:dependency_version) { "3.2.0" }
+        let(:ignored_versions) { [">= 4.a0"] }
+        let(:dependency_requirements) do
+          [{
+            file: "pom.xml",
+            requirement: "3.2.0",
+            groups: [],
+            metadata: {
+              packaging_type: "jar",
+              property_name: "project.parent.version",
+              property_source: "pom.xml"
+            },
+            source: nil
+          }]
+        end
+        let(:maven_central_metadata_url) do
+          "https://repo.maven.apache.org/maven2/" \
+            "com/example/annotation-processor/maven-metadata.xml"
+        end
+        let(:maven_central_releases) do
+          fixture("maven_central_metadata", "parent_pom.xml")
+        end
+
+        before do
+          stub_request(:head, "https://repo.maven.apache.org/maven2/com/example/annotation-processor/4.1.0/annotation-processor-4.1.0.jar")
+            .to_return(status: 200)
+          stub_request(:head, "https://repo.maven.apache.org/maven2/com/example/annotation-processor/3.4.1/annotation-processor-3.4.1.jar")
+            .to_return(status: 200)
+          stub_request(:get, "https://repo.maven.apache.org/maven2/com/example/parent-pom/3.2.0/parent-pom-3.2.0.pom")
+            .to_return(status: 200, body: fixture("poms", "parent-pom-3.2.0.pom"))
+        end
+
+        it { is_expected.to eq(version_class.new("3.4.1")) }
+
+        it "returns nil for latest_resolvable_version" do
+          expect(checker.latest_resolvable_version).to be_nil
+        end
+
+        context "when a minor update is available" do
+          let(:ignored_versions) { [] }
+
+          before do
+            stub_request(:head, "https://repo.maven.apache.org/maven2/com/example/annotation-processor/3.4.1/annotation-processor-3.4.1.jar")
+              .to_return(status: 200)
+          end
+
+          it "returns the latest minor version as latest_version" do
+            expect(checker.latest_version).to eq(version_class.new("4.1.0"))
+          end
+
+          it "returns nil for latest_resolvable_version" do
+            expect(checker.latest_resolvable_version).to be_nil
+          end
+
+          it "prevents the processor from updating via any path" do
+            # Dependencies using ${project.parent.version} should not drive parent updates.
+            # The parent must be updated directly, where its own constraints will be checked.
+            expect(checker.can_update?(requirements_to_unlock: :own)).to be(false)
+            expect(checker.can_update?(requirements_to_unlock: :all)).to be(false)
+          end
+        end
+      end
+
+      context "when checking updates for the parent POM" do
+        let(:dependency_name) { "com.example:parent-pom" }
+        let(:dependency_version) { "3.2.0" }
+        let(:dependency_requirements) do
+          [{
+            file: "pom.xml",
+            requirement: "3.2.0",
+            groups: [],
+            metadata: {
+              packaging_type: "pom"
+            },
+            source: nil
+          }]
+        end
+        let(:maven_central_metadata_url) do
+          "https://repo.maven.apache.org/maven2/" \
+            "com/example/parent-pom/maven-metadata.xml"
+        end
+        let(:maven_central_releases) do
+          fixture("maven_central_metadata", "parent_pom.xml")
+        end
+
+        before do
+          stub_request(:head, "https://repo.maven.apache.org/maven2/com/example/parent-pom/4.1.0/parent-pom-4.1.0.pom")
+            .to_return(status: 200)
+          stub_request(:get, "https://repo.maven.apache.org/maven2/com/example/parent-pom/3.2.0/parent-pom-3.2.0.pom")
+            .to_return(status: 200, body: fixture("poms", "parent-pom-3.2.0.pom"))
+        end
+
+        it "can be updated normally" do
+          expect(checker.latest_version).to eq(version_class.new("4.1.0"))
+          expect(checker.latest_resolvable_version).to eq(version_class.new("4.1.0"))
+        end
+      end
+    end
+  end
+
+  describe "#latest_resolvable_version" do
+    subject { checker.latest_resolvable_version }
+
+    it { is_expected.to eq(version_class.new("23.6-jre")) }
+
+    context "when checking updates for a dependency that references ${project.parent.version}" do
+      let(:pom_body) { fixture("poms", "parent_with_processor_referencing_it.xml") }
+      let(:dependency_name) { "com.example:annotation-processor" }
+      let(:dependency_version) { "3.2.0" }
+      let(:dependency_requirements) do
+        [{
+          file: "pom.xml",
+          requirement: "3.2.0",
+          groups: [],
+          metadata: {
+            packaging_type: "jar",
+            property_name: "project.parent.version",
+            property_source: "pom.xml"
+          },
+          source: nil
+        }]
+      end
+      let(:maven_central_metadata_url) do
+        "https://repo.maven.apache.org/maven2/" \
+          "com/example/annotation-processor/maven-metadata.xml"
+      end
+      let(:maven_central_releases) do
+        fixture("maven_central_metadata", "parent_pom.xml")
+      end
+
+      before do
+        stub_request(:head, "https://repo.maven.apache.org/maven2/com/example/annotation-processor/4.1.0/annotation-processor-4.1.0.jar")
+          .to_return(status: 200)
+        stub_request(:get, "https://repo.maven.apache.org/maven2/com/example/parent-pom/3.2.0/parent-pom-3.2.0.pom")
+          .to_return(status: 200, body: fixture("poms", "parent-pom-3.2.0.pom"))
+      end
+
+      it { is_expected.to be_nil }
     end
   end
 
@@ -668,7 +816,8 @@ RSpec.describe Dependabot::Maven::UpdateChecker do
             target_version_details: {
               version: version_class.new("23.6-jre"),
               source_url: "https://repo.maven.apache.org/maven2"
-            }
+            },
+            update_cooldown: nil
           )
           .and_call_original
         expect(latest_version_resolvable_with_full_unlock).to be(true)
@@ -727,86 +876,180 @@ RSpec.describe Dependabot::Maven::UpdateChecker do
           )
       end
 
-      it "delegates to the PropertyUpdater" do
-        expect(described_class::PropertyUpdater)
-          .to receive(:new)
-          .with(
-            dependency: dependency,
-            dependency_files: dependency_files,
-            credentials: credentials,
-            ignored_versions: [],
-            target_version_details: {
-              version: version_class.new("23.6-jre"),
-              source_url: "https://repo.maven.apache.org/maven2"
-            }
-          )
-          .and_call_original
-        expect(checker_updated_dependencies_after_full_unlock).to eq(
-          [
-            Dependabot::Dependency.new(
-              name: "org.springframework:spring-beans",
-              version: "23.6-jre",
-              previous_version: "4.3.12.RELEASE",
-              requirements: [{
-                file: "pom.xml",
-                requirement: "23.6-jre",
-                groups: [],
-                source: {
-                  type: "maven_repo",
-                  url: "https://repo.maven.apache.org/maven2"
-                },
-                metadata: {
-                  property_name: "springframework.version",
-                  property_source: "pom.xml",
-                  packaging_type: "jar"
-                }
-              }],
-              previous_requirements: [{
-                file: "pom.xml",
-                requirement: "4.3.12.RELEASE",
-                groups: [],
-                source: nil,
-                metadata: {
-                  property_name: "springframework.version",
-                  property_source: "pom.xml",
-                  packaging_type: "jar"
-                }
-              }],
-              package_manager: "maven"
-            ),
-            Dependabot::Dependency.new(
-              name: "org.springframework:spring-context",
-              version: "23.6-jre",
-              previous_version: "4.3.12.RELEASE",
-              requirements: [{
-                file: "pom.xml",
-                requirement: "23.6-jre",
-                groups: [],
-                source: {
-                  type: "maven_repo",
-                  url: "https://repo.maven.apache.org/maven2"
-                },
-                metadata: {
-                  property_name: "springframework.version",
-                  property_source: "pom.xml",
-                  packaging_type: "jar"
-                }
-              }],
-              previous_requirements: [{
-                file: "pom.xml",
-                requirement: "4.3.12.RELEASE",
-                groups: [],
-                source: nil,
-                metadata: {
-                  property_name: "springframework.version",
-                  property_source: "pom.xml",
-                  packaging_type: "jar"
-                }
-              }],
-              package_manager: "maven"
+      context "without cooldown options" do
+        it "delegates to the PropertyUpdater" do
+          expect(described_class::PropertyUpdater)
+            .to receive(:new)
+            .with(
+              dependency: dependency,
+              dependency_files: dependency_files,
+              credentials: credentials,
+              ignored_versions: [],
+              target_version_details: {
+                version: version_class.new("23.6-jre"),
+                source_url: "https://repo.maven.apache.org/maven2"
+              },
+              update_cooldown: nil
             )
-          ]
-        )
+            .and_call_original
+          expect(checker_updated_dependencies_after_full_unlock).to eq(
+            [
+              Dependabot::Dependency.new(
+                name: "org.springframework:spring-beans",
+                version: "23.6-jre",
+                previous_version: "4.3.12.RELEASE",
+                requirements: [{
+                  file: "pom.xml",
+                  requirement: "23.6-jre",
+                  groups: [],
+                  source: {
+                    type: "maven_repo",
+                    url: "https://repo.maven.apache.org/maven2"
+                  },
+                  metadata: {
+                    property_name: "springframework.version",
+                    property_source: "pom.xml",
+                    packaging_type: "jar"
+                  }
+                }],
+                previous_requirements: [{
+                  file: "pom.xml",
+                  requirement: "4.3.12.RELEASE",
+                  groups: [],
+                  source: nil,
+                  metadata: {
+                    property_name: "springframework.version",
+                    property_source: "pom.xml",
+                    packaging_type: "jar"
+                  }
+                }],
+                package_manager: "maven"
+              ),
+              Dependabot::Dependency.new(
+                name: "org.springframework:spring-context",
+                version: "23.6-jre",
+                previous_version: "4.3.12.RELEASE",
+                requirements: [{
+                  file: "pom.xml",
+                  requirement: "23.6-jre",
+                  groups: [],
+                  source: {
+                    type: "maven_repo",
+                    url: "https://repo.maven.apache.org/maven2"
+                  },
+                  metadata: {
+                    property_name: "springframework.version",
+                    property_source: "pom.xml",
+                    packaging_type: "jar"
+                  }
+                }],
+                previous_requirements: [{
+                  file: "pom.xml",
+                  requirement: "4.3.12.RELEASE",
+                  groups: [],
+                  source: nil,
+                  metadata: {
+                    property_name: "springframework.version",
+                    property_source: "pom.xml",
+                    packaging_type: "jar"
+                  }
+                }],
+                package_manager: "maven"
+              )
+            ]
+          )
+        end
+      end
+
+      context "with cooldown options" do
+        let(:cooldown_options) do
+          Dependabot::Package::ReleaseCooldownOptions.new(
+            default_days: 20 # Now is 2017-12-14 , 23.5-jre release date: 2017-11-22
+          )
+        end
+
+        it "delegates to the PropertyUpdater" do
+          expect(described_class::PropertyUpdater)
+            .to receive(:new)
+            .with(
+              dependency: dependency,
+              dependency_files: dependency_files,
+              credentials: credentials,
+              ignored_versions: [],
+              target_version_details: {
+                version: version_class.new("23.6-jre"),
+                source_url: "https://repo.maven.apache.org/maven2"
+              },
+              update_cooldown: cooldown_options
+            )
+            .and_call_original
+          expect(checker_updated_dependencies_after_full_unlock).to eq(
+            [
+              Dependabot::Dependency.new(
+                name: "org.springframework:spring-beans",
+                version: "23.6-jre",
+                previous_version: "4.3.12.RELEASE",
+                requirements: [{
+                  file: "pom.xml",
+                  requirement: "23.6-jre",
+                  groups: [],
+                  source: {
+                    type: "maven_repo",
+                    url: "https://repo.maven.apache.org/maven2"
+                  },
+                  metadata: {
+                    property_name: "springframework.version",
+                    property_source: "pom.xml",
+                    packaging_type: "jar"
+                  }
+                }],
+                previous_requirements: [{
+                  file: "pom.xml",
+                  requirement: "4.3.12.RELEASE",
+                  groups: [],
+                  source: nil,
+                  metadata: {
+                    property_name: "springframework.version",
+                    property_source: "pom.xml",
+                    packaging_type: "jar"
+                  }
+                }],
+                package_manager: "maven"
+              ),
+              Dependabot::Dependency.new(
+                name: "org.springframework:spring-context",
+                version: "23.6-jre",
+                previous_version: "4.3.12.RELEASE",
+                requirements: [{
+                  file: "pom.xml",
+                  requirement: "23.6-jre",
+                  groups: [],
+                  source: {
+                    type: "maven_repo",
+                    url: "https://repo.maven.apache.org/maven2"
+                  },
+                  metadata: {
+                    property_name: "springframework.version",
+                    property_source: "pom.xml",
+                    packaging_type: "jar"
+                  }
+                }],
+                previous_requirements: [{
+                  file: "pom.xml",
+                  requirement: "4.3.12.RELEASE",
+                  groups: [],
+                  source: nil,
+                  metadata: {
+                    property_name: "springframework.version",
+                    property_source: "pom.xml",
+                    packaging_type: "jar"
+                  }
+                }],
+                package_manager: "maven"
+              )
+            ]
+          )
+        end
       end
     end
   end

@@ -1,4 +1,4 @@
-# typed: true
+# typed: strong
 # frozen_string_literal: true
 
 require "sorbet-runtime"
@@ -18,17 +18,30 @@ module Dependabot
       class FilePreparer
         extend T::Sig
 
-        def initialize(dependency_files:, dependency:,
-                       unlock_requirement: true,
-                       replacement_git_pin: nil,
-                       latest_allowable_version: nil)
+        sig do
+          params(
+            dependency_files: T::Array[Dependabot::DependencyFile],
+            dependency: Dependabot::Dependency,
+            unlock_requirement: T.any(T.nilable(Symbol), T::Boolean),
+            replacement_git_pin: T.nilable(String),
+            latest_allowable_version: T.nilable(Gem::Version)
+          ).void
+        end
+        def initialize(
+          dependency_files:,
+          dependency:,
+          unlock_requirement: true,
+          replacement_git_pin: nil,
+          latest_allowable_version: nil
+        )
           @dependency_files = dependency_files
           @dependency = dependency
-          @unlock_requirement = unlock_requirement
+          @unlock_requirement = T.let(unlock_requirement ? true : false, T::Boolean)
           @replacement_git_pin = replacement_git_pin
           @latest_allowable_version = latest_allowable_version
         end
 
+        sig { returns(T::Array[Dependabot::DependencyFile]) }
         def prepared_dependency_files
           files = []
           files += mixfiles.map do |file|
@@ -45,21 +58,31 @@ module Dependabot
 
         private
 
+        sig { returns(T::Array[Dependabot::DependencyFile]) }
         attr_reader :dependency_files
+
+        sig { returns(Dependabot::Dependency) }
         attr_reader :dependency
+
+        sig { returns(T.nilable(String)) }
         attr_reader :replacement_git_pin
+
+        sig { returns(T.nilable(Gem::Version)) }
         attr_reader :latest_allowable_version
 
+        sig { returns(T::Boolean) }
         def unlock_requirement?
           @unlock_requirement
         end
 
+        sig { returns(T::Boolean) }
         def replace_git_pin?
           !replacement_git_pin.nil?
         end
 
+        sig { params(file: Dependabot::DependencyFile).returns(String) }
         def mixfile_content_for_update_check(file)
-          content = file.content
+          content = T.must(file.content)
 
           return sanitize_mixfile(content) unless dependency_appears_in_file?(file.name)
 
@@ -69,10 +92,11 @@ module Dependabot
           sanitize_mixfile(content)
         end
 
+        sig { params(content: String, filename: String).returns(String) }
         def relax_version(content, filename:)
           old_requirement =
-            dependency.requirements.find { |r| r.fetch(:file) == filename }
-                      .fetch(:requirement)
+            dependency.requirements.find { |r| r.file == filename }
+                      &.requirement_string
           updated_requirement = updated_version_requirement_string(filename)
 
           Hex::FileUpdater::MixfileRequirementUpdater.new(
@@ -80,10 +104,11 @@ module Dependabot
             mixfile_content: content,
             previous_requirement: old_requirement,
             updated_requirement: updated_requirement,
-            insert_if_bare: updated_requirement && updated_requirement != ">= 0"
+            insert_if_bare: !updated_requirement.nil?
           ).updated_content
         end
 
+        sig { params(filename: String).returns(T.nilable(String)) }
         def updated_version_requirement_string(filename)
           lower_bound_req = updated_version_req_lower_bound(filename)
 
@@ -96,17 +121,19 @@ module Dependabot
         # rubocop:disable Metrics/AbcSize
         # rubocop:disable Metrics/PerceivedComplexity
         # rubocop:disable Metrics/CyclomaticComplexity
+        sig { params(filename: String).returns(String) }
         def updated_version_req_lower_bound(filename)
           original_req = dependency.requirements
-                                   .find { |r| r.fetch(:file) == filename }
-                                   &.fetch(:requirement)
+                                   .find { |r| r.file == filename }
+                                   &.requirement_string
 
           if original_req && !unlock_requirement? then original_req
           elsif dependency.version&.match?(/^[0-9a-f]{40}$/) then ">= 0"
           elsif dependency.version then ">= #{dependency.version}"
           else
             version_for_requirement =
-              dependency.requirements.filter_map { |r| r[:requirement] }
+              dependency.requirements
+                        .filter_map(&:requirement_string)
                         .reject { |req_string| req_string.start_with?("<") }
                         .select { |req_string| req_string.match?(version_regex) }
                         .map { |req_string| req_string.match(version_regex) }
@@ -126,10 +153,11 @@ module Dependabot
         # rubocop:enable Metrics/CyclomaticComplexity
         # rubocop:enable Metrics/AbcSize
 
+        sig { params(content: String, filename: String).returns(String) }
         def replace_git_pin(content, filename:)
           old_pin =
-            dependency.requirements.find { |r| r.fetch(:file) == filename }
-                      &.dig(:source, :ref)
+            dependency.requirements.find { |r| r.file == filename }
+                      &.source_string("ref")
 
           return content unless old_pin
           return content if old_pin == replacement_git_pin
@@ -138,16 +166,18 @@ module Dependabot
             dependency_name: dependency.name,
             mixfile_content: content,
             previous_pin: old_pin,
-            updated_pin: replacement_git_pin
+            updated_pin: T.must(replacement_git_pin)
           ).updated_content
         end
 
+        sig { params(content: String).returns(String) }
         def sanitize_mixfile(content)
           Hex::FileUpdater::MixfileSanitizer.new(
             mixfile_content: content
           ).sanitized_content
         end
 
+        sig { returns(T::Array[Dependabot::DependencyFile]) }
         def mixfiles
           mixfiles =
             dependency_files
@@ -157,14 +187,23 @@ module Dependabot
           mixfiles
         end
 
+        sig { returns(T.nilable(Dependabot::DependencyFile)) }
         def lockfile
-          @lockfile ||= dependency_files.find { |f| f.name == "mix.lock" }
+          @lockfile ||= T.let(
+            dependency_files.find { |f| f.name == "mix.lock" },
+            T.nilable(Dependabot::DependencyFile)
+          )
         end
 
+        sig { returns(T::Array[Dependabot::DependencyFile]) }
         def support_files
-          @support_files ||= dependency_files.select(&:support_file)
+          @support_files ||= T.let(
+            dependency_files.select(&:support_file),
+            T.nilable(T::Array[Dependabot::DependencyFile])
+          )
         end
 
+        sig { returns(T::Boolean) }
         def wants_prerelease?
           current_version = dependency.version
           if current_version &&
@@ -174,20 +213,23 @@ module Dependabot
           end
 
           dependency.requirements.any? do |req|
-            req[:requirement].match?(/\d-[A-Za-z0-9]/)
+            req.requirement_string&.match?(/\d-[A-Za-z0-9]/)
           end
         end
 
+        sig { returns(T.class_of(Dependabot::Version)) }
         def version_class
           dependency.version_class
         end
 
+        sig { returns(Regexp) }
         def version_regex
-          Dependabot::Hex::Version::VERSION_PATTERN
+          Regexp.new(Dependabot::Hex::Version::VERSION_PATTERN)
         end
 
+        sig { params(file_name: String).returns(T::Boolean) }
         def dependency_appears_in_file?(file_name)
-          dependency.requirements.any? { |r| r[:file] == file_name }
+          dependency.requirements.any? { |r| r.file == file_name }
         end
       end
     end

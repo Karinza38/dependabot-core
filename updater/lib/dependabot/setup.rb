@@ -16,36 +16,49 @@ Dependabot.logger = Logger.new($stdout).tap do |logger|
   logger.formatter = Dependabot::Logger::BasicFormatter.new
 end
 
+# rubocop:disable-next Metrics/BlockLength
 Sentry.init do |config|
   config.release = ENV.fetch("DEPENDABOT_UPDATER_VERSION")
-  config.logger = Dependabot.logger
+  config.sdk_logger = Dependabot.logger
   config.project_root = File.expand_path("../../..", __dir__)
 
   config.app_dirs_pattern = %r{(
     dependabot-updater/bin|
     dependabot-updater/config|
     dependabot-updater/lib|
+    bazel|
     common|
-    python|
-    terraform|
-    elm|
+    bundler|
+    cargo|
+    composer|
+    conda|
+    deno|
+    devcontainers|
     docker|
     dotnet_sdk|
+    elm|
     git_submodules|
     github_actions|
-    composer|
-    nuget|
-    gradle|
-    maven|
-    hex|
-    cargo|
     go_modules|
+    gradle|
+    helm|
+    hex|
+    julia|
+    maven|
+    nix|
     npm_and_yarn|
-    bundler|
+    nuget|
+    pre_commit|
     pub|
+    python|
+    rust_toolchain|
+    sbt|
     silent|
     swift|
-    devcontainers
+    terraform|
+    opentofu|
+    uv|
+    vcpkg|
   )}x
 
   config.before_send = ->(event, hint) { Dependabot::Sentry.process_chain(event, hint) }
@@ -57,23 +70,37 @@ Dependabot::OpenTelemetry.configure
 Dependabot::Sorbet::Runtime.silently_report_errors!
 
 # Ecosystems
-require "dependabot/python"
-require "dependabot/terraform"
-require "dependabot/elm"
+require "dependabot/bazel"
+require "dependabot/bun"
+require "dependabot/bundler"
+require "dependabot/cargo"
+require "dependabot/composer"
+require "dependabot/conda"
+require "dependabot/deno"
+require "dependabot/devcontainers"
 require "dependabot/docker"
+require "dependabot/docker_compose"
 require "dependabot/dotnet_sdk"
+require "dependabot/elm"
 require "dependabot/git_submodules"
 require "dependabot/github_actions"
-require "dependabot/composer"
-require "dependabot/nuget"
-require "dependabot/gradle"
-require "dependabot/maven"
-require "dependabot/hex"
-require "dependabot/cargo"
 require "dependabot/go_modules"
+require "dependabot/gradle"
+require "dependabot/helm"
+require "dependabot/hex"
+require "dependabot/julia"
+require "dependabot/maven"
+require "dependabot/nix"
 require "dependabot/npm_and_yarn"
-require "dependabot/bundler"
+require "dependabot/nuget"
+require "dependabot/pre_commit"
 require "dependabot/pub"
+require "dependabot/python"
+require "dependabot/rust_toolchain"
+require "dependabot/sbt"
 require "dependabot/silent"
 require "dependabot/swift"
-require "dependabot/devcontainers"
+require "dependabot/terraform"
+require "dependabot/opentofu"
+require "dependabot/uv"
+require "dependabot/vcpkg"

@@ -27,6 +27,7 @@ RSpec.describe Dependabot::Composer::UpdateChecker do
   let(:security_advisories) { [] }
   let(:raise_on_ignored) { false }
   let(:ignored_versions) { [] }
+  let(:update_cooldown) { nil }
   let(:dependency) do
     Dependabot::Dependency.new(
       name: dependency_name,
@@ -43,7 +44,8 @@ RSpec.describe Dependabot::Composer::UpdateChecker do
       ignored_versions: ignored_versions,
       raise_on_ignored: raise_on_ignored,
       security_advisories: security_advisories,
-      requirements_update_strategy: requirements_update_strategy
+      requirements_update_strategy: requirements_update_strategy,
+      update_cooldown: update_cooldown
     )
   end
 
@@ -159,6 +161,58 @@ RSpec.describe Dependabot::Composer::UpdateChecker do
       end
 
       it { is_expected.to eq("303b8a83c87d5c6d749926cf02620465a5dcd0f2") }
+
+      context "when pinned to a version-like tag" do
+        let(:requirements) do
+          [{
+            requirement: "1.0.*",
+            file: "composer.json",
+            groups: ["runtime"],
+            source: {
+              type: "git",
+              url: "https://github.com/dependabot/monolog.git",
+              branch: "example",
+              ref: "1.16.0"
+            }
+          }]
+        end
+
+        it { is_expected.to eq("1e044bc4b34e91743943479f1be7a1d5eb93add0") }
+
+        context "with a cooldown period configured" do
+          let(:update_cooldown) do
+            Dependabot::Package::ReleaseCooldownOptions.new(default_days: 90)
+          end
+
+          before do
+            allow(checker.send(:git_commit_checker))
+              .to receive(:refs_for_tag_with_detail)
+              .and_return(
+                [
+                  Dependabot::GitTagWithDetail.new(tag: "1.22.0", release_date: "2018-01-02"),
+                  Dependabot::GitTagWithDetail.new(
+                    tag: "1.22.1",
+                    release_date: Time.now.strftime("%Y-%m-%d")
+                  )
+                ]
+              )
+          end
+
+          it "skips the version tag still within its cooldown window" do
+            expect(checker.latest_version)
+              .to eq("bad29cb8d18ab0315e6c477751418a82c850d558")
+          end
+
+          context "when there is no cooldown (e.g. a security update)" do
+            let(:update_cooldown) { nil }
+
+            it "uses the latest version tag" do
+              expect(checker.latest_version)
+                .to eq("1e044bc4b34e91743943479f1be7a1d5eb93add0")
+            end
+          end
+        end
+      end
     end
   end
 
@@ -694,11 +748,13 @@ RSpec.describe Dependabot::Composer::UpdateChecker do
       before do
         allow(checker).to receive(:latest_version_from_registry)
           .and_return(Gem::Version.new("3.0.2"))
-        stub_request(:get, "https://wpackagist.org/packages.json")
-          .to_return(
-            status: 200,
-            body: fixture("wpackagist_response.json")
-          )
+
+        version_resolver = instance_double(
+          Dependabot::Composer::UpdateChecker::VersionResolver,
+          latest_resolvable_version: Dependabot::Composer::Version.new("3.0.2")
+        )
+        allow(Dependabot::Composer::UpdateChecker::VersionResolver)
+          .to receive(:new).and_return(version_resolver)
       end
 
       it { is_expected.to be >= Gem::Version.new("3.0.2") }
@@ -720,14 +776,22 @@ RSpec.describe Dependabot::Composer::UpdateChecker do
       it { is_expected.to be_nil }
     end
 
+    context "with an invalid composer.json file" do
+      let(:project_name) { "invalid_manifest" }
+
+      it "raises a helpful error" do
+        expect { latest_resolvable_version }.to raise_error(Dependabot::DependencyFileNotParseable)
+      end
+    end
+
     context "when a sub-dependency would block the update" do
       let(:project_name) { "subdependency_update_required" }
       let(:dependency_name) { "illuminate/support" }
-      let(:dependency_version) { "5.2.0" }
+      let(:dependency_version) { "6.20.44" }
       let(:requirements) do
         [{
           file: "composer.json",
-          requirement: "^5.2.0",
+          requirement: "^6.0.0",
           groups: ["runtime"],
           source: nil
         }]
@@ -735,19 +799,11 @@ RSpec.describe Dependabot::Composer::UpdateChecker do
 
       before do
         allow(checker).to receive(:latest_version_from_registry)
-          .and_return(Gem::Version.new("5.6.23"))
+          .and_return(Gem::Version.new("9.52.16"))
       end
 
-      # 5.5.0 series and up require an update to illuminate/contracts
-      it { is_expected.to be >= Gem::Version.new("5.6.23") }
-    end
-
-    context "with an invalid composer.json file" do
-      let(:project_name) { "invalid_manifest" }
-
-      it "raises a helpful error" do
-        expect { latest_resolvable_version }.to raise_error(Dependabot::DependencyFileNotParseable)
-      end
+      # Should be able to update to a newer version
+      it { is_expected.to be >= Gem::Version.new("6.20.44") }
     end
   end
 

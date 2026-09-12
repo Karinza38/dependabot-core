@@ -112,6 +112,22 @@
     }
   },
   {
+    "name": "Containerfile",
+    "path": "Containerfile",
+    "sha": "311f9743315183cc6751313cb251cfeb3de45c1a",
+    "size": 4927,
+    "url": "https://api.github.com/repos/dependabot/dependabot-core/contents/Containerfile?ref=master",
+    "html_url": "https://github.com/dependabot/dependabot-core/blob/main/Containerfile",
+    "git_url": "https://api.github.com/repos/dependabot/dependabot-core/git/blobs/311f9743315183cc6751313cb251cfeb3de45c1a",
+    "download_url": "https://raw.githubusercontent.com/dependabot/dependabot-core/master/Containerfile",
+    "type": "file",
+    "_links": {
+      "self": "https://api.github.com/repos/dependabot/dependabot-core/contents/Containerfile?ref=master",
+      "git": "https://api.github.com/repos/dependabot/dependabot-core/git/blobs/311f9743315183cc6751313cb251cfeb3de45c1a",
+      "html": "https://github.com/dependabot/dependabot-core/blob/main/Containerfile"
+    }
+  },
+  {
     "name": "Dockerfile-base",
     "path": "Dockerfile-base",
     "sha": "311f9743315183cc6751313cb251cfeb3de45c1a",
@@ -125,6 +141,38 @@
       "self": "https://api.github.com/repos/dependabot/dependabot-core/contents/Dockerfile-base?ref=master",
       "git": "https://api.github.com/repos/dependabot/dependabot-core/git/blobs/311f9743315183cc6751313cb251cfeb3de45c1a",
       "html": "https://github.com/dependabot/dependabot-core/blob/main/Dockerfile-base"
+    }
+  },
+  {
+    "name": "docker-compose.yml",
+    "path": "docker-compose.yml",
+    "sha": "311f9743315183cc6751313cb251cfeb3de45c1a",
+    "size": 4927,
+    "url": "https://api.github.com/repos/dependabot/dependabot-core/contents/docker-compose.yml?ref=master",
+    "html_url": "https://github.com/dependabot/dependabot-core/blob/main/docker-compose.yml",
+    "git_url": "https://api.github.com/repos/dependabot/dependabot-core/git/blobs/311f9743315183cc6751313cb251cfeb3de45c1a",
+    "download_url": "https://raw.githubusercontent.com/dependabot/dependabot-core/master/docker-compose.yml",
+    "type": "file",
+    "_links": {
+      "self": "https://api.github.com/repos/dependabot/dependabot-core/contents/docker-compose.yml?ref=master",
+      "git": "https://api.github.com/repos/dependabot/dependabot-core/git/blobs/311f9743315183cc6751313cb251cfeb3de45c1a",
+      "html": "https://github.com/dependabot/dependabot-core/blob/main/docker-compose.yml"
+    }
+  },
+  {
+    "name": "docker-compose.override.yml",
+    "path": "docker-compose.override.yml",
+    "sha": "311f9743315183cc6751313cb251cfeb3de45c1a",
+    "size": 4927,
+    "url": "https://api.github.com/repos/dependabot/dependabot-core/contents/docker-compose.override.yml?ref=master",
+    "html_url": "https://github.com/dependabot/dependabot-core/blob/main/docker-compose.override.yml",
+    "git_url": "https://api.github.com/repos/dependabot/dependabot-core/git/blobs/311f9743315183cc6751313cb251cfeb3de45c1a",
+    "download_url": "https://raw.githubusercontent.com/dependabot/dependabot-core/master/docker-compose.override.yml",
+    "type": "file",
+    "_links": {
+      "self": "https://api.github.com/repos/dependabot/dependabot-core/contents/docker-compose.override.yml?ref=master",
+      "git": "https://api.github.com/repos/dependabot/dependabot-core/git/blobs/311f9743315183cc6751313cb251cfeb3de45c1a",
+      "html": "https://github.com/dependabot/dependabot-core/blob/main/docker-compose.override.yml"
     }
   },
   {

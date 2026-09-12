@@ -3,6 +3,8 @@
 
 require "sorbet-runtime"
 
+require "dependabot/dependency_requirement"
+
 module Dependabot
   module RequirementsUpdater
     module Base
@@ -15,8 +17,10 @@ module Dependabot
 
       interface!
 
-      sig { abstract.returns(T::Array[T::Hash[Symbol, T.untyped]]) }
+      sig { abstract.returns(T::Array[Dependabot::DependencyRequirement]) }
       def updated_requirements; end
+
+      private
 
       sig { abstract.returns(T::Class[Version]) }
       def version_class; end

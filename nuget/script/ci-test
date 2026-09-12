@@ -2,13 +2,11 @@
 
 set -e
 
-pushd ./helpers/lib/NuGetUpdater
-dotnet restore
-dotnet format --no-restore --exclude ../NuGet.Client --verify-no-changes -v diag
-dotnet build --configuration Release
-dotnet test --configuration Release --no-restore --no-build --logger "console;verbosity=normal" --blame-hang-timeout 5m ./NuGetUpdater.Cli.Test/NuGetUpdater.Cli.Test.csproj
-dotnet test --configuration Release --no-restore --no-build --logger "console;verbosity=normal" --blame-hang-timeout 5m ./NuGetUpdater.Core.Test/NuGetUpdater.Core.Test.csproj
-popd
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+NUGET_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-bundle install
-bundle exec rspec spec
+# PowerShell unit tests
+pwsh "$NUGET_DIR/updater/test.ps1"
+
+# C# unit tests
+"$SCRIPT_DIR/run-csharp-tests"

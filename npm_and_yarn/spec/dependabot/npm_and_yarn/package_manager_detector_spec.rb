@@ -61,9 +61,28 @@ RSpec.describe Dependabot::NpmAndYarn::PackageManagerDetector do
     )
   end
 
+  let(:bun_lockfile) do
+    instance_double(
+      Dependabot::DependencyFile,
+      name: "bun.lock",
+      content: <<~LOCKFILE
+        lockfileVersion: 1.1.39
+
+        dependencies:
+          lodash:
+            specifier: ^4.17.20
+            version: 4.17.21
+            resolution:
+              integrity: sha512-abc123
+              tarball: https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz
+      LOCKFILE
+    )
+  end
+
   let(:lockfiles) { { npm: npm_lockfile, yarn: yarn_lockfile, pnpm: pnpm_lockfile } }
   let(:package_json) { { "packageManager" => "npm@7" } }
-  let(:detector) { described_class.new(lockfiles, package_json) }
+  let(:config) { Dependabot::Package::NpmPackageManagerConfig.from_package_json(package_json) }
+  let(:detector) { described_class.new(lockfiles, config) }
 
   describe "#detect_package_manager" do
     context "when npm lockfile exists" do
@@ -147,6 +166,15 @@ RSpec.describe Dependabot::NpmAndYarn::PackageManagerDetector do
       context "when there are unknown keys in the engines" do
         let(:lockfiles) { {} }
         let(:package_json) { { "engines" => { "node" => "1" } } }
+
+        it "returns default (npm)" do
+          expect(detector.detect_package_manager).to eq("npm")
+        end
+      end
+
+      context "when a package manager engine has a null requirement" do
+        let(:lockfiles) { {} }
+        let(:package_json) { { "engines" => { "yarn" => nil } } }
 
         it "returns default (npm)" do
           expect(detector.detect_package_manager).to eq("npm")

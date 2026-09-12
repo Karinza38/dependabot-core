@@ -20,18 +20,21 @@ module Dependabot
     class FileParser < Dependabot::FileParsers::Base
       require "dependabot/file_parsers/base/dependency_set"
 
-      DEPENDENCY_GROUP_KEYS = T.let([
-        {
-          manifest: "require",
-          lockfile: "packages",
-          group: "runtime"
-        },
-        {
-          manifest: "require-dev",
-          lockfile: "packages-dev",
-          group: "development"
-        }
-      ].freeze, T::Array[T::Hash[Symbol, String]])
+      DEPENDENCY_GROUP_KEYS = T.let(
+        [
+          {
+            manifest: "require",
+            lockfile: "packages",
+            group: "runtime"
+          },
+          {
+            manifest: "require-dev",
+            lockfile: "packages-dev",
+            group: "development"
+          }
+        ].freeze,
+        T::Array[T::Hash[Symbol, String]]
+      )
 
       sig { override.returns(T::Array[Dependabot::Dependency]) }
       def parse
@@ -57,9 +60,14 @@ module Dependabot
 
       sig { returns(Ecosystem::VersionManager) }
       def package_manager
-        raw_composer_version = env_versions[:composer] || composer_version
+        if composer_version == Helpers::V1
+          return PackageManager.new(
+            detected_version: composer_version
+          )
+        end
         PackageManager.new(
-          raw_composer_version
+          detected_version: composer_version,
+          raw_version: env_versions[:composer]
         )
       end
 
@@ -113,6 +121,14 @@ module Dependabot
 
           parsed_composer_json[manifest].each do |name, req|
             next unless package?(name)
+
+            local_package_prefix = ["dev-main", "dev-master", "@dev"]
+
+            # we avoid updating local packages, so we skip them adding to dependency list
+            if local_package_prefix.include?(req)
+              Dependabot.logger.info("Skipping #{name} with version #{req} as it cannot be updated.")
+              next
+            end
 
             if lockfile
               group = keys[:group]
@@ -210,8 +226,11 @@ module Dependabot
       end
 
       sig do
-        params(name: String, type: String,
-               requirement: String).returns(T.nilable(T::Hash[Symbol, T.nilable(String)]))
+        params(
+          name: String,
+          type: String,
+          requirement: String
+        ).returns(T.nilable(T::Hash[Symbol, T.nilable(String)]))
       end
       def dependency_source(name:, type:, requirement:)
         return unless lockfile
@@ -228,8 +247,10 @@ module Dependabot
       end
 
       sig do
-        params(package_details: T::Hash[String, T.untyped],
-               requirement: String).returns(T.nilable(T::Hash[Symbol, T.nilable(String)]))
+        params(
+          package_details: T::Hash[String, T.untyped],
+          requirement: String
+        ).returns(T.nilable(T::Hash[Symbol, T.nilable(String)]))
       end
       def git_dependency_details(package_details, requirement)
         return unless package_details.dig("source", "type") == "git"
@@ -320,8 +341,10 @@ module Dependabot
 
       sig { returns(String) }
       def composer_version
-        @composer_version ||= T.let(Helpers.composer_version(parsed_composer_json, parsed_lockfile),
-                                    T.nilable(String))
+        @composer_version ||= T.let(
+          Helpers.composer_version(parsed_composer_json, parsed_lockfile),
+          T.nilable(String)
+        )
       end
     end
   end

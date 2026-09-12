@@ -77,6 +77,18 @@ RSpec.describe Dependabot::Docker::FileParser do
       its(:length) { is_expected.to eq(0) }
     end
 
+    context "when a Dockerfile cannot be parsed" do
+      let(:error) { Dependabot::DependencyFileNotParseable.new("/Dockerfile") }
+
+      before do
+        allow(dockerfile).to receive(:content).and_raise(error)
+      end
+
+      it "raises the unparseable file error" do
+        expect { dependencies }.to raise_error(error)
+      end
+    end
+
     context "with a name" do
       let(:dockerfile_fixture_name) { "name" }
 
@@ -302,11 +314,13 @@ RSpec.describe Dependabot::Docker::FileParser do
           context "when replaces-base is false" do
             let(:repo_url) { "https://registry.hub.docker.com/v2/library/ubuntu/" }
             let(:credentials) do
-              [Dependabot::Credential.new({
-                "type" => "docker_registry",
-                "registry" => "registry-host.io:5000",
-                "replaces-base" => false
-              })]
+              [Dependabot::Credential.new(
+                {
+                  "type" => "docker_registry",
+                  "registry" => "registry-host.io:5000",
+                  "replaces-base" => false
+                }
+              )]
             end
             let(:parser) do
               described_class.new(
@@ -344,8 +358,10 @@ RSpec.describe Dependabot::Docker::FileParser do
               it "has the right details" do
                 expect(dependency).to be_a(Dependabot::Dependency)
                 expect(dependency.name).to eq("ubuntu")
-                expect(dependency.version).to eq("18305429afa14ea462f810146ba44d4363ae76e4c8d" \
-                                                 "fc38288cf73aa07485005")
+                expect(dependency.version).to eq(
+                  "18305429afa14ea462f810146ba44d4363ae76e4c8d" \
+                  "fc38288cf73aa07485005"
+                )
                 expect(dependency.requirements).to eq(expected_requirements)
               end
             end
@@ -381,15 +397,17 @@ RSpec.describe Dependabot::Docker::FileParser do
         expect(dependency).to be_a(Dependabot::Dependency)
         expect(dependency.name).to eq("ubuntu")
         expect(dependency.version).to eq("12.04.5")
-        expect(dependency.requirements).to eq([{
-          requirement: nil,
-          groups: [],
-          file: "Dockerfile",
-          source: {
-            tag: "12.04.5",
-            digest: "18305429afa14ea462f810146ba44d4363ae76e4c8dfc38288cf73aa07485005"
-          }
-        }])
+        expect(dependency.requirements).to eq(
+          [{
+            requirement: nil,
+            groups: [],
+            file: "Dockerfile",
+            source: {
+              tag: "12.04.5",
+              digest: "18305429afa14ea462f810146ba44d4363ae76e4c8dfc38288cf73aa07485005"
+            }
+          }]
+        )
       end
     end
 
@@ -668,7 +686,7 @@ RSpec.describe Dependabot::Docker::FileParser do
             requirement: nil,
             groups: [],
             file: "Dockerfile",
-            source: { tag: "artful" }
+            source: { tag: "artful", platform: "linux/amd64" }
           }]
         end
 
@@ -676,6 +694,35 @@ RSpec.describe Dependabot::Docker::FileParser do
           expect(dependency).to be_a(Dependabot::Dependency)
           expect(dependency.name).to eq("ubuntu")
           expect(dependency.version).to eq("artful")
+          expect(dependency.requirements).to eq(expected_requirements)
+
+          ecosystem = parser.ecosystem
+
+          expect(ecosystem.name).to eq("docker")
+          expect(ecosystem.package_manager.name).to eq("docker")
+
+          expect(ecosystem.package_manager.deprecated?).to be false
+          expect(ecosystem.package_manager.unsupported?).to be false
+        end
+      end
+    end
+
+    context "with a build-arg platform placeholder" do
+      let(:dockerfile_body) { "FROM --platform=$BUILDPLATFORM ubuntu:artful" }
+
+      describe "the first dependency" do
+        subject(:dependency) { dependencies.first }
+
+        let(:expected_requirements) do
+          [{
+            requirement: nil,
+            groups: [],
+            file: "Dockerfile",
+            source: { tag: "artful", platform: "$BUILDPLATFORM" }
+          }]
+        end
+
+        it "captures the raw platform value" do
           expect(dependency.requirements).to eq(expected_requirements)
         end
       end
@@ -866,15 +913,17 @@ RSpec.describe Dependabot::Docker::FileParser do
         expect(dependency).to be_a(Dependabot::Dependency)
         expect(dependency.name).to eq("ubuntu")
         expect(dependency.version).to eq("12.04.5")
-        expect(dependency.requirements).to eq([{
-          requirement: nil,
-          groups: [],
-          file: "digest_and_tag.yaml",
-          source: {
-            tag: "12.04.5",
-            digest: "18305429afa14ea462f810146ba44d4363ae76e4c8dfc38288cf73aa07485005"
-          }
-        }])
+        expect(dependency.requirements).to eq(
+          [{
+            requirement: nil,
+            groups: [],
+            file: "digest_and_tag.yaml",
+            source: {
+              tag: "12.04.5",
+              digest: "18305429afa14ea462f810146ba44d4363ae76e4c8dfc38288cf73aa07485005"
+            }
+          }]
+        )
       end
     end
 
@@ -1135,13 +1184,121 @@ RSpec.describe Dependabot::Docker::FileParser do
       end
     end
 
-    context "with an invalid yaml file" do
-      let(:podfile_fixture_name) { "with_bom.yaml" }
+    context "when a YAML file cannot be parsed" do
+      let(:unparseable_yaml) do
+        <<~YAML
+          metadata:
+            annotations:
+              a.b/c: "true"
+             invalid: yaml
+        YAML
+      end
+      let(:unparseable_file) do
+        Dependabot::DependencyFile.new(
+          name: "unparseable.yaml",
+          directory: "/",
+          content: unparseable_yaml
+        )
+      end
 
-      it "throws when the yaml starts with a byte order mark" do
-        expect do
-          _unused = dependencies
-        end.to raise_error(Dependabot::DependencyFileNotParseable)
+      before do
+        allow(Dependabot.logger).to receive(:warn)
+      end
+
+      context "with a valid Dockerfile" do
+        let(:podfiles) { [dockerfile, unparseable_file] }
+
+        it "warns and parses dependencies from the Dockerfile" do
+          expect(dependencies.length).to eq(1)
+          expect(dependencies.first.name).to eq("ubuntu")
+          expect(dependencies.first.version).to eq("17.04")
+          expect(Dependabot.logger).to have_received(:warn).with(
+            a_string_including("Failed to parse YAML file /unparseable.yaml")
+          )
+        end
+      end
+
+      context "with another valid YAML file" do
+        let(:podfiles) { [unparseable_file, valid_file] }
+        let(:valid_file) do
+          Dependabot::DependencyFile.new(
+            name: "valid.yaml",
+            directory: "/",
+            content: fixture("kubernetes", "yaml", "pod.yaml")
+          )
+        end
+
+        it "warns and parses dependencies from the valid file" do
+          expect(dependencies.length).to eq(1)
+          expect(dependencies.first.name).to eq("nginx")
+          expect(dependencies.first.version).to eq("1.14.2")
+          expect(dependencies.first.requirements).to eq(
+            [{
+              requirement: nil,
+              groups: [],
+              file: "valid.yaml",
+              source: { tag: "1.14.2" }
+            }]
+          )
+          expect(Dependabot.logger).to have_received(:warn).with(
+            a_string_including("Failed to parse YAML file /unparseable.yaml")
+          )
+        end
+      end
+
+      context "without a Dockerfile or parseable YAML file" do
+        let(:podfiles) { [unparseable_file] }
+
+        it "warns and returns no dependencies" do
+          expect(dependencies).to be_empty
+          expect(Dependabot.logger).to have_received(:warn).with(
+            a_string_including("Failed to parse YAML file /unparseable.yaml")
+          )
+        end
+      end
+
+      context "with multiple directories" do
+        let(:files_by_directory) do
+          {
+            "/invalid-one" => [
+              Dependabot::DependencyFile.new(
+                name: "unparseable.yaml",
+                directory: "/invalid-one",
+                content: unparseable_yaml
+              )
+            ],
+            "/invalid-two" => [
+              Dependabot::DependencyFile.new(
+                name: "unparseable.yaml",
+                directory: "/invalid-two",
+                content: unparseable_yaml
+              )
+            ],
+            "/valid" => [
+              Dependabot::DependencyFile.new(
+                name: "valid.yaml",
+                directory: "/valid",
+                content: fixture("kubernetes", "yaml", "pod.yaml")
+              )
+            ]
+          }
+        end
+
+        it "continues parsing later directories" do
+          dependencies_by_directory = files_by_directory.to_h do |directory, directory_files|
+            directory_source = source.dup.tap { |configured_source| configured_source.directory = directory }
+            directory_dependencies = described_class.new(
+              dependency_files: directory_files,
+              source: directory_source
+            ).parse
+
+            [directory, directory_dependencies]
+          end
+
+          expect(dependencies_by_directory.fetch("/invalid-one")).to be_empty
+          expect(dependencies_by_directory.fetch("/invalid-two")).to be_empty
+          expect(dependencies_by_directory.fetch("/valid").map(&:name)).to eq(["nginx"])
+        end
       end
     end
   end
@@ -1252,6 +1409,14 @@ RSpec.describe Dependabot::Docker::FileParser do
           expect(dependency.version).to eq("18.04")
           expect(dependency.requirements).to eq(expected_requirements)
         end
+      end
+    end
+
+    context "with images with unparseable versions" do
+      let(:helmfile_fixture_name) { "multi-image-with-bad-version.yaml" }
+
+      it "omits the images with unparseable version numbers" do
+        expect(dependencies.map(&:version)).to eq(["some-name_123"])
       end
     end
   end

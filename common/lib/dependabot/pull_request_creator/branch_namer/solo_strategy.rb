@@ -1,4 +1,4 @@
-# typed: strict
+# typed: strong
 # frozen_string_literal: true
 
 require "digest"
@@ -15,26 +15,18 @@ module Dependabot
 
         sig { override.returns(String) }
         def new_branch_name
+          if template
+            return render_from_template(
+              vars: template_vars,
+              strategy: :solo
+            )
+          end
+
           return short_branch_name if branch_name_might_be_long?
 
           @name ||=
             T.let(
-              begin
-                dependency_name_part =
-                  if dependencies.count > 1 && updating_a_property?
-                    property_name
-                  elsif dependencies.count > 1 && updating_a_dependency_set?
-                    dependency_set.fetch(:group)
-                  else
-                    dependencies
-                      .map(&:name)
-                      .join("-and-")
-                      .tr(":[]", "-")
-                      .tr("@", "")
-                  end
-
-                "#{dependency_name_part}-#{branch_version_suffix}"
-              end,
+              "#{template_dependency_name}-#{branch_version_suffix}",
               T.nilable(String)
             )
 
@@ -53,6 +45,40 @@ module Dependabot
           ].compact
         end
 
+        sig { returns(T::Hash[String, String]) }
+        def template_vars
+          dep_name = template_dependency_name
+          version = branch_version_suffix || ""
+
+          vars = {
+            "prefix" => prefix,
+            "package_manager" => package_manager,
+            "directory" => sanitized_directory,
+            "dependency" => dep_name,
+            "version" => version,
+            "name" => "#{dep_name}-#{version}",
+            "target_branch" => target_branch || ""
+          }
+          vars
+        end
+
+        sig { returns(String) }
+        def template_dependency_name
+          if dependencies.count > 1 && updating_a_property?
+            property_name
+          elsif dependencies.count > 1 && updating_a_dependency_set?
+            dependency_set.fetch(:group)
+          else
+            dependencies.map(&:name).join("-and-").tr(":[]", "-").tr("@", "")
+          end
+        end
+
+        sig { returns(String) }
+        def sanitized_directory
+          dir = (files.first&.directory&.tr(" ", "-") || "/").sub(%r{^/}, "")
+          dir.empty? ? "root" : dir
+        end
+
         sig { returns(String) }
         def package_manager
           T.must(dependencies.first).package_manager
@@ -62,23 +88,25 @@ module Dependabot
         def updating_a_property?
           T.must(dependencies.first)
            .requirements
-           .any? { |r| r.dig(:metadata, :property_name) }
+           .any? { |r| r.metadata_string("property_name") }
         end
 
         sig { returns(T::Boolean) }
         def updating_a_dependency_set?
           T.must(dependencies.first)
            .requirements
-           .any? { |r| r.dig(:metadata, :dependency_set) }
+           .any? { |r| r.metadata_string_hash("dependency_set") }
         end
 
         sig { returns(String) }
         def property_name
           @property_name ||=
-            T.let(T.must(dependencies.first).requirements
-                                .find { |r| r.dig(:metadata, :property_name) }
-                                &.dig(:metadata, :property_name),
-                  T.nilable(String))
+            T.let(
+              T.must(dependencies.first).requirements
+                                              .find { |r| r.metadata_string("property_name") }
+                                              &.metadata_string("property_name"),
+              T.nilable(String)
+            )
 
           raise "No property name!" unless @property_name
 
@@ -90,9 +118,9 @@ module Dependabot
           @dependency_set ||=
             T.let(
               T.must(dependencies.first).requirements
-                                 .find { |r| r.dig(:metadata, :dependency_set) }
-                                 &.dig(:metadata, :dependency_set),
-              T.nilable(T::Hash[String, String])
+                                 .find { |r| r.metadata_string_hash("dependency_set") }
+                                 &.metadata_string_hash("dependency_set"),
+              T.nilable(T::Hash[Symbol, String])
             )
 
           raise "No dependency set!" unless @dependency_set
@@ -117,21 +145,21 @@ module Dependabot
 
         sig { params(dependency: Dependabot::Dependency).returns(String) }
         def sanitized_requirement(dependency)
-          new_library_requirement(dependency)
-            .delete(" ")
-            .gsub("!=", "neq-")
-            .gsub(">=", "gte-")
-            .gsub("<=", "lte-")
-            .gsub("~>", "tw-")
-            .gsub("^", "tw-")
-            .gsub("||", "or-")
-            .gsub("~", "approx-")
-            .gsub("~=", "tw-")
-            .gsub(/==*/, "eq-")
-            .gsub(">", "gt-")
-            .gsub("<", "lt-")
-            .gsub("*", "star")
-            .gsub(",", "-and-")
+          T.must(new_library_requirement(dependency))
+           .delete(" ")
+           .gsub("!=", "neq-")
+           .gsub(">=", "gte-")
+           .gsub("<=", "lte-")
+           .gsub("~>", "tw-")
+           .gsub("^", "tw-")
+           .gsub("||", "or-")
+           .gsub("~", "approx-")
+           .gsub("~=", "tw-")
+           .gsub(/==*/, "eq-")
+           .gsub(">", "gt-")
+           .gsub("<", "lt-")
+           .gsub("*", "star")
+           .gsub(",", "-and-")
         end
 
         sig { params(dependency: Dependabot::Dependency).returns(T.nilable(String)) }
@@ -144,9 +172,11 @@ module Dependabot
             T.must(dependency.version)[0..6]
           elsif dependency.version == dependency.previous_version &&
                 package_manager == "docker"
-            dependency.requirements
-                      .filter_map { |r| r.dig(:source, "digest") || r.dig(:source, :digest) }
-                      .first.split(":").last[0..6]
+            T.must(
+              dependency.requirements
+                                    .filter_map { |r| r.source_string("digest") }
+                                    .first
+            ).split(":").last&.[](0..6)
           else
             dependency.version
           end
@@ -155,17 +185,17 @@ module Dependabot
         sig { params(dependency: Dependabot::Dependency).returns(T.nilable(String)) }
         def previous_ref(dependency)
           previous_refs = T.must(dependency.previous_requirements).filter_map do |r|
-            r.dig(:source, "ref") || r.dig(:source, :ref)
+            r.source_string("ref")
           end.uniq
-          previous_refs.first if previous_refs.count == 1
+          previous_refs.first if previous_refs.one?
         end
 
         sig { params(dependency: Dependabot::Dependency).returns(T.nilable(String)) }
         def new_ref(dependency)
           new_refs = dependency.requirements.filter_map do |r|
-            r.dig(:source, "ref") || r.dig(:source, :ref)
+            r.source_string("ref")
           end.uniq
-          new_refs.first if new_refs.count == 1
+          new_refs.first if new_refs.one?
         end
 
         sig { params(dependency: Dependabot::Dependency).returns(T::Boolean) }
@@ -174,16 +204,16 @@ module Dependabot
           previous_ref(dependency) != new_ref(dependency)
         end
 
-        sig { params(dependency: Dependabot::Dependency).returns(T.untyped) }
+        sig { params(dependency: Dependabot::Dependency).returns(T.nilable(String)) }
         def new_library_requirement(dependency)
           updated_reqs =
             dependency.requirements - T.must(dependency.previous_requirements)
 
           gemspec =
-            updated_reqs.find { |r| r[:file].match?(%r{^[^/]*\.gemspec$}) }
-          return gemspec[:requirement] if gemspec
+            updated_reqs.find { |r| T.must(r.file).match?(%r{^[^/]*\.gemspec$}) }
+          return gemspec.requirement_string if gemspec
 
-          updated_reqs.first&.fetch(:requirement)
+          updated_reqs.first&.requirement_string
         end
 
         # TODO: Bring this in line with existing library checks that we do in the
@@ -215,9 +245,11 @@ module Dependabot
         sig { returns(T.nilable(String)) }
         def dependency_digest
           T.let(
-            Digest::MD5.hexdigest(dependencies.map do |dependency|
-              "#{dependency.name}-#{dependency.removed? ? 'removed' : dependency.version}"
-            end.sort.join(",")).slice(0, 10),
+            Digest::MD5.hexdigest(
+              dependencies.map do |dependency|
+                "#{dependency.name}-#{dependency.removed? ? 'removed' : dependency.version}"
+              end.sort.join(",")
+            ).slice(0, 10),
             T.nilable(String)
           )
         end

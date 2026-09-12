@@ -4,6 +4,7 @@
 require "dependabot/dependency_file"
 require "dependabot/npm_and_yarn/file_parser"
 require "dependabot/npm_and_yarn/helpers"
+require "dependabot/package/npm_lockfile_details"
 require "sorbet-runtime"
 
 module Dependabot
@@ -16,9 +17,14 @@ module Dependabot
         require "dependabot/npm_and_yarn/file_parser/pnpm_lock"
         require "dependabot/npm_and_yarn/file_parser/json_lock"
 
-        sig { params(dependency_files: T::Array[DependencyFile]).void }
-        def initialize(dependency_files:)
+        DEFAULT_LOCKFILES = %w(package-lock.json yarn.lock pnpm-lock.yaml npm-shrinkwrap.json).freeze
+
+        LockFile = T.type_alias { T.any(JsonLock, YarnLock, PnpmLock) }
+
+        sig { params(dependency_files: T::Array[DependencyFile], dealias_packages: T::Boolean).void }
+        def initialize(dependency_files:, dealias_packages: false)
           @dependency_files = dependency_files
+          @dealias_packages = dealias_packages
         end
 
         sig { returns(Dependabot::FileParsers::Base::DependencySet) }
@@ -43,10 +49,10 @@ module Dependabot
 
         sig do
           params(dependency_name: String, requirement: T.nilable(String), manifest_name: String)
-            .returns(T.nilable(T::Hash[String, T.untyped]))
+            .returns(T.nilable(Dependabot::Package::NpmLockfileDetails))
         end
         def lockfile_details(dependency_name:, requirement:, manifest_name:)
-          details = T.let(nil, T.nilable(T::Hash[String, T.untyped]))
+          details = T.let(nil, T.nilable(Dependabot::Package::NpmLockfileDetails))
           potential_lockfiles_for_manifest(manifest_name).each do |lockfile|
             details = lockfile_for(lockfile).details(dependency_name, requirement, manifest_name)
 
@@ -64,58 +70,52 @@ module Dependabot
         sig { params(manifest_filename: String).returns(T::Array[DependencyFile]) }
         def potential_lockfiles_for_manifest(manifest_filename)
           dir_name = File.dirname(manifest_filename)
-          possible_lockfile_names =
-            %w(package-lock.json npm-shrinkwrap.json pnpm-lock.yaml yarn.lock).map do |f|
-              Pathname.new(File.join(dir_name, f)).cleanpath.to_path
-            end +
-            %w(yarn.lock pnpm-lock.yaml package-lock.json npm-shrinkwrap.json)
+          possible_lockfile_names = DEFAULT_LOCKFILES.map do |f|
+            Pathname.new(File.join(dir_name, f)).cleanpath.to_path
+          end + DEFAULT_LOCKFILES
 
           possible_lockfile_names.uniq
                                  .filter_map { |nm| dependency_files.find { |f| f.name == nm } }
         end
 
-        sig { params(file: DependencyFile).returns(T.any(JsonLock, YarnLock, PnpmLock)) }
+        sig { params(file: DependencyFile).returns(LockFile) }
         def lockfile_for(file)
-          @lockfiles ||= T.let({}, T.nilable(T::Hash[String, T.any(JsonLock, YarnLock, PnpmLock)]))
-          @lockfiles[file.name] ||= if [*package_locks, *shrinkwraps].include?(file)
-                                      JsonLock.new(file)
-                                    elsif yarn_locks.include?(file)
-                                      YarnLock.new(file)
+          @lockfiles ||= T.let({}, T.nilable(T::Hash[String, LockFile]))
+          @lockfiles[file.name] ||= case file.name
+                                    when *package_locks.map(&:name), *shrinkwraps.map(&:name)
+                                      JsonLock.new(file, dealias_packages: @dealias_packages)
+                                    when *yarn_locks.map(&:name)
+                                      YarnLock.new(file, dealias_packages: @dealias_packages)
+                                    when *pnpm_locks.map(&:name)
+                                      PnpmLock.new(file, dealias_packages: @dealias_packages)
                                     else
-                                      PnpmLock.new(file)
+                                      raise "Unexpected lockfile: #{file.name}"
                                     end
+        end
+
+        sig { params(extension: String).returns(T::Array[DependencyFile]) }
+        def select_files_by_extension(extension)
+          dependency_files.select { |f| f.name.end_with?(extension) }
         end
 
         sig { returns(T::Array[DependencyFile]) }
         def package_locks
-          @package_locks ||= T.let(
-            dependency_files
-            .select { |f| f.name.end_with?("package-lock.json") }, T.nilable(T::Array[DependencyFile])
-          )
+          @package_locks ||= T.let(select_files_by_extension("package-lock.json"), T.nilable(T::Array[DependencyFile]))
         end
 
         sig { returns(T::Array[DependencyFile]) }
         def pnpm_locks
-          @pnpm_locks ||= T.let(
-            dependency_files
-            .select { |f| f.name.end_with?("pnpm-lock.yaml") }, T.nilable(T::Array[DependencyFile])
-          )
+          @pnpm_locks ||= T.let(select_files_by_extension("pnpm-lock.yaml"), T.nilable(T::Array[DependencyFile]))
         end
 
         sig { returns(T::Array[DependencyFile]) }
         def yarn_locks
-          @yarn_locks ||= T.let(
-            dependency_files
-            .select { |f| f.name.end_with?("yarn.lock") }, T.nilable(T::Array[DependencyFile])
-          )
+          @yarn_locks ||= T.let(select_files_by_extension("yarn.lock"), T.nilable(T::Array[DependencyFile]))
         end
 
         sig { returns(T::Array[DependencyFile]) }
         def shrinkwraps
-          @shrinkwraps ||= T.let(
-            dependency_files
-            .select { |f| f.name.end_with?("npm-shrinkwrap.json") }, T.nilable(T::Array[DependencyFile])
-          )
+          @shrinkwraps ||= T.let(select_files_by_extension("npm-shrinkwrap.json"), T.nilable(T::Array[DependencyFile]))
         end
 
         sig { returns(T.class_of(Dependabot::NpmAndYarn::Version)) }

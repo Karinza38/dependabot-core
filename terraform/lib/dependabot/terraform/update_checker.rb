@@ -16,10 +16,9 @@ module Dependabot
     class UpdateChecker < Dependabot::UpdateCheckers::Base
       extend T::Sig
 
-      ELIGIBLE_SOURCE_TYPES = T.let(
-        %w(git provider registry).freeze,
-        T::Array[String]
-      )
+      require_relative "update_checker/latest_version_resolver"
+
+      ELIGIBLE_SOURCE_TYPES = %w(git provider registry).freeze
 
       sig { override.returns(T.nilable(T.any(String, Gem::Version))) }
       def latest_version
@@ -43,7 +42,7 @@ module Dependabot
         nil
       end
 
-      sig { override.returns(T::Array[T::Hash[Symbol, T.untyped]]) }
+      sig { override.returns(T::Array[Dependabot::DependencyRequirement]) }
       def updated_requirements
         RequirementsUpdater.new(
           requirements: dependency.requirements,
@@ -79,9 +78,12 @@ module Dependabot
         return @latest_version_for_registry_dependency if @latest_version_for_registry_dependency
 
         versions = all_module_versions
+        # Filter versions which are in cooldown period
+        if cooldown_enabled? # rubocop:disable Style/IfUnlessModifier
+          versions = latest_version_resolver.filter_versions_in_cooldown_period_from_module(versions)
+        end
         versions.reject!(&:prerelease?) unless wants_prerelease?
         versions.reject! { |v| ignore_requirements.any? { |r| r.satisfied_by?(v) } }
-
         @latest_version_for_registry_dependency = T.let(
           versions.max,
           T.nilable(Dependabot::Terraform::Version)
@@ -90,13 +92,13 @@ module Dependabot
 
       sig { returns(T::Array[Dependabot::Terraform::Version]) }
       def all_module_versions
-        identifier = dependency_source_details&.fetch(:module_identifier)
+        identifier = T.must(dependency.source_string("module_identifier", allowed_types: ELIGIBLE_SOURCE_TYPES))
         registry_client.all_module_versions(identifier: identifier)
       end
 
       sig { returns(T::Array[Dependabot::Terraform::Version]) }
       def all_provider_versions
-        identifier = dependency_source_details&.fetch(:module_identifier)
+        identifier = T.must(dependency.source_string("module_identifier", allowed_types: ELIGIBLE_SOURCE_TYPES))
         registry_client.all_provider_versions(identifier: identifier)
       end
 
@@ -104,11 +106,26 @@ module Dependabot
       def registry_client
         @registry_client ||= T.let(
           begin
-            hostname = dependency_source_details&.fetch(:registry_hostname)
+            hostname = registry_hostname
             RegistryClient.new(hostname: hostname, credentials: credentials)
           end,
           T.nilable(Dependabot::Terraform::RegistryClient)
         )
+      end
+
+      sig { returns(String) }
+      def registry_hostname
+        hostname = dependency.source_string(
+          "registry_hostname",
+          allowed_types: ELIGIBLE_SOURCE_TYPES
+        ) || RegistryClient::PUBLIC_HOSTNAME
+        return hostname unless hostname == RegistryClient::PUBLIC_HOSTNAME
+
+        base_registry = credentials.find do |cred|
+          cred.fetch("type", nil) == "terraform_registry" && cred.replaces_base?
+        end
+
+        base_registry&.[]("host") || hostname
       end
 
       sig { returns(T.nilable(Dependabot::Terraform::Version)) }
@@ -118,6 +135,10 @@ module Dependabot
         return @latest_version_for_provider_dependency if @latest_version_for_provider_dependency
 
         versions = all_provider_versions
+        # Filter versions which are in cooldown period
+        if cooldown_enabled?
+          versions = latest_version_resolver.filter_versions_in_cooldown_period_from_provider(versions)
+        end
         versions.reject!(&:prerelease?) unless wants_prerelease?
         versions.reject! { |v| ignore_requirements.any? { |r| r.satisfied_by?(v) } }
 
@@ -137,7 +158,7 @@ module Dependabot
         end
 
         dependency.requirements.any? do |req|
-          req[:requirement]&.match?(/\d-[A-Za-z0-9]/)
+          req.requirement_string&.match?(/\d-[A-Za-z0-9]/)
         end
       end
 
@@ -151,31 +172,25 @@ module Dependabot
 
         # If the dependency is pinned to a tag that looks like a version then
         # we want to update that tag. Because we don't have a lockfile, the
-        # latest version is the tag itself.
-        if git_commit_checker.pinned_ref_looks_like_version?
-          latest_tag = git_commit_checker.local_tag_for_latest_version
-                                         &.fetch(:tag)
-          version_rgx = GitCommitChecker::VERSION_REGEX
-          return unless latest_tag.match(version_rgx)
+        # latest version is the tag itself. Tags within their cooldown window
+        # are filtered out by the shared GitCommitChecker.
+        latest_tag = git_commit_checker.local_tag_for_pinned_version_ref(update_cooldown)&.tag
+        return unless latest_tag
 
-          version = latest_tag.match(version_rgx)
-                              .named_captures.fetch("version")
-          return version_class.new(version)
-        end
+        version_rgx = GitCommitChecker::VERSION_REGEX
+        return unless latest_tag.match(version_rgx)
 
-        # If the dependency is pinned to a tag that doesn't look like a
-        # version then there's nothing we can do.
-        nil
+        version = T.must(latest_tag.match(version_rgx))
+                   .named_captures.fetch("version")
+        version_class.new(version)
       end
 
       sig { returns(T.nilable(String)) }
       def tag_for_latest_version
         return unless git_commit_checker.git_dependency?
-        return unless git_commit_checker.pinned?
-        return unless git_commit_checker.pinned_ref_looks_like_version?
 
-        latest_tag = git_commit_checker.local_tag_for_latest_version
-                                       &.fetch(:tag)
+        latest_tag = git_commit_checker.local_tag_for_pinned_version_ref(update_cooldown)&.tag
+        return unless latest_tag
 
         version_rgx = GitCommitChecker::VERSION_REGEX
         return unless latest_tag.match(version_rgx)
@@ -185,33 +200,32 @@ module Dependabot
 
       sig { returns(T::Boolean) }
       def proxy_requirement?
-        dependency.requirements.any? do |req|
-          req.fetch(:source)&.fetch(:proxy_url, nil)
-        end
+        dependency.requirements.any? { |req| req.source_string("proxy_url") }
       end
 
       sig { returns(T::Boolean) }
       def registry_dependency?
-        return false if dependency_source_details.nil?
-
-        dependency_source_details&.fetch(:type) == "registry"
+        dependency.source_string("type", allowed_types: ELIGIBLE_SOURCE_TYPES) == "registry"
       end
 
       sig { returns(T::Boolean) }
       def provider_dependency?
-        return false if dependency_source_details.nil?
-
-        dependency_source_details&.fetch(:type) == "provider"
-      end
-
-      sig { returns(T.nilable(T::Hash[T.any(String, Symbol), T.untyped])) }
-      def dependency_source_details
-        dependency.source_details(allowed_types: ELIGIBLE_SOURCE_TYPES)
+        dependency.source_string("type", allowed_types: ELIGIBLE_SOURCE_TYPES) == "provider"
       end
 
       sig { returns(T::Boolean) }
       def git_dependency?
         git_commit_checker.git_dependency?
+      end
+
+      sig { returns(LatestVersionResolver) }
+      def latest_version_resolver
+        LatestVersionResolver.new(
+          dependency: dependency,
+          credentials: credentials,
+          cooldown_options: update_cooldown,
+          git_commit_checker: git_commit_checker
+        )
       end
 
       sig { returns(Dependabot::GitCommitChecker) }
@@ -225,6 +239,17 @@ module Dependabot
           ),
           T.nilable(Dependabot::GitCommitChecker)
         )
+      end
+
+      sig { returns(T::Boolean) }
+      def cooldown_enabled?
+        # This is a simple check to see if user has put cooldown days.
+        # If not set, then we aassume user does not want cooldown.
+        # Since Terraform does not support Semver versioning, So option left
+        # for the user is to set cooldown default days.
+        return false if update_cooldown.nil?
+
+        T.must(update_cooldown&.default_days).positive?
       end
     end
   end

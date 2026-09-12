@@ -4,9 +4,18 @@ common: &common
   - Dockerfile.updater-core
   - 'common/**'
   - 'updater/**'
+bazel:
+  - *common
+  - 'bazel/**'
+deno:
+  - *common
+  - 'deno/**'
 github_actions:
   - *common
   - 'github_actions/**'
+bun:
+  - *common
+  - 'bun/**'
 bundler:
   - *common
   - 'bundler/**'
@@ -41,12 +50,18 @@ hex:
 maven:
   - *common
   - 'maven/**'
+nix:
+  - *common
+  - 'nix/**'
 npm_and_yarn:
   - *common
   - 'npm_and_yarn/**'
 nuget:
   - *common
   - 'nuget/**'
+pre_commit:
+  - *common
+  - 'pre_commit/**'
 python:
   - *common
   - 'python/**'
@@ -56,9 +71,34 @@ pub:
 git_submodules:
   - *common
   - 'git_submodules/**'
+rust_toolchain:
+  - *common
+  - 'rust_toolchain/**'
+sbt:
+  - *common
+  - 'sbt/**'
+  - 'maven/**'
 swift:
   - *common
   - 'swift/**'
 terraform:
   - *common
   - 'terraform/**'
+opentofu:
+  - *common
+  - 'opentofu/**'
+uv:
+  - *common
+  - 'uv/**'
+helm:
+  - *common
+  - 'helm/**'
+julia:
+  - *common
+  - 'julia/**'
+vcpkg:
+  - *common
+  - 'vcpkg/**'
+conda:
+  - *common
+  - 'conda/**'

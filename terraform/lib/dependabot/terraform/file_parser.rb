@@ -1,7 +1,6 @@
 # typed: strict
 # frozen_string_literal: true
 
-require "cgi"
 require "excon"
 require "nokogiri"
 require "open3"
@@ -44,30 +43,51 @@ module Dependabot
 
       sig { returns(Ecosystem) }
       def ecosystem
-        @ecosystem ||= T.let(begin
-          Ecosystem.new(
-            name: ECOSYSTEM,
-            package_manager: package_manager
-          )
-        end, T.nilable(Dependabot::Ecosystem))
+        @ecosystem ||= T.let(
+          begin
+            Ecosystem.new(
+              name: ECOSYSTEM,
+              package_manager: package_manager
+            )
+          end,
+          T.nilable(Dependabot::Ecosystem)
+        )
       end
 
       private
 
+      # rubocop:disable Metrics/PerceivedComplexity
       sig { params(dependency_set: Dependabot::FileParsers::Base::DependencySet).void }
       def parse_terraform_files(dependency_set)
         terraform_files.each do |file|
-          modules = parsed_file(file).fetch("module", {})
-          modules.each do |name, details|
-            details = details.first
+          # Process module declarations only for non-support files
+          # (we can't update local path modules in support files)
+          unless file.support_file?
+            modules = parsed_file(file).fetch("module", {})
+            # If override.tf files are present, we need to merge the modules
+            if override_terraform_files.any?
+              override_terraform_files.each do |override_file|
+                override_modules = parsed_file(override_file).fetch("module", {})
+                modules = merge_modules(override_modules, modules)
+              end
+            end
 
-            source = source_from(details)
-            # Cannot update local path modules, skip
-            next if source && source[:type] == "path"
+            modules.each do |name, details|
+              details = details.first
 
-            dependency_set << build_terraform_dependency(file, name, T.must(source), details)
+              source = source_from(details)
+              # Cannot update local path modules, and `source_from` returns nil for an
+              # interpolated source (Terraform >= 1.15 permits a `const` variable there), which
+              # has no version to read. Skip both, as the terragrunt path above does, rather
+              # than passing the nil to `T.must` and aborting the parse for the whole repo.
+              next if source.nil? || source[:type] == "path"
+
+              dependency_set << build_terraform_dependency(file, name, source, details)
+            end
           end
 
+          # Always process provider requirements, even in support files
+          # (nested local modules can have their own provider requirements)
           parsed_file(file).fetch("terraform", []).each do |terraform|
             required_providers = terraform.fetch("required_providers", {})
             required_providers.each do |provider|
@@ -78,6 +98,7 @@ module Dependabot
           end
         end
       end
+      # rubocop:enable Metrics/PerceivedComplexity
 
       sig { params(dependency_set: Dependabot::FileParsers::Base::DependencySet).void }
       def parse_terragrunt_files(dependency_set)
@@ -124,10 +145,10 @@ module Dependabot
           version: version,
           package_manager: "terraform",
           requirements: [
-            requirement: version_req,
-            groups: [],
-            file: file.name,
-            source: source
+            { requirement: version_req,
+              groups: [],
+              file: file.name,
+              source: source }
           ]
         )
       end
@@ -153,14 +174,14 @@ module Dependabot
           version: determine_version_for(T.must(hostname), T.must(namespace), T.must(name), version_req),
           package_manager: "terraform",
           requirements: [
-            requirement: version_req,
-            groups: [],
-            file: file.name,
-            source: {
-              type: "provider",
-              registry_hostname: hostname,
-              module_identifier: "#{namespace}/#{name}"
-            }
+            { requirement: version_req,
+              groups: [],
+              file: file.name,
+              source: {
+                type: "provider",
+                registry_hostname: hostname,
+                module_identifier: "#{namespace}/#{name}"
+              } }
           ]
         )
       end
@@ -192,10 +213,10 @@ module Dependabot
           version: version,
           package_manager: "terraform",
           requirements: [
-            requirement: nil,
-            groups: [],
-            file: file.name,
-            source: source
+            { requirement: nil,
+              groups: [],
+              file: file.name,
+              source: source }
           ]
         )
       end
@@ -227,10 +248,13 @@ module Dependabot
         matches = source_address&.match(PROVIDER_SOURCE_ADDRESS)
         matches = {} if matches.nil?
 
+        # Terraform provider source addresses are case-insensitive, so we normalize
+        # to lowercase to avoid treating e.g. "Azure/azapi" and "azure/azapi" as
+        # different sources when merging dependencies across multiple files.
         [
-          matches[:hostname] || DEFAULT_REGISTRY,
-          matches[:namespace] || DEFAULT_NAMESPACE,
-          matches[:name] || name
+          (matches[:hostname] || DEFAULT_REGISTRY).downcase,
+          (matches[:namespace] || DEFAULT_NAMESPACE).downcase,
+          (matches[:name] || name).downcase
         ]
       end
 
@@ -238,17 +262,19 @@ module Dependabot
       def registry_source_details_from(source_string)
         parts = source_string.split("//").first.split("/")
 
+        # Registry module source addresses are case-insensitive, so we normalize
+        # to lowercase to avoid treating case-variant declarations as different sources.
         if parts.count == 3
           {
             type: "registry",
             registry_hostname: "registry.terraform.io",
-            module_identifier: source_string.split("//").first
+            module_identifier: source_string.split("//").first.downcase
           }
         elsif parts.count == 4
           {
             type: "registry",
-            registry_hostname: parts.first,
-            module_identifier: parts[1..3].join("/")
+            registry_hostname: parts.first.downcase,
+            module_identifier: parts[1..3].join("/").downcase
           }
         else
           msg = "Invalid registry source specified: '#{source_string}'"
@@ -290,7 +316,7 @@ module Dependabot
           type: "git",
           url: git_url,
           branch: nil,
-          ref: CGI.parse(querystr.to_s)["ref"].first&.split(%r{(?<!:)//})&.first
+          ref: URI.decode_www_form(querystr.to_s).to_h["ref"]&.split(%r{(?<!:)//})&.first
         }
       end
 

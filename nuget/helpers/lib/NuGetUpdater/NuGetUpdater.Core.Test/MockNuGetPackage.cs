@@ -318,7 +318,7 @@ namespace NuGetUpdater.Core.Test
                     </Project>
                     """
                 );
-                var (exitCode, stdout, stderr) = ProcessEx.RunAsync("dotnet", ["msbuild", projectPath, "/t:_ReportCurrentSdkVersion"]).Result;
+                var (exitCode, stdout, stderr) = ProcessEx.RunDotnetMSBuildSafelyAsync([projectPath, "/t:_ReportCurrentSdkVersion"], projectDir.FullName).Result;
                 if (exitCode != 0)
                 {
                     throw new Exception($"Failed to report the current SDK version:\n{stdout}\n{stderr}");
@@ -345,6 +345,15 @@ namespace NuGetUpdater.Core.Test
             }
         });
 
+        public static readonly Lazy<string> FSharpCorePackageVersion = new(() =>
+        {
+            var fsharpPropsPath = Path.Combine(Path.GetDirectoryName(BundledVersionsPropsPath.Value)!, "FSharp", "Microsoft.FSharp.Core.NetSdk.props");
+            var fsharpPropsDocument = XDocument.Load(fsharpPropsPath);
+            var fsharpCoreVersionElement = fsharpPropsDocument.XPathSelectElement("//*[name()='FSCorePackageVersion']")!;
+            var fsharpCoreVersion = fsharpCoreVersionElement.Value;
+            return fsharpCoreVersion;
+        });
+
         private static readonly Dictionary<string, MockNuGetPackage> WellKnownPackages = new();
         public static MockNuGetPackage WellKnownReferencePackage(string packageName, string targetFramework, (string Path, byte[] Content)[]? files = null)
         {
@@ -369,7 +378,7 @@ namespace NuGetUpdater.Core.Test
                 }
 
                 string expectedVersion = matchingFrameworkElement.Attribute("TargetingPackVersion")!.Value;
-                return new(
+                WellKnownPackages[key] = new MockNuGetPackage(
                     $"{packageName}.Ref",
                     expectedVersion,
                     AdditionalMetadata:
@@ -387,9 +396,20 @@ namespace NuGetUpdater.Core.Test
             return WellKnownPackages[key];
         }
 
+        public static MockNuGetPackage GetMicrosoftNETCoreAppRefPackage(int majorRuntimeVersion)
+        {
+            return WellKnownReferencePackage("Microsoft.NETCore.App", $"net{majorRuntimeVersion}.0",
+            [
+                ("data/FrameworkList.xml", Encoding.UTF8.GetBytes($"""
+                    <FileList TargetFrameworkIdentifier=".NETCoreApp" TargetFrameworkVersion="{majorRuntimeVersion}.0" FrameworkName="Microsoft.NETCore.App" Name=".NET Runtime">
+                    </FileList>
+                    """))
+            ]);
+        }
+
         public static MockNuGetPackage WellKnownHostPackage(string packageName, string targetFramework, (string Path, byte[] Content)[]? files = null)
         {
-            string key = $"{packageName}/{targetFramework}";
+            string key = $"{packageName}.Host/{targetFramework}";
             if (!WellKnownPackages.ContainsKey(key))
             {
                 // for the current SDK, the file `Microsoft.NETCoreSdk.BundledVersions.props` contains the version of the
@@ -418,11 +438,38 @@ namespace NuGetUpdater.Core.Test
                 }
 
                 string expectedVersion = matchingAppHostPack.Attribute("AppHostPackVersion")!.Value;
-                return new(
+                WellKnownPackages[key] = new(
                     $"{packageName}.Host.{expectedRid}",
                     expectedVersion,
                     Files: files
                 );
+            }
+
+            return WellKnownPackages[key];
+        }
+
+        public static MockNuGetPackage WellKnownWindowsSdkRefPackage(string windowsSdkVersion)
+        {
+            var packageName = "Microsoft.Windows.SDK.NET.Ref";
+            var key = $"{packageName}/{windowsSdkVersion}";
+            if (!WellKnownPackages.ContainsKey(key))
+            {
+                var propsDocument = XDocument.Load(BundledVersionsPropsPath.Value);
+                var sdkTpmElement = propsDocument.XPathSelectElement($"/Project/ItemGroup/WindowsSdkSupportedTargetPlatformVersion[@Include='{windowsSdkVersion}']")!;
+                var packageVersion = sdkTpmElement.Attribute("WindowsSdkPackageVersion")!.Value!;
+                var package = new MockNuGetPackage(packageName, packageVersion, Files: [
+                    ("data/FrameworkList.xml", Encoding.UTF8.GetBytes("""
+                        <FileList Name="Windows SDK .NET 6.0">
+                          <!-- contents omitted -->
+                        </FileList>
+                        """)),
+                    ("data/RuntimeList.xml", Encoding.UTF8.GetBytes("""
+                        <FileList Name="Windows SDK .NET 6.0" TargetFrameworkIdentifier=".NETCoreApp" TargetFrameworkVersion="6.0" FrameworkName="Microsoft.Windows.SDK.NET.Ref">
+                          <!-- contents omitted -->
+                        </FileList>
+                        """))
+                ]);
+                WellKnownPackages[key] = package;
             }
 
             return WellKnownPackages[key];
@@ -436,39 +483,14 @@ namespace NuGetUpdater.Core.Test
             WellKnownReferencePackage("Microsoft.AspNetCore.App", "net7.0"),
             WellKnownReferencePackage("Microsoft.AspNetCore.App", "net8.0"),
             WellKnownReferencePackage("Microsoft.AspNetCore.App", "net9.0"),
-            WellKnownReferencePackage("Microsoft.NETCore.App", "net6.0",
-            [
-                ("data/FrameworkList.xml", Encoding.UTF8.GetBytes("""
-                    <FileList TargetFrameworkIdentifier=".NETCoreApp" TargetFrameworkVersion="6.0" FrameworkName="Microsoft.NETCore.App" Name=".NET Runtime">
-                    </FileList>
-                    """))
-            ]),
-            WellKnownReferencePackage("Microsoft.NETCore.App", "net7.0",
-            [
-                ("data/FrameworkList.xml", Encoding.UTF8.GetBytes("""
-                    <FileList TargetFrameworkIdentifier=".NETCoreApp" TargetFrameworkVersion="7.0" FrameworkName="Microsoft.NETCore.App" Name=".NET Runtime">
-                    </FileList>
-                    """))
-            ]),
-            WellKnownReferencePackage("Microsoft.NETCore.App", "net8.0",
-            [
-                ("data/FrameworkList.xml", Encoding.UTF8.GetBytes("""
-                    <FileList TargetFrameworkIdentifier=".NETCoreApp" TargetFrameworkVersion="8.0" FrameworkName="Microsoft.NETCore.App" Name=".NET Runtime">
-                    </FileList>
-                    """))
-            ]),
-            WellKnownReferencePackage("Microsoft.NETCore.App", "net9.0",
-            [
-                ("data/FrameworkList.xml", Encoding.UTF8.GetBytes("""
-                    <FileList TargetFrameworkIdentifier=".NETCoreApp" TargetFrameworkVersion="9.0" FrameworkName="Microsoft.NETCore.App" Name=".NET Runtime">
-                    </FileList>
-                    """))
-            ]),
+            GetMicrosoftNETCoreAppRefPackage(6),
+            GetMicrosoftNETCoreAppRefPackage(7),
+            GetMicrosoftNETCoreAppRefPackage(8),
+            GetMicrosoftNETCoreAppRefPackage(9),
             WellKnownReferencePackage("Microsoft.WindowsDesktop.App", "net6.0"),
             WellKnownReferencePackage("Microsoft.WindowsDesktop.App", "net7.0"),
             WellKnownReferencePackage("Microsoft.WindowsDesktop.App", "net8.0"),
             WellKnownReferencePackage("Microsoft.WindowsDesktop.App", "net9.0"),
-            WellKnownHostPackage("Microsoft.NETCore.App", "net8.0"),
         ];
     }
 }

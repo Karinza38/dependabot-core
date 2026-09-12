@@ -47,6 +47,10 @@ module Dependabot
           @error_handler = error_handler
           # A list of notices that will be used in PR messages and/or sent to the dependabot github alerts.
           @notices = T.let([], T::Array[Dependabot::Notice])
+
+          return unless job.source.directory.nil? && job.source.directories&.one?
+
+          job.source.directory = job.source.directories&.first
         end
 
         sig { void }
@@ -70,12 +74,16 @@ module Dependabot
 
         sig { returns(Dependabot::Job) }
         attr_reader :job
-        sig { returns(Dependabot::Service) }
+
+        sig { override.returns(Dependabot::Service) }
         attr_reader :service
+
         sig { returns(Dependabot::DependencySnapshot) }
         attr_reader :dependency_snapshot
+
         sig { returns(Dependabot::Updater::ErrorHandler) }
         attr_reader :error_handler
+
         # A list of notices that will be used in PR messages and/or sent to the dependabot github alerts.
         sig { returns(T::Array[Dependabot::Notice]) }
         attr_reader :notices
@@ -92,7 +100,7 @@ module Dependabot
         sig { params(dependencies: T::Array[Dependabot::Dependency]).void }
         def check_and_update_pull_request(dependencies)
           # If the job dependencies are empty, then we should close the PR
-          job_dependencies = job.dependencies
+          job_dependencies = job.dependencies&.uniq
           unless job_dependencies
             Dependabot.logger.info("No dependencies to update")
             close_pull_request(reason: :dependencies_removed)
@@ -103,6 +111,11 @@ module Dependabot
             # If the job dependencies mismatch the parsed dependencies, then
             # we should close the PR as at least one thing we changed has been
             # removed from the project.
+            Dependabot.logger.info(
+              "Job dependencies do not match parsed dependencies. " \
+              "Job dependencies: #{job_dependencies}, " \
+              "Parsed dependencies: #{dependencies.map(&:name)}"
+            )
             close_pull_request(reason: :dependency_removed)
             return
           end
@@ -113,7 +126,7 @@ module Dependabot
           # pull request is rebased.
           if dependencies.none? { |d| job.allowed_update?(d) }
             lead_dependency = dependencies.first
-            if lead_dependency && job.vulnerable?(lead_dependency)
+            if lead_dependency && job.current_version_vulnerable?(lead_dependency)
               Dependabot.logger.info(
                 "Dependency no longer allowed to update #{lead_dependency.name} #{lead_dependency.version}"
               )
@@ -132,26 +145,18 @@ module Dependabot
           # Note: Gradle, Maven and Nuget dependency names can be case-insensitive
           # and the dependency name in the security advisory often doesn't match
           # what users have specified in their manifest.
-          # Dependabot::Experiments.register(:lead_security_dependency, true)
+          lead_dep_name = security_advisory_dependency.downcase
 
-          if Dependabot::Experiments.enabled?(:lead_security_dependency)
-            lead_dep_name = security_advisory_dependency.downcase
+          Dependabot.logger.info(
+            "Security advisory dependency: #{lead_dep_name}\n" \
+            "First dependency in list: #{job_dependencies.first&.downcase}"
+          )
 
-            # telemetry data collection
+          if lead_dep_name != job_dependencies.first&.downcase
             Dependabot.logger.info(
-              "Security advisory dependency: #{lead_dep_name}\n" \
-              "First dependency in list: #{job_dependencies.first&.downcase}"
+              "Difference found between security-advisory (#{lead_dep_name}) and " \
+              "first-dependency (#{job_dependencies.first&.downcase})"
             )
-
-            if lead_dep_name != job_dependencies.first&.downcase
-              Dependabot.logger.info(
-                "Difference found between security-advisory (#{lead_dep_name}) and " \
-                "first-dependency (#{job_dependencies.first&.downcase})"
-              )
-            end
-
-          else
-            lead_dep_name = job_dependencies.first&.downcase
           end
 
           lead_dependency = dependencies.find do |dep|
@@ -162,6 +167,9 @@ module Dependabot
 
           checker = update_checker_for(lead_dependency)
           log_checking_for_update(lead_dependency)
+          record_blocked_version_ignored(
+            job: job, dependency: lead_dependency, operation: BlockedVersionsOperation::REFRESH_SECURITY_UPDATE
+          )
 
           Dependabot.logger.info("Latest version is #{checker.latest_version}")
 
@@ -194,8 +202,13 @@ module Dependabot
           # NOTE: Gradle, Maven and Nuget dependency names can be case-insensitive
           # and the dependency name in the security advisory often doesn't match
           # what users have specified in their manifest.
-          job_dependencies = job_dependencies.map(&:downcase)
-          changed_dependencies = dependency_change.updated_dependencies.map { |x| x.name.downcase }
+          job_dependencies = job_dependencies.map(&:downcase).uniq
+          changed_dependencies = dependency_change.updated_dependencies.map { |x| x.name.downcase }.uniq
+
+          Dependabot.logger.info(
+            "Job Dependencies (current): #{job_dependencies}, " \
+            "Changed Dependencies (new): #{changed_dependencies}"
+          )
 
           if changed_dependencies.sort_by(&:downcase) != job_dependencies.sort_by(&:downcase)
             # The dependencies being updated have changed. Close the existing
@@ -286,16 +299,20 @@ module Dependabot
 
         sig { params(dependency_change: Dependabot::DependencyChange).void }
         def create_pull_request(dependency_change)
-          Dependabot.logger.info("Submitting #{dependency_change.updated_dependencies.map(&:name).join(', ')} " \
-                                 "pull request for creation")
+          Dependabot.logger.info(
+            "Submitting #{dependency_change.updated_dependencies.map(&:name).join(', ')} " \
+            "pull request for creation"
+          )
 
           service.create_pull_request(dependency_change, dependency_snapshot.base_commit_sha)
         end
 
         sig { params(dependency_change: Dependabot::DependencyChange).void }
         def update_pull_request(dependency_change)
-          Dependabot.logger.info("Submitting #{dependency_change.updated_dependencies.map(&:name).join(', ')} " \
-                                 "pull request for update")
+          Dependabot.logger.info(
+            "Submitting #{dependency_change.updated_dependencies.map(&:name).join(', ')} " \
+            "pull request for update"
+          )
 
           service.update_pull_request(dependency_change, dependency_snapshot.base_commit_sha)
         end
@@ -306,15 +323,17 @@ module Dependabot
 
           job_dependencies = job.dependencies || []
 
-          Dependabot.logger.info("Telling backend to close pull request for " \
-                                 "#{job_dependencies.join(', ')} - #{reason_string}")
+          Dependabot.logger.info(
+            "Telling backend to close pull request for " \
+            "#{job_dependencies.join(', ')} - #{reason_string}"
+          )
 
           service.close_pull_request(job_dependencies, reason)
         end
 
         sig { returns(String) }
         def security_advisory_dependency
-          T.cast(job.security_advisories.first, T::Hash[String, String])["dependency-name"].to_s
+          job.security_advisories.first&.dependency_name.to_s
         end
       end
     end

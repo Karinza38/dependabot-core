@@ -14,6 +14,8 @@ module Dependabot
     class UpdateChecker < Dependabot::UpdateCheckers::Base
       extend T::Sig
 
+      require_relative "update_checker/latest_version_finder"
+
       sig { override.returns(T.nilable(T.any(String, Dependabot::Version))) }
       def latest_version
         @latest_version ||=
@@ -35,7 +37,7 @@ module Dependabot
         latest_version
       end
 
-      sig { override.returns(T::Array[T::Hash[Symbol, T.untyped]]) }
+      sig { override.returns(T::Array[Dependabot::DependencyRequirement]) }
       def updated_requirements
         # Submodule requirements are the URL and branch to use for the
         # submodule. We never want to update either.
@@ -57,12 +59,18 @@ module Dependabot
 
       sig { returns(T.nilable(String)) }
       def fetch_latest_version
-        git_commit_checker = Dependabot::GitCommitChecker.new(
-          dependency: dependency,
-          credentials: credentials
+        T.let(
+          LatestVersionFinder.new(
+            dependency: dependency,
+            dependency_files: dependency_files,
+            credentials: credentials,
+            ignored_versions: ignored_versions,
+            security_advisories: security_advisories,
+            cooldown_options: update_cooldown,
+            raise_on_ignored: raise_on_ignored
+          ).latest_tag,
+          T.nilable(String)
         )
-
-        git_commit_checker.head_commit_for_current_branch
       end
     end
   end

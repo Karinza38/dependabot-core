@@ -1,0 +1,14 @@
+<Project>
+  <PropertyGroup>
+    <!--
+    Suppress errors like:
+      error MSB3644: The reference assemblies for .NETFramework,Version=v4.7.2 were not found.
+    because that's irrelevant to dependency discovery.
+    -->
+    <NoWarn>$(NoWarn);MSB3644</NoWarn>
+    <!-- A package downgrade warning shouldn't be lifted to an error because that would prevent discovery. -->
+    <NoWarn>$(NoWarn);NU1605</NoWarn>
+    <!-- Deprecated MonoAndroid framework shouldn't cause a warning because we'll do nothing about it here. -->
+    <NoWarn>$(NoWarn);NU1703</NoWarn>
+  </PropertyGroup>
+</Project>

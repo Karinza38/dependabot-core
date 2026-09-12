@@ -3,6 +3,7 @@
 
 require "nokogiri"
 require "sorbet-runtime"
+require "open3"
 
 require "dependabot/dependency"
 require "dependabot/file_parsers"
@@ -16,10 +17,14 @@ require "dependabot/errors"
 # - http://maven.apache.org/pom.html
 module Dependabot
   module Maven
+    # rubocop:disable-next Metrics/ClassLength
     class FileParser < Dependabot::FileParsers::Base
       extend T::Sig
+
       require "dependabot/file_parsers/base/dependency_set"
+      require_relative "file_parser/maven_dependency_parser"
       require_relative "file_parser/property_value_finder"
+      require_relative "file_parser/wrapper_mojo"
 
       # The following "dependencies" are candidates for updating:
       # - The project's parent
@@ -32,6 +37,7 @@ module Dependabot
                             "annotationProcessorPaths > path"
       PLUGIN_SELECTOR     = "plugins > plugin"
       EXTENSION_SELECTOR  = "extensions > extension"
+      TARGET_SELECTOR = "target > locations > location[type='Maven'] > dependencies > dependency"
       PLUGIN_ARTIFACT_ITEMS_SELECTOR = "plugins > plugin > executions > execution > " \
                                        "configuration > artifactItems > artifactItem"
 
@@ -40,10 +46,11 @@ module Dependabot
 
       sig { override.returns(T::Array[Dependabot::Dependency]) }
       def parse
-        dependency_set = DependencySet.new
-        pomfiles.each { |pom| dependency_set += pomfile_dependencies(pom) }
-        extensionfiles.each { |extension| dependency_set += extensionfile_dependencies(extension) }
-        dependency_set.dependencies
+        if Dependabot::Experiments.enabled?(:maven_transitive_dependencies)
+          parse_with_transitive_dependencies
+        else
+          parse_standard_dependencies
+        end
       end
 
       sig { returns(Ecosystem) }
@@ -60,6 +67,54 @@ module Dependabot
 
       private
 
+      sig { returns(T::Array[Dependabot::Dependency]) }
+      def parse_with_transitive_dependencies
+        dependency_set = DependencySet.new
+        dependency_set += MavenDependencyParser.build_dependency_set(pomfiles)
+
+        pomfiles.each { |pom| dependency_set += pomfile_dependencies(pom) }
+        extensionfiles.each { |extension| dependency_set += extensionfile_dependencies(extension) }
+        add_wrapper_dependencies(dependency_set)
+
+        dependencies = []
+        dependency_set.dependencies.each do |dep|
+          requirements = merge_requirements(dep.requirements)
+          dependencies << Dependabot::Dependency.new(
+            name: dep.name,
+            version: dep.version,
+            package_manager: "maven",
+            requirements: requirements
+          )
+        end
+        dependencies
+      end
+
+      sig { returns(T::Array[Dependabot::Dependency]) }
+      def parse_standard_dependencies
+        dependency_set = DependencySet.new
+        pomfiles.each { |pom| dependency_set += pomfile_dependencies(pom) }
+        extensionfiles.each { |extension| dependency_set += extensionfile_dependencies(extension) }
+        targetfiles.each { |target| dependency_set += targetfile_dependencies(target) }
+
+        add_wrapper_dependencies(dependency_set)
+
+        dependency_set.dependencies
+      end
+
+      sig { params(dependency_set: DependencySet).void }
+      def add_wrapper_dependencies(dependency_set)
+        return unless Dependabot::Experiments.enabled?(:maven_wrapper_updater)
+
+        wrapper_properties_files.each do |properties_file|
+          dir = File.dirname(properties_file.name).sub(%r{/?\.mvn/wrapper$}, "")
+          dir = "." if dir.empty?
+          scripts = wrapper_script_files_for(dir)
+          FileParser::WrapperMojo.resolve_dependencies(properties_file, script_files: scripts).each do |dep|
+            dependency_set << dep
+          end
+        end
+      end
+
       sig { returns(Ecosystem::VersionManager) }
       def package_manager
         @package_manager ||= T.let(
@@ -70,9 +125,12 @@ module Dependabot
 
       sig { returns(T.nilable(Ecosystem::VersionManager)) }
       def language
-        @language ||= T.let(begin
-          Language.new("NOT-AVAILABLE")
-        end, T.nilable(Dependabot::Maven::Language))
+        @language ||= T.let(
+          begin
+            Language.new("NOT-AVAILABLE")
+          end,
+          T.nilable(Dependabot::Maven::Language)
+        )
       end
 
       sig { params(pom: Dependabot::DependencyFile).returns(DependencySet) }
@@ -83,14 +141,16 @@ module Dependabot
         doc = Nokogiri::XML(pom.content)
         doc.remove_namespaces!
 
+        plugin_names = collect_plugin_names(pom, doc)
+
         doc.css(DEPENDENCY_SELECTOR).each do |dependency_node|
-          dep = dependency_from_dependency_node(pom, dependency_node)
+          dep = dependency_from_dependency_node(pom, dependency_node, plugin_names)
           dependency_set << dep if dep
         rescue DependencyFileNotEvaluatable => e
           errors << e
         end
 
-        doc.css(PLUGIN_SELECTOR, PLUGIN_ARTIFACT_ITEMS_SELECTOR).each do |dependency_node|
+        plugin_nodes(doc).each do |dependency_node|
           dep = dependency_from_plugin_node(pom, dependency_node)
           dependency_set << dep if dep
         rescue DependencyFileNotEvaluatable => e
@@ -102,6 +162,18 @@ module Dependabot
         dependency_set
       end
 
+      sig { params(pom: Dependabot::DependencyFile, doc: Nokogiri::XML::Document).returns(T::Set[String]) }
+      def collect_plugin_names(pom, doc)
+        plugin_names = Set.new
+
+        plugin_nodes(doc).each do |plugin_node|
+          name = plugin_name(plugin_node, pom)
+          plugin_names << name if name
+        end
+
+        plugin_names
+      end
+
       sig { params(extension: Dependabot::DependencyFile).returns(DependencySet) }
       def extensionfile_dependencies(extension)
         dependency_set = DependencySet.new
@@ -110,8 +182,32 @@ module Dependabot
         doc = Nokogiri::XML(extension.content)
         doc.remove_namespaces!
 
+        plugin_names = collect_plugin_names(extension, doc)
+
         doc.css(EXTENSION_SELECTOR).each do |dependency_node|
-          dep = dependency_from_dependency_node(extension, dependency_node)
+          dep = dependency_from_dependency_node(extension, dependency_node, plugin_names)
+          dependency_set << dep if dep
+        rescue DependencyFileNotEvaluatable => e
+          errors << e
+        end
+
+        raise T.must(errors.first) if errors.any? && dependency_set.dependencies.none?
+
+        dependency_set
+      end
+
+      sig { params(target: Dependabot::DependencyFile).returns(DependencySet) }
+      def targetfile_dependencies(target)
+        dependency_set = DependencySet.new
+
+        errors = T.let([], T::Array[DependencyFileNotEvaluatable])
+        doc = Nokogiri::XML(target.content)
+        doc.remove_namespaces!
+
+        plugin_names = collect_plugin_names(target, doc)
+
+        doc.css(TARGET_SELECTOR).each do |dependency_node|
+          dep = dependency_from_dependency_node(target, dependency_node, plugin_names)
           dependency_set << dep if dep
         rescue DependencyFileNotEvaluatable => e
           errors << e
@@ -123,32 +219,42 @@ module Dependabot
       end
 
       sig do
-        params(pom: Dependabot::DependencyFile,
-               dependency_node: Nokogiri::XML::Element).returns(T.nilable(Dependabot::Dependency))
+        params(
+          pom: Dependabot::DependencyFile,
+          dependency_node: Nokogiri::XML::Element,
+          plugin_names: T::Set[String]
+        ).returns(T.nilable(Dependabot::Dependency))
       end
-      def dependency_from_dependency_node(pom, dependency_node)
+      def dependency_from_dependency_node(pom, dependency_node, plugin_names)
         return unless (name = dependency_name(dependency_node, pom))
         return if internal_dependency_names.include?(name)
 
-        build_dependency(pom, dependency_node, name)
+        is_plugin = plugin_names.include?(name)
+        build_dependency(pom, dependency_node, name, is_plugin: is_plugin)
       end
 
       sig do
-        params(pom: Dependabot::DependencyFile,
-               dependency_node: Nokogiri::XML::Element).returns(T.nilable(Dependabot::Dependency))
+        params(
+          pom: Dependabot::DependencyFile,
+          dependency_node: Nokogiri::XML::Element
+        ).returns(T.nilable(Dependabot::Dependency))
       end
       def dependency_from_plugin_node(pom, dependency_node)
         return unless (name = plugin_name(dependency_node, pom))
         return if internal_dependency_names.include?(name)
 
-        build_dependency(pom, dependency_node, name)
+        build_dependency(pom, dependency_node, name, is_plugin: true)
       end
 
       sig do
-        params(pom: Dependabot::DependencyFile, dependency_node: Nokogiri::XML::Element,
-               name: String).returns(T.nilable(Dependabot::Dependency))
+        params(
+          pom: Dependabot::DependencyFile,
+          dependency_node: Nokogiri::XML::Element,
+          name: String,
+          is_plugin: T::Boolean
+        ).returns(T.nilable(Dependabot::Dependency))
       end
-      def build_dependency(pom, dependency_node, name)
+      def build_dependency(pom, dependency_node, name, is_plugin:)
         property_details =
           {
             property_name: version_property_name(dependency_node),
@@ -162,7 +268,7 @@ module Dependabot
           requirements: [{
             requirement: dependency_requirement(pom, dependency_node),
             file: pom.name,
-            groups: dependency_groups(pom, dependency_node),
+            groups: dependency_groups(pom, dependency_node, is_plugin: is_plugin),
             source: nil,
             metadata: {
               packaging_type: packaging_type(pom, dependency_node),
@@ -173,8 +279,10 @@ module Dependabot
       end
 
       sig do
-        params(dependency_node: Nokogiri::XML::Element,
-               pom: Dependabot::DependencyFile).returns(T.nilable(String))
+        params(
+          dependency_node: Nokogiri::XML::Element,
+          pom: Dependabot::DependencyFile
+        ).returns(T.nilable(String))
       end
       def dependency_name(dependency_node, pom)
         return unless dependency_node.at_xpath("./groupId")
@@ -256,8 +364,16 @@ module Dependabot
         version_content.empty? ? nil : version_content
       end
 
-      sig { params(pom: Dependabot::DependencyFile, dependency_node: Nokogiri::XML::Element).returns(T::Array[String]) }
-      def dependency_groups(pom, dependency_node)
+      sig do
+        params(
+          pom: Dependabot::DependencyFile,
+          dependency_node: Nokogiri::XML::Element,
+          is_plugin: T::Boolean
+        ).returns(T::Array[String])
+      end
+      def dependency_groups(pom, dependency_node, is_plugin:)
+        return ["plugin"] if is_plugin
+
         dependency_scope(pom, dependency_node) == "test" ? ["test"] : []
       end
 
@@ -318,7 +434,7 @@ module Dependabot
           .property_details(property_name: property_name, callsite_pom: pom)
           &.fetch(:file)
 
-        return declaring_pom if declaring_pom
+        return declaring_pom if declaring_pom.is_a?(String)
 
         msg = "Property not found: #{property_name}"
         raise DependencyFileNotEvaluatable, msg
@@ -331,7 +447,7 @@ module Dependabot
           .property_details(property_name: property_name, callsite_pom: pom)
           &.fetch(:value)
 
-        return value if value
+        return value if value.is_a?(String)
 
         msg = "Property not found: #{property_name}"
         raise DependencyFileNotEvaluatable, msg
@@ -342,7 +458,7 @@ module Dependabot
       sig { returns(Dependabot::Maven::FileParser::PropertyValueFinder) }
       def property_value_finder
         @property_value_finder ||= T.let(
-          PropertyValueFinder.new(dependency_files: dependency_files, credentials: credentials.map(&:to_s)),
+          PropertyValueFinder.new(dependency_files: dependency_files, credentials: @credentials),
           T.nilable(Dependabot::Maven::FileParser::PropertyValueFinder)
         )
       end
@@ -365,6 +481,30 @@ module Dependabot
         )
       end
 
+      sig { returns(T::Array[Dependabot::DependencyFile]) }
+      def targetfiles
+        @targetfiles ||= T.let(
+          dependency_files.select { |f| f.name.end_with?(".target") },
+          T.nilable(T::Array[Dependabot::DependencyFile])
+        )
+      end
+
+      sig { returns(T::Array[Dependabot::DependencyFile]) }
+      def wrapper_properties_files
+        @wrapper_properties_files ||= T.let(
+          dependency_files.select { |f| f.name.end_with?("maven-wrapper.properties") },
+          T.nilable(T::Array[Dependabot::DependencyFile])
+        )
+      end
+
+      sig { params(dir: String).returns(T::Array[Dependabot::DependencyFile]) }
+      def wrapper_script_files_for(dir)
+        script_names = %w(mvnw mvnw.cmd mvnwDebug mvnwDebug.cmd).map do |s|
+          dir == "." ? s : "#{dir}/#{s}"
+        end
+        dependency_files.select { |f| script_names.include?(f.name) }
+      end
+
       sig { returns(T::Array[String]) }
       def internal_dependency_names
         @internal_dependency_names ||= T.let(
@@ -385,6 +525,137 @@ module Dependabot
       sig { override.void }
       def check_required_files
         raise "No pom.xml!" unless get_original_file("pom.xml")
+      end
+
+      # Merge dependency scan requirements with file parsing requirements.
+      # Since dependency scan evaluates properties, we need to combine results with XML parsing,
+      # so we know when certain requirement not a literal value and can differentiate transitive dependencies
+      # from direct dependencies.
+      sig do
+        params(requirements: T::Array[Dependabot::DependencyRequirement])
+          .returns(T::Array[Dependabot::DependencyRequirement])
+      end
+      def merge_requirements(requirements)
+        return requirements if requirements.length <= 1
+
+        merged = []
+        used_indices = Set.new
+        requirements.each_with_index do |dep_scan_req, i|
+          merge_requirement_at(requirements, dep_scan_req, i, merged, used_indices)
+        end
+
+        merged
+      end
+
+      sig do
+        params(
+          requirements: T::Array[Dependabot::DependencyRequirement],
+          dep_scan_req: Dependabot::DependencyRequirement,
+          index: Integer,
+          merged: T::Array[Dependabot::DependencyRequirement],
+          used_indices: T::Set[Integer]
+        ).void
+      end
+      def merge_requirement_at(requirements, dep_scan_req, index, merged, used_indices)
+        return if used_indices.include?(index)
+
+        pom_file = dep_scan_req.metadata_string("pom_file")
+        return merged << dep_scan_req if pom_file.nil?
+
+        merge_matching_requirement(requirements, dep_scan_req, index, merged, used_indices)
+      end
+
+      sig do
+        params(
+          requirements: T::Array[Dependabot::DependencyRequirement],
+          dep_scan_req: Dependabot::DependencyRequirement,
+          index: Integer,
+          merged: T::Array[Dependabot::DependencyRequirement],
+          used_indices: T::Set[Integer]
+        ).void
+      end
+      def merge_matching_requirement(requirements, dep_scan_req, index, merged, used_indices)
+        # Look for another requirement where pom_file matches property_source
+        pom_file = T.must(dep_scan_req.metadata_string("pom_file"))
+        match_index = matching_requirement_index(requirements, pom_file, index, used_indices)
+        return merge_unmatched_requirement(dep_scan_req, index, merged, used_indices) unless match_index
+
+        parsing_req = T.must(requirements[match_index])
+        merged << merge_requirement(dep_scan_req, parsing_req)
+        used_indices.add(index)
+        used_indices.add(match_index)
+      end
+
+      sig do
+        params(
+          dep_scan_req: Dependabot::DependencyRequirement,
+          index: Integer,
+          merged: T::Array[Dependabot::DependencyRequirement],
+          used_indices: T::Set[Integer]
+        ).void
+      end
+      def merge_unmatched_requirement(dep_scan_req, index, merged, used_indices)
+        merged << dep_scan_req
+        used_indices.add(index)
+      end
+
+      sig do
+        params(
+          requirements: T::Array[Dependabot::DependencyRequirement],
+          pom_file: String,
+          index: Integer,
+          used_indices: T::Set[Integer]
+        ).returns(T.nilable(Integer))
+      end
+      def matching_requirement_index(requirements, pom_file, index, used_indices)
+        requirements.find_index.with_index do |parsing_req, i|
+          i > index && !used_indices.include?(i) && pom_file == parsing_req.file
+        end
+      end
+
+      sig do
+        params(
+          dep_scan_req: Dependabot::DependencyRequirement,
+          parsing_req: Dependabot::DependencyRequirement
+        ).returns(Dependabot::DependencyRequirement)
+      end
+      def merge_requirement(dep_scan_req, parsing_req)
+        # We prefer file and requirement properties from parsed requirements,
+        # because they include correct file and not evaluated property value.
+        merged_req = {
+          requirement: parsing_req.requirement,
+          file: parsing_req.file,
+          groups: [*dep_scan_req.groups, *parsing_req.groups].uniq.compact,
+          source: dep_scan_req.source,
+          metadata: merge_metadata(T.must(dep_scan_req.metadata), T.must(parsing_req.metadata))
+        }
+
+        Dependabot::DependencyRequirement.create(merged_req)
+      end
+
+      # Merge metadata from two requirements, combining all keys
+      sig do
+        params(
+          metadata1: Dependabot::DependencyRequirement::ObjectHash,
+          metadata2: Dependabot::DependencyRequirement::ObjectHash
+        ).returns(Dependabot::DependencyRequirement::ObjectHash)
+      end
+      def merge_metadata(metadata1, metadata2)
+        metadata1.merge(metadata2) do |_key, old_value, new_value|
+          case [old_value, new_value]
+          in [nil, new_value] then new_value
+          in [old_value, nil] then old_value
+          in [old_value, new_value] if old_value == new_value then old_value
+          else
+            # If values differ, combine them
+            [*old_value, *new_value].uniq
+          end
+        end
+      end
+
+      sig { params(doc: Nokogiri::XML::Document).returns(Nokogiri::XML::NodeSet) }
+      def plugin_nodes(doc)
+        doc.css(PLUGIN_SELECTOR, PLUGIN_ARTIFACT_ITEMS_SELECTOR)
       end
     end
   end

@@ -47,8 +47,10 @@ module Dependabot
               if T.must(old_version_changelog_line) < T.must(new_version_changelog_line)
                 Range.new(old_version_changelog_line, -1)
               else
-                Range.new(new_version_changelog_line,
-                          T.must(old_version_changelog_line) - 1)
+                Range.new(
+                  new_version_changelog_line,
+                  T.must(old_version_changelog_line) - 1
+                )
               end
             elsif old_version_changelog_line
               return if T.must(old_version_changelog_line).zero?
@@ -167,17 +169,17 @@ module Dependabot
         sig { returns(T.nilable(String)) }
         def previous_ref
           previous_refs = T.must(dependency.previous_requirements).filter_map do |r|
-            r.dig(:source, "ref") || r.dig(:source, :ref)
+            r.source_string("ref")
           end.uniq
-          previous_refs.first if previous_refs.count == 1
+          previous_refs.first if previous_refs.one?
         end
 
         sig { returns(T.nilable(String)) }
         def new_ref
           new_refs = dependency.requirements.filter_map do |r|
-            r.dig(:source, "ref") || r.dig(:source, :ref)
+            r.source_string("ref")
           end.uniq
-          new_refs.first if new_refs.count == 1
+          new_refs.first if new_refs.one?
         end
 
         # TODO: Refactor me so that Composer doesn't need to be special cased
@@ -188,7 +190,7 @@ module Dependabot
           return false if dependency.package_manager == "composer"
 
           requirements = dependency.requirements
-          sources = requirements.map { |r| r.fetch(:source) }.uniq.compact
+          sources = requirements.map(&:source_hash).uniq.compact
           return false if sources.empty?
 
           sources.all? { |s| s[:type] == "git" || s["type"] == "git" }

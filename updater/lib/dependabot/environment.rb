@@ -1,4 +1,4 @@
-# typed: strict
+# typed: strong
 # frozen_string_literal: true
 
 require "sorbet-runtime"
@@ -54,15 +54,23 @@ module Dependabot
       @github_actions ||= T.let(b, T.nilable(T::Boolean))
     end
 
+    sig { returns(T.nilable(String)) }
+    def self.updater_sha
+      @updater_sha ||= T.let(environment_variable("DEPENDABOT_UPDATER_SHA", nil), T.nilable(String))
+    end
+
     sig { returns(T::Boolean) }
     def self.deterministic_updates?
       b = T.cast(environment_variable("UPDATER_DETERMINISTIC", false), T::Boolean)
       @deterministic_updates ||= T.let(b, T.nilable(T::Boolean))
     end
 
-    sig { returns(T::Hash[String, T.untyped]) }
+    sig { returns(T::Hash[String, Object]) }
     def self.job_definition
-      @job_definition ||= T.let(JSON.parse(File.read(job_path)), T.nilable(T::Hash[String, T.untyped]))
+      @job_definition ||= T.let(
+        T.cast(JSON.parse(File.read(job_path)), T::Hash[String, Object]),
+        T.nilable(T::Hash[String, Object])
+      )
     end
 
     sig do
@@ -88,7 +96,10 @@ module Dependabot
 
     sig { returns(T::Boolean) }
     private_class_method def self.job_debug_enabled?
-      !!job_definition.dig("job", "debug")
+      job = job_definition["job"]
+      return false unless job.is_a?(Hash)
+
+      !!T.cast(job["debug"], Object)
     end
 
     sig { returns(T::Boolean) }

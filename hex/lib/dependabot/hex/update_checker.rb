@@ -1,4 +1,4 @@
-# typed: true
+# typed: strict
 # frozen_string_literal: true
 
 require "excon"
@@ -12,29 +12,43 @@ require "json"
 module Dependabot
   module Hex
     class UpdateChecker < Dependabot::UpdateCheckers::Base
+      extend T::Sig
+
       require_relative "update_checker/file_preparer"
       require_relative "update_checker/requirements_updater"
       require_relative "update_checker/version_resolver"
+      require_relative "update_checker/latest_version_finder"
 
+      sig { override.returns(T.nilable(T.any(String, Dependabot::Version, Gem::Version))) }
       def latest_version
-        @latest_version ||=
+        @latest_version ||= T.let(
           if git_dependency?
             latest_version_for_git_dependency
           else
             latest_release_from_hex_registry || latest_resolvable_version
-          end
+          end,
+          T.nilable(T.any(String, Dependabot::Version, Gem::Version))
+        )
       end
 
+      sig { override.returns(T.nilable(T.any(String, Dependabot::Version, Gem::Version))) }
       def latest_resolvable_version
-        @latest_resolvable_version ||=
+        @latest_resolvable_version ||= T.let(
           if git_dependency?
             latest_resolvable_version_for_git_dependency
           else
             fetch_latest_resolvable_version(unlock_requirement: true)
-          end
+          end,
+          T.nilable(T.any(String, Dependabot::Version, Gem::Version))
+        )
       end
 
+      sig { override.returns(T.any(String, T.nilable(Dependabot::Version))) }
       def latest_resolvable_version_with_no_unlock
+        @latest_resolvable_version_with_no_unlock = T.let(
+          nil, T.any(String, T.nilable(Dependabot::Version))
+        )
+
         @latest_resolvable_version_with_no_unlock ||=
           if git_dependency?
             latest_resolvable_commit_with_unchanged_git_source
@@ -43,6 +57,7 @@ module Dependabot
           end
       end
 
+      sig { override.returns(T::Array[Dependabot::DependencyRequirement]) }
       def updated_requirements
         RequirementsUpdater.new(
           requirements: dependency.requirements,
@@ -53,19 +68,18 @@ module Dependabot
 
       private
 
+      sig { override.returns(T::Boolean) }
       def latest_version_resolvable_with_full_unlock?
         # Full unlock checks aren't implemented for Elixir (yet)
         false
       end
 
+      sig { override.returns(T::Array[Dependabot::Dependency]) }
       def updated_dependencies_after_full_unlock
         raise NotImplementedError
       end
 
-      def latest_version_for_git_dependency
-        latest_git_version_sha
-      end
-
+      sig { returns(T.any(String, T.nilable(Dependabot::Version))) }
       def latest_resolvable_version_for_git_dependency
         # If the gem isn't pinned, the latest version is just the latest
         # commit for the specified branch.
@@ -76,14 +90,15 @@ module Dependabot
         # of the latest tag that looks like a version.
         if git_commit_checker.pinned_ref_looks_like_version? &&
            latest_git_tag_is_resolvable?
-          new_tag = git_commit_checker.local_tag_for_latest_version
-          return new_tag.fetch(:commit_sha)
+          new_tag = git_commit_checker.local_tag_for_latest_version(update_cooldown)
+          return T.must(new_tag).commit_sha
         end
 
         # If the dependency is pinned then there's nothing we can do.
         dependency.version
       end
 
+      sig { returns(T.any(String, T.nilable(Dependabot::Version))) }
       def latest_resolvable_commit_with_unchanged_git_source
         fetch_latest_resolvable_version(unlock_requirement: false)
       rescue SharedHelpers::HelperSubprocessFailed,
@@ -95,11 +110,13 @@ module Dependabot
         raise e
       end
 
+      sig { returns(T::Boolean) }
       def git_dependency?
         git_commit_checker.git_dependency?
       end
 
-      def latest_git_version_sha
+      sig { returns(T.nilable(T.any(String, Dependabot::Version))) }
+      def latest_version_for_git_dependency
         # If the gem isn't pinned, the latest version is just the latest
         # commit for the specified branch.
         return git_commit_checker.head_commit_for_current_branch unless git_commit_checker.pinned?
@@ -108,8 +125,8 @@ module Dependabot
         # we want to update that tag. The latest version will then be the SHA
         # of the latest tag that looks like a version.
         if git_commit_checker.pinned_ref_looks_like_version?
-          latest_tag = git_commit_checker.local_tag_for_latest_version
-          return latest_tag&.fetch(:commit_sha) || dependency.version
+          latest_tag = git_commit_checker.local_tag_for_latest_version(update_cooldown)
+          return latest_tag&.commit_sha || dependency.version
         end
 
         # If the dependency is pinned to a tag that doesn't look like a
@@ -117,19 +134,20 @@ module Dependabot
         dependency.version
       end
 
+      sig { returns(T::Boolean) }
       def latest_git_tag_is_resolvable?
-        return @git_tag_resolvable if @latest_git_tag_is_resolvable_checked
+        return T.must(@git_tag_resolvable) if @latest_git_tag_is_resolvable_checked
 
-        @latest_git_tag_is_resolvable_checked = true
+        @latest_git_tag_is_resolvable_checked = T.let(true, T.nilable(T::Boolean))
 
-        return false if git_commit_checker.local_tag_for_latest_version.nil?
+        return false if git_commit_checker.local_tag_for_latest_version(update_cooldown).nil?
 
-        replacement_tag = git_commit_checker.local_tag_for_latest_version
+        replacement_tag = git_commit_checker.local_tag_for_latest_version(update_cooldown)
 
         prepared_files = FilePreparer.new(
           dependency: dependency,
           dependency_files: dependency_files,
-          replacement_git_pin: replacement_tag.fetch(:tag)
+          replacement_git_pin: T.must(replacement_tag).tag
         ).prepared_dependency_files
 
         resolver_result = VersionResolver.new(
@@ -140,13 +158,16 @@ module Dependabot
         ).latest_resolvable_version
 
         @git_tag_resolvable = !resolver_result.nil?
+        @git_tag_resolvable
       rescue SharedHelpers::HelperSubprocessFailed,
              Dependabot::DependencyFileNotResolvable => e
         raise e unless e.message.include?("resolution failed")
 
-        @git_tag_resolvable = false
+        @git_tag_resolvable = T.let(false, T.nilable(T::Boolean))
+        false
       end
 
+      sig { returns(T.nilable(Dependabot::DependencyRequirement::ObjectHash)) }
       def updated_source
         # Never need to update source, unless a git_dependency
         return dependency_source_details unless git_dependency?
@@ -154,27 +175,57 @@ module Dependabot
         # Update the git tag if updating a pinned version
         if git_commit_checker.pinned_ref_looks_like_version? &&
            latest_git_tag_is_resolvable?
-          new_tag = git_commit_checker.local_tag_for_latest_version
-          return dependency_source_details.merge(ref: new_tag.fetch(:tag))
+          new_tag = git_commit_checker.local_tag_for_latest_version(update_cooldown)
+          return source_with_ref(
+            T.must(dependency_source_details),
+            T.must(new_tag).tag
+          )
         end
 
         # Otherwise return the original source
         dependency_source_details
       end
 
+      sig { returns(T.nilable(Dependabot::DependencyRequirement::ObjectHash)) }
       def dependency_source_details
         dependency.source_details
       end
 
+      sig do
+        params(
+          source: Dependabot::DependencyRequirement::ObjectHash,
+          ref: String
+        ).returns(Dependabot::DependencyRequirement::ObjectHash)
+      end
+      def source_with_ref(source, ref)
+        updated_source = source.dup
+        key = if source.key?(:ref)
+                :ref
+              elsif source.key?("ref")
+                "ref"
+              elsif source.keys.any?(Symbol)
+                :ref
+              else
+                "ref"
+              end
+        updated_source[key] = ref
+        updated_source
+      end
+
+      sig do
+        params(unlock_requirement: T.any(T.nilable(Symbol), T::Boolean))
+          .returns(T.any(String, T.nilable(Dependabot::Version)))
+      end
       def fetch_latest_resolvable_version(unlock_requirement:)
-        @latest_resolvable_version_hash ||= {}
+        @latest_resolvable_version_hash ||= T.let({}, T.nilable(T::Hash[T.untyped, T.untyped]))
         @latest_resolvable_version_hash[unlock_requirement] ||=
           version_resolver(unlock_requirement: unlock_requirement)
           .latest_resolvable_version
       end
 
+      sig { params(unlock_requirement: T.any(T.nilable(Symbol), T::Boolean)).returns(VersionResolver) }
       def version_resolver(unlock_requirement:)
-        @version_resolver ||= {}
+        @version_resolver ||= T.let({}, T.nilable(T::Hash[T.untyped, T.untyped]))
         @version_resolver[unlock_requirement] ||=
           begin
             prepared_dependency_files = prepared_dependency_files(
@@ -191,8 +242,17 @@ module Dependabot
           end
       end
 
-      def prepared_dependency_files(unlock_requirement:,
-                                    latest_allowable_version: nil)
+      sig do
+        params(
+          unlock_requirement: T.any(T.nilable(Symbol), T::Boolean),
+          latest_allowable_version: T.nilable(Dependabot::Version)
+        )
+          .returns(T::Array[Dependabot::DependencyFile])
+      end
+      def prepared_dependency_files(
+        unlock_requirement:,
+        latest_allowable_version: nil
+      )
         FilePreparer.new(
           dependency: dependency,
           dependency_files: dependency_files,
@@ -201,70 +261,32 @@ module Dependabot
         ).prepared_dependency_files
       end
 
-      # rubocop:disable Metrics/PerceivedComplexity
+      sig { returns(T.nilable(Dependabot::Version)) }
       def latest_release_from_hex_registry
         @latest_release_from_hex_registry ||=
-          begin
-            versions = hex_registry_response&.fetch("releases", []) || []
-            versions =
-              versions
-              .select { |release| version_class.correct?(release["version"]) }
-              .map { |release| version_class.new(release["version"]) }
-
-            versions.reject!(&:prerelease?) unless wants_prerelease?
-
-            filtered = versions.reject do |v|
-              ignore_requirements.any? { |r| r.satisfied_by?(v) }
-            end
-
-            if @raise_on_ignored && filter_lower_versions(filtered).empty? && filter_lower_versions(versions).any?
-              raise AllVersionsIgnored
-            end
-
-            filtered.max
-          end
-      end
-      # rubocop:enable Metrics/PerceivedComplexity
-
-      def filter_lower_versions(versions_array)
-        return versions_array unless current_version
-
-        versions_array.select do |version|
-          version > current_version
-        end
+          T.let(
+            LatestVersionFinder.new(
+              dependency: dependency,
+              credentials: credentials,
+              dependency_files: dependency_files,
+              security_advisories: security_advisories,
+              ignored_versions: ignored_versions,
+              raise_on_ignored: raise_on_ignored,
+              cooldown_options: update_cooldown
+            ).release_version,
+            T.nilable(T.nilable(Dependabot::Version))
+          )
       end
 
-      def hex_registry_response
-        return @hex_registry_response if @hex_registry_requested
-
-        @hex_registry_requested = true
-
-        response = Dependabot::RegistryClient.get(url: dependency_url)
-        return unless response.status == 200
-
-        @hex_registry_response = JSON.parse(response.body)
-      rescue Excon::Error::Socket, Excon::Error::Timeout
-        nil
-      end
-
-      def wants_prerelease?
-        return true if current_version&.prerelease?
-
-        dependency.requirements.any? do |req|
-          req[:requirement]&.match?(/\d-[A-Za-z0-9]/)
-        end
-      end
-
-      def dependency_url
-        "https://hex.pm/api/packages/#{dependency.name}"
-      end
-
+      sig { returns(Dependabot::GitCommitChecker) }
       def git_commit_checker
-        @git_commit_checker ||=
+        @git_commit_checker ||= T.let(
           GitCommitChecker.new(
             dependency: dependency,
             credentials: credentials
-          )
+          ),
+          T.nilable(Dependabot::GitCommitChecker)
+        )
       end
     end
   end

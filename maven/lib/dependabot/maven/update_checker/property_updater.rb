@@ -1,129 +1,249 @@
-# typed: true
+# typed: strict
 # frozen_string_literal: true
 
+require "dependabot/package/release_cooldown_options"
 require "dependabot/maven/file_parser"
 require "dependabot/maven/update_checker"
 require "dependabot/maven/file_updater/declaration_finder"
+require "sorbet-runtime"
 
 module Dependabot
   module Maven
     class UpdateChecker
       class PropertyUpdater
+        extend T::Sig
+
         require_relative "requirements_updater"
         require_relative "version_finder"
 
-        def initialize(dependency:, dependency_files:, credentials:,
-                       target_version_details:, ignored_versions:)
+        sig do
+          params(
+            dependency: Dependabot::Dependency,
+            dependency_files: T::Array[Dependabot::DependencyFile],
+            credentials: T::Array[Dependabot::Credential],
+            ignored_versions: T::Array[String],
+            target_version_details: T.nilable(UpdateChecker::VersionDetails),
+            update_cooldown: T.nilable(Dependabot::Package::ReleaseCooldownOptions)
+          ).void
+        end
+        def initialize(
+          dependency:,
+          dependency_files:,
+          credentials:,
+          ignored_versions:,
+          target_version_details:,
+          update_cooldown: nil
+        )
           @dependency       = dependency
           @dependency_files = dependency_files
           @credentials      = credentials
           @ignored_versions = ignored_versions
-          @target_version   = target_version_details&.fetch(:version)
-          @source_url       = target_version_details&.fetch(:source_url)
+          target_version = target_version_details&.fetch(:version)
+          target_version = nil unless target_version.is_a?(Dependabot::Maven::Version)
+          @target_version = T.let(target_version, T.nilable(Dependabot::Maven::Version))
+          @source_url = T.let(target_version_details&.fetch(:source_url), T.nilable(String))
+          @update_cooldown = update_cooldown
+          @property_value_finder = T.let(nil, T.nilable(Dependabot::Maven::FileParser::PropertyValueFinder))
         end
 
+        sig { returns(T::Boolean) }
         def update_possible?
           return false unless target_version
-          return @update_possible if defined?(@update_possible)
+          return T.must(@update_possible) if defined?(@update_possible)
 
-          @update_possible =
+          @update_possible ||= T.let(
             dependencies_using_property.all? do |dep|
               next false if includes_property_reference?(updated_version(dep))
 
-              versions = VersionFinder.new(
+              releases = VersionFinder.new(
                 dependency: dep,
                 dependency_files: dependency_files,
                 credentials: credentials,
                 ignored_versions: ignored_versions,
-                security_advisories: []
-              ).versions.map { |v| v.fetch(:version) }
+                security_advisories: [],
+                cooldown_options: update_cooldown
+              ).releases
+
+              versions = releases.map(&:version)
 
               versions.include?(updated_version(dep)) || versions.none?
-            end
+            end,
+            T.nilable(T::Boolean)
+          )
         end
 
+        sig { returns(T::Array[Dependabot::Dependency]) }
         def updated_dependencies
           raise "Update not possible!" unless update_possible?
 
-          @updated_dependencies ||=
+          @updated_dependencies ||= T.let(
             dependencies_using_property.map do |dep|
               Dependency.new(
                 name: dep.name,
                 version: updated_version(dep),
                 requirements: updated_requirements(dep),
-                previous_version: dep.version,
+                previous_version: previous_version(dep),
                 previous_requirements: dep.requirements,
                 package_manager: dep.package_manager
               )
-            end
+            end,
+            T.nilable(T::Array[Dependabot::Dependency])
+          )
         end
 
         private
 
+        sig { returns(Dependabot::Dependency) }
         attr_reader :dependency
+
+        sig { returns(T::Array[Dependabot::DependencyFile]) }
         attr_reader :dependency_files
+
+        sig { returns(T.nilable(Dependabot::Maven::Version)) }
         attr_reader :target_version
+
+        sig { returns(T.nilable(String)) }
         attr_reader :source_url
+
+        sig { returns(T::Array[Dependabot::Credential]) }
         attr_reader :credentials
+
+        sig { returns(T::Array[String]) }
         attr_reader :ignored_versions
 
+        sig { returns(T.nilable(Dependabot::Package::ReleaseCooldownOptions)) }
+        attr_reader :update_cooldown
+
+        sig { returns(T::Array[Dependabot::Dependency]) }
         def dependencies_using_property
-          @dependencies_using_property ||=
+          @dependencies_using_property ||= T.let(
             Maven::FileParser.new(
               dependency_files: dependency_files,
               source: nil
             ).parse.select do |dep|
               dep.requirements.any? do |r|
-                next unless r.dig(:metadata, :property_name) == property_name
+                next unless r.metadata_string("property_name") == property_name
 
-                r.dig(:metadata, :property_source) == property_source
+                r.metadata_string("property_source") == property_source
               end
-            end
+            end,
+            T.nilable(T::Array[Dependabot::Dependency])
+          )
         end
 
+        sig { returns(String) }
         def property_name
-          @property_name ||= dependency.requirements
-                                       .find { |r| r.dig(:metadata, :property_name) }
-                                       &.dig(:metadata, :property_name)
+          @property_name ||= T.let(
+            property_requirement.metadata_string("property_name"),
+            T.nilable(String)
+          )
 
           raise "No requirement with a property name!" unless @property_name
 
           @property_name
         end
 
+        sig { returns(T.nilable(String)) }
         def property_source
-          @property_source ||=
-            dependency.requirements
-                      .find { |r| r.dig(:metadata, :property_name) == property_name }
-                      &.dig(:metadata, :property_source)
+          @property_source ||= T.let(
+            property_requirement.metadata_string("property_source"),
+            T.nilable(String)
+          )
         end
 
+        sig { returns(Dependabot::DependencyRequirement) }
+        def property_requirement
+          property_requirements = dependency.requirements.select { |r| r.metadata_string("property_name") }
+          matching_requirement = property_requirements.find do |requirement|
+            normalized_requirement_version(requirement) == dependency.version
+          end
+          requirement = matching_requirement || property_requirements.first
+
+          raise "No requirement with a property name!" unless requirement
+
+          requirement
+        end
+
+        sig { params(requirement: Dependabot::DependencyRequirement).returns(T.nilable(String)) }
+        def normalized_requirement_version(requirement)
+          requirement_string = requirement.requirement_string
+          return unless requirement_string
+          return if requirement_string.include?(",")
+
+          requirement_string.gsub(/[\(\)\[\]]/, "").strip
+        end
+
+        sig { params(string: String).returns(T::Boolean) }
         def includes_property_reference?(string)
           string.match?(Maven::FileParser::PROPERTY_REGEX)
         end
 
+        sig { params(dep: Dependabot::Dependency).returns(T.nilable(String)) }
         def version_string(dep)
-          declaring_requirement =
-            dep.requirements
-               .find { |r| r.dig(:metadata, :property_name) == property_name }
-
           Maven::FileUpdater::DeclarationFinder.new(
             dependency: dep,
-            declaring_requirement: declaring_requirement,
+            declaring_requirement: declaring_property_requirement(dep),
             dependency_files: dependency_files
-          ).declaration_nodes.first.at_css("version")&.content
+          ).declaration_nodes.first&.at_css("version")&.content
         end
 
+        sig { returns(T.nilable(Dependabot::DependencyFile)) }
         def pom
           dependency_files.find { |f| f.name == "pom.xml" }
         end
 
+        sig { params(dep: Dependabot::Dependency).returns(String) }
         def updated_version(dep)
-          version_string(dep).gsub("${#{property_name}}", target_version.to_s)
+          unless target_version
+            raise "Cannot update property: target version is nil. " \
+                  "This may indicate an issue with version resolution for dependency #{dep.name}"
+          end
+
+          T.must(version_string(dep)).gsub("${#{property_name}}", T.must(target_version).to_s)
         end
 
+        sig { params(dep: Dependabot::Dependency).returns(String) }
+        def previous_version(dep)
+          T.must(version_string(dep)).gsub("${#{property_name}}", current_property_value(dep))
+        end
+
+        sig { params(dep: Dependabot::Dependency).returns(String) }
+        def current_property_value(dep)
+          declaring_requirement = declaring_property_requirement(dep)
+          callsite_pom = dependency_files.find { |f| f.name == declaring_requirement.file }
+          unless callsite_pom
+            raise DependencyFileNotEvaluatable,
+                  "POM not found: #{declaring_requirement.file} for property #{property_name}"
+          end
+
+          property_value =
+            property_value_finder
+            .property_details(property_name: property_name, callsite_pom: callsite_pom)
+            &.fetch(:value)
+
+          return property_value if property_value.is_a?(String)
+
+          raise DependencyFileNotEvaluatable, "Property not found: #{property_name}"
+        end
+
+        sig { params(dep: Dependabot::Dependency).returns(Dependabot::DependencyRequirement) }
+        def declaring_property_requirement(dep)
+          declaring_requirement =
+            dep.requirements.find do |r|
+              next false unless r.metadata_string("property_name") == property_name
+
+              r.metadata_string("property_source") == property_source
+            end
+
+          return declaring_requirement if declaring_requirement
+
+          raise DependencyFileNotEvaluatable,
+                "Requirement not found for property #{property_name} from #{property_source || 'unknown source'}"
+        end
+
+        sig { params(dep: Dependabot::Dependency).returns(T::Array[Dependabot::DependencyRequirement]) }
         def updated_requirements(dep)
-          @updated_requirements ||= {}
+          @updated_requirements ||= T.let({}, T.nilable(T::Hash[String, T::Array[Dependabot::DependencyRequirement]]))
           @updated_requirements[dep.name] ||=
             RequirementsUpdater.new(
               requirements: dep.requirements,
@@ -131,6 +251,15 @@ module Dependabot
               source_url: source_url,
               properties_to_update: [property_name]
             ).updated_requirements
+        end
+
+        sig { returns(Dependabot::Maven::FileParser::PropertyValueFinder) }
+        def property_value_finder
+          @property_value_finder ||=
+            Dependabot::Maven::FileParser::PropertyValueFinder.new(
+              dependency_files: dependency_files,
+              credentials: credentials
+            )
         end
       end
     end

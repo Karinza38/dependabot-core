@@ -1,6 +1,7 @@
-# typed: true
+# typed: strict
 # frozen_string_literal: true
 
+require "sorbet-runtime"
 require "dependabot/python/file_updater"
 require "dependabot/python/file_parser/setup_file_parser"
 
@@ -10,11 +11,24 @@ module Dependabot
       # Take a setup.py, parses it (carefully!) and then create a new, clean
       # setup.py using only the information which will appear in the lockfile.
       class SetupFileSanitizer
+        extend T::Sig
+
+        sig do
+          params(
+            setup_file: T.nilable(Dependabot::DependencyFile),
+            setup_cfg: T.nilable(Dependabot::DependencyFile)
+          ).void
+        end
         def initialize(setup_file:, setup_cfg:)
           @setup_file = setup_file
           @setup_cfg = setup_cfg
+          @install_requires_array = T.let(nil, T.nilable(T::Array[String]))
+          @setup_requires_array = T.let(nil, T.nilable(T::Array[String]))
+          @extras_require_hash = T.let(nil, T.nilable(T::Hash[String, T::Array[String]]))
+          @parsed_setup_file = T.let(nil, T.nilable(Dependabot::FileParsers::Base::DependencySet))
         end
 
+        sig { returns(String) }
         def sanitized_content
           # The part of the setup.py that Pipenv cares about appears to be the
           # install_requires. A name and version are required by don't end up
@@ -31,44 +45,53 @@ module Dependabot
 
         private
 
+        sig { returns(T.nilable(Dependabot::DependencyFile)) }
         attr_reader :setup_file
+
+        sig { returns(T.nilable(Dependabot::DependencyFile)) }
         attr_reader :setup_cfg
 
+        sig { returns(T::Boolean) }
         def include_pbr?
           setup_requires_array.any? { |d| d.start_with?("pbr") }
         end
 
+        sig { returns(T::Array[String]) }
         def install_requires_array
           @install_requires_array ||=
             parsed_setup_file.dependencies.filter_map do |dep|
-              next unless dep.requirements.first[:groups]
-                             .include?("install_requires")
+              first = T.must(dep.requirements.first)
+              next unless first.groups&.include?("install_requires")
 
-              dep.name + dep.requirements.first[:requirement].to_s
+              name_with_extras(dep) + first.requirement.to_s
             end
         end
 
+        sig { returns(T::Array[String]) }
         def setup_requires_array
           @setup_requires_array ||=
             parsed_setup_file.dependencies.filter_map do |dep|
-              next unless dep.requirements.first[:groups]
-                             .include?("setup_requires")
+              first = T.must(dep.requirements.first)
+              next unless first.groups&.include?("setup_requires")
 
-              dep.name + dep.requirements.first[:requirement].to_s
+              name_with_extras(dep) + first.requirement.to_s
             end
         end
 
+        sig { returns(T::Hash[String, T::Array[String]]) }
         def extras_require_hash
           @extras_require_hash ||=
             begin
               hash = {}
               parsed_setup_file.dependencies.each do |dep|
-                dep.requirements.first[:groups].each do |group|
+                first = T.must(dep.requirements.first)
+                T.must(first.groups).each do |group|
                   next unless group.start_with?("extras_require:")
 
-                  hash[group.split(":").last] ||= []
-                  hash[group.split(":").last] <<
-                    (dep.name + dep.requirements.first[:requirement].to_s)
+                  group_name = group.to_s
+                  hash[group_name.split(":").last] ||= []
+                  hash[group_name.split(":").last] <<
+                    (name_with_extras(dep) + first.requirement.to_s)
                 end
               end
 
@@ -76,6 +99,16 @@ module Dependabot
             end
         end
 
+        # Reconstruct dependency name with extras from metadata.
+        sig { params(dep: Dependabot::Dependency).returns(String) }
+        def name_with_extras(dep)
+          extras_str = dep.metadata[:extras]
+          return dep.name unless extras_str.is_a?(String) && !extras_str.empty?
+
+          "#{dep.name}[#{extras_str}]"
+        end
+
+        sig { returns(Dependabot::FileParsers::Base::DependencySet) }
         def parsed_setup_file
           @parsed_setup_file ||=
             Python::FileParser::SetupFileParser.new(
@@ -86,10 +119,11 @@ module Dependabot
             ).dependency_set
         end
 
+        sig { returns(String) }
         def package_name
-          content = setup_file.content
+          content = T.must(T.must(setup_file).content)
           match = content.match(/name\s*=\s*['"](?<package_name>[^'"]+)['"]/)
-          match ? match[:package_name] : "default_package_name"
+          match ? T.must(match[:package_name]) : "default_package_name"
         end
       end
     end

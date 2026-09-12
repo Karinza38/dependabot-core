@@ -15,12 +15,14 @@ RSpec.describe Dependabot::Python::MetadataFinder do
   let(:version) { "1.0" }
   let(:dependency_name) { "luigi" }
   let(:credentials) do
-    [Dependabot::Credential.new({
-      "type" => "git_source",
-      "host" => "github.com",
-      "username" => "x-access-token",
-      "password" => "token"
-    })]
+    [Dependabot::Credential.new(
+      {
+        "type" => "git_source",
+        "host" => "github.com",
+        "username" => "x-access-token",
+        "password" => "token"
+      }
+    )]
   end
   let(:dependency) do
     Dependabot::Dependency.new(
@@ -70,15 +72,19 @@ RSpec.describe Dependabot::Python::MetadataFinder do
 
     context "with a private index" do
       let(:credentials) do
-        [Dependabot::Credential.new({
-          "type" => "git_source",
-          "host" => "github.com",
-          "username" => "x-access-token",
-          "password" => "token"
-        }), Dependabot::Credential.new({
-          "type" => "python_index",
-          "index-url" => "https://username:password@pypi.posrip.com/pypi/"
-        })]
+        [Dependabot::Credential.new(
+          {
+            "type" => "git_source",
+            "host" => "github.com",
+            "username" => "x-access-token",
+            "password" => "token"
+          }
+        ), Dependabot::Credential.new(
+          {
+            "type" => "python_index",
+            "index-url" => "https://username:password@pypi.posrip.com/pypi/"
+          }
+        )]
       end
       let(:pypi_response) { fixture("pypi", "pypi_response.json") }
 
@@ -92,18 +98,27 @@ RSpec.describe Dependabot::Python::MetadataFinder do
 
       it { is_expected.to eq("https://github.com/spotify/luigi") }
 
+      it "still includes public PyPI as a fallback" do
+        possible_urls = finder.send(:possible_listing_urls)
+        expect(possible_urls).to include(a_string_matching(/pypi\.org/))
+      end
+
       context "with the creds passed as a token" do
         let(:credentials) do
-          [Dependabot::Credential.new({
-            "type" => "git_source",
-            "host" => "github.com",
-            "username" => "x-access-token",
-            "password" => "token"
-          }), Dependabot::Credential.new({
-            "type" => "python_index",
-            "index-url" => "https://pypi.posrip.com/pypi/",
-            "token" => "username:password"
-          })]
+          [Dependabot::Credential.new(
+            {
+              "type" => "git_source",
+              "host" => "github.com",
+              "username" => "x-access-token",
+              "password" => "token"
+            }
+          ), Dependabot::Credential.new(
+            {
+              "type" => "python_index",
+              "index-url" => "https://pypi.posrip.com/pypi/",
+              "token" => "username:password"
+            }
+          )]
         end
 
         it { is_expected.to eq("https://github.com/spotify/luigi") }
@@ -111,15 +126,19 @@ RSpec.describe Dependabot::Python::MetadataFinder do
 
       context "with the creds using an email address and basic auth" do
         let(:credentials) do
-          [Dependabot::Credential.new({
-            "type" => "git_source",
-            "host" => "github.com",
-            "username" => "x-access-token",
-            "password" => "token"
-          }), Dependabot::Credential.new({
-            "type" => "python_index",
-            "index-url" => "https://user@mail.co:password@pypi.posrip.com/pypi/"
-          })]
+          [Dependabot::Credential.new(
+            {
+              "type" => "git_source",
+              "host" => "github.com",
+              "username" => "x-access-token",
+              "password" => "token"
+            }
+          ), Dependabot::Credential.new(
+            {
+              "type" => "python_index",
+              "index-url" => "https://user@mail.co:password@pypi.posrip.com/pypi/"
+            }
+          )]
         end
 
         before do
@@ -151,6 +170,163 @@ RSpec.describe Dependabot::Python::MetadataFinder do
 
           it { is_expected.to eq("https://github.com/spotify/luigi") }
         end
+      end
+    end
+
+    context "with a private index using /simple/ endpoint" do
+      let(:credentials) do
+        [Dependabot::Credential.new(
+          {
+            "type" => "git_source",
+            "host" => "github.com",
+            "username" => "x-access-token",
+            "password" => "token"
+          }
+        ), Dependabot::Credential.new(
+          {
+            "type" => "python_index",
+            "index-url" => "https://jfrogghdemo.jfrog.io/artifactory/api/pypi/dependabot-pip/simple",
+            "token" => "testuser:testpass",
+            "replaces-base" => true
+          }
+        )]
+      end
+      let(:pypi_response) { fixture("pypi", "pypi_response.json") }
+
+      before do
+        # Stub the correctly converted private registry URL (/simple/ -> /pypi/)
+        private_url = "https://jfrogghdemo.jfrog.io/artifactory/api/pypi/dependabot-pip/pypi/#{dependency_name}/json"
+        stub_request(:get, private_url)
+          .with(basic_auth: %w(testuser testpass))
+          .to_return(status: 200, body: pypi_response)
+      end
+
+      it "correctly converts /simple/ endpoint to /pypi/ endpoint for JSON API" do
+        expect(source_url).to eq("https://github.com/spotify/luigi")
+      end
+
+      it "generates the correct possible listing URLs" do
+        possible_urls = finder.send(:possible_listing_urls)
+
+        # Should convert /simple/ to /pypi/ for the private registry
+        expect(possible_urls).to include(
+          "https://testuser:testpass@jfrogghdemo.jfrog.io/artifactory/api/pypi/dependabot-pip/pypi/luigi/json"
+        )
+
+        # Should not include the incorrect /simple/ URL for JSON API
+        expect(possible_urls).not_to include(
+          "https://testuser:testpass@jfrogghdemo.jfrog.io/artifactory/api/pypi/dependabot-pip/simple/luigi/json"
+        )
+      end
+
+      it "does not include public PyPI in possible listing URLs" do
+        possible_urls = finder.send(:possible_listing_urls)
+        expect(possible_urls).not_to include(a_string_matching(/pypi\.org/))
+      end
+
+      it "does not query public PyPI even when private registry returns 404" do
+        private_url = "https://jfrogghdemo.jfrog.io/artifactory/api/pypi/dependabot-pip/pypi/#{dependency_name}/json"
+        stub_request(:get, private_url)
+          .with(basic_auth: %w(testuser testpass))
+          .to_return(status: 404, body: "")
+
+        source_url
+        expect(WebMock).not_to have_requested(:get, pypi_url)
+      end
+
+      context "when the private registry endpoint doesn't end with /simple/" do
+        let(:credentials) do
+          [Dependabot::Credential.new(
+            {
+              "type" => "python_index",
+              "index-url" => "https://custom.registry.com/custom/path",
+              "token" => "testtoken"
+            }
+          )]
+        end
+
+        before do
+          # For non-simple endpoints, should append /json directly
+          private_url = "https://custom.registry.com/custom/path/#{dependency_name}/json"
+          stub_request(:get, private_url)
+            .to_return(status: 200, body: pypi_response)
+        end
+
+        it "doesn't convert URLs that don't end with /simple/" do
+          possible_urls = finder.send(:possible_listing_urls)
+
+          expect(possible_urls).to include(
+            "https://testtoken@custom.registry.com/custom/path/luigi/json"
+          )
+        end
+      end
+    end
+
+    context "with a private index where 'simple' appears in both repository name and endpoint" do
+      let(:credentials) do
+        [Dependabot::Credential.new(
+          {
+            "type" => "git_source",
+            "host" => "github.com",
+            "username" => "x-access-token",
+            "password" => "token"
+          }
+        ), Dependabot::Credential.new(
+          {
+            "type" => "python_index",
+            "index-url" => "https://registry.example.com/simple/simple",
+            "token" => "testuser:testpass",
+            "replaces-base" => true
+          }
+        )]
+      end
+      let(:pypi_response) { fixture("pypi", "pypi_response.json") }
+
+      before do
+        # Stub the correctly converted private registry URL
+        # Should convert only the trailing /simple to /pypi, leaving repository name intact
+        private_url = "https://registry.example.com/simple/pypi/#{dependency_name}/json"
+        stub_request(:get, private_url)
+          .with(basic_auth: %w(testuser testpass))
+          .to_return(status: 200, body: pypi_response)
+      end
+
+      it "correctly converts only trailing /simple/ to /pypi/, preserving 'simple' in repository name" do
+        expect(source_url).to eq("https://github.com/spotify/luigi")
+      end
+
+      it "does not include public PyPI in possible listing URLs" do
+        possible_urls = finder.send(:possible_listing_urls)
+        expect(possible_urls).not_to include(a_string_matching(/pypi\.org/))
+      end
+
+      it "does not query public PyPI even when private registry returns 404" do
+        private_url = "https://registry.example.com/simple/pypi/#{dependency_name}/json"
+        stub_request(:get, private_url)
+          .with(basic_auth: %w(testuser testpass))
+          .to_return(status: 404, body: "")
+
+        source_url
+        expect(WebMock).not_to have_requested(:get, pypi_url)
+      end
+
+      it "generates the correct URL with 'simple' preserved in repository name" do
+        possible_urls = finder.send(:possible_listing_urls)
+
+        # Should convert only trailing /simple to /pypi, keeping repository name "simple"
+        expect(possible_urls).to include(
+          "https://testuser:testpass@registry.example.com/simple/pypi/luigi/json"
+        )
+
+        # Should not include the incorrect /simple/ URL for JSON API
+        expect(possible_urls).not_to include(
+          "https://testuser:testpass@registry.example.com/simple/simple/luigi/json"
+        )
+
+        # Should NOT incorrectly modify the repository name
+        expect(possible_urls).not_to include(
+          "https://testuser:testpass@registry.example.com/pypi/pypi/luigi/json"
+        )
       end
     end
 
@@ -323,6 +499,28 @@ RSpec.describe Dependabot::Python::MetadataFinder do
 
       it { is_expected.to eq("https://github.com/xxxxx/django-split-settings") }
     end
+
+    context "when project_urls includes unrelated links before the source repo" do
+      let(:dependency_name) { "geohelper" }
+      let(:pypi_response) { fixture("pypi", "pypi_response_project_urls_prefer_matching_repo.json") }
+
+      it "prefers the repository that matches the dependency name" do
+        expect(source_url).to eq("https://github.com/example-org/geohelper")
+      end
+
+      it "parses the matching project URL only once" do
+        matching_url_parse_count = 0
+
+        allow(Dependabot::Source).to receive(:from_url).and_wrap_original do |original, url|
+          matching_url_parse_count += 1 if url == "https://github.com/example-org/geohelper"
+          original.call(url)
+        end
+
+        source_url
+
+        expect(matching_url_parse_count).to eq(1)
+      end
+    end
   end
 
   describe "#homepage_url" do
@@ -340,6 +538,184 @@ RSpec.describe Dependabot::Python::MetadataFinder do
       it "returns the specified homepage" do
         expect(homepage_url).to eq("http://initd.org/psycopg/")
       end
+    end
+  end
+
+  describe "#maintainer_changes" do
+    subject(:maintainer_changes) { finder.maintainer_changes }
+
+    let(:version) { "2.1.0" }
+    let(:previous_version) { "2.0.0" }
+    let(:pypi_version_url) { "https://pypi.org/pypi/#{dependency_name}/#{version}/json" }
+    let(:pypi_previous_version_url) do
+      "https://pypi.org/pypi/#{dependency_name}/#{previous_version}/json"
+    end
+    let(:dependency) do
+      Dependabot::Dependency.new(
+        name: dependency_name,
+        version: version,
+        previous_version: previous_version,
+        requirements: [{
+          file: "requirements.txt",
+          requirement: "==#{version}",
+          groups: [],
+          source: nil
+        }],
+        package_manager: "pip"
+      )
+    end
+
+    context "when there is no previous version" do
+      let(:dependency) do
+        Dependabot::Dependency.new(
+          name: dependency_name,
+          version: version,
+          requirements: [{
+            file: "requirements.txt",
+            requirement: "==#{version}",
+            groups: [],
+            source: nil
+          }],
+          package_manager: "pip"
+        )
+      end
+
+      it { is_expected.to be_nil }
+    end
+
+    context "when the maintainers have not changed" do
+      before do
+        stub_request(:get, pypi_previous_version_url)
+          .to_return(status: 200, body: fixture("pypi", "pypi_response_ownership_single.json"))
+        stub_request(:get, pypi_version_url)
+          .to_return(status: 200, body: fixture("pypi", "pypi_response_ownership_single.json"))
+      end
+
+      it { is_expected.to be_nil }
+    end
+
+    context "when all maintainers are new" do
+      before do
+        stub_request(:get, pypi_previous_version_url)
+          .to_return(status: 200, body: fixture("pypi", "pypi_response_ownership_single.json"))
+        stub_request(:get, pypi_version_url)
+          .to_return(status: 200, body: fixture("pypi", "pypi_response_ownership_changed.json"))
+      end
+
+      it "returns a warning about new maintainers" do
+        expect(maintainer_changes).to eq(
+          "None of the maintainers for your current version of luigi are " \
+          "listed as maintainers for the new version on PyPI."
+        )
+      end
+    end
+
+    context "when some maintainers overlap" do
+      before do
+        stub_request(:get, pypi_previous_version_url)
+          .to_return(status: 200, body: fixture("pypi", "pypi_response_ownership_single.json"))
+        stub_request(:get, pypi_version_url)
+          .to_return(
+            status: 200,
+            body: fixture("pypi", "pypi_response_ownership_partial_change.json")
+          )
+      end
+
+      it { is_expected.to be_nil }
+    end
+
+    context "when the organization changes" do
+      before do
+        stub_request(:get, pypi_previous_version_url)
+          .to_return(status: 200, body: fixture("pypi", "pypi_response_ownership_org_old.json"))
+        stub_request(:get, pypi_version_url)
+          .to_return(
+            status: 200,
+            body: fixture("pypi", "pypi_response_ownership_org_changed.json")
+          )
+      end
+
+      it "returns a warning about the organization change" do
+        expect(maintainer_changes).to eq(
+          "The organization that maintains luigi on PyPI has " \
+          "changed since your current version."
+        )
+      end
+    end
+
+    context "when the organization is added" do
+      before do
+        stub_request(:get, pypi_previous_version_url)
+          .to_return(status: 200, body: fixture("pypi", "pypi_response_ownership_single.json"))
+        stub_request(:get, pypi_version_url)
+          .to_return(
+            status: 200,
+            body: fixture("pypi", "pypi_response_ownership_org_changed.json")
+          )
+      end
+
+      it { is_expected.to be_nil }
+    end
+
+    context "when the organization is removed" do
+      before do
+        stub_request(:get, pypi_previous_version_url)
+          .to_return(status: 200, body: fixture("pypi", "pypi_response_ownership_org_old.json"))
+        stub_request(:get, pypi_version_url)
+          .to_return(status: 200, body: fixture("pypi", "pypi_response_ownership_single.json"))
+      end
+
+      it "returns a warning about the organization change" do
+        expect(maintainer_changes).to eq(
+          "The organization that maintains luigi on PyPI has " \
+          "changed since your current version."
+        )
+      end
+    end
+
+    context "when the dependency uses a local version" do
+      let(:version) { "2.1.0+build1" }
+      let(:previous_version) { "2.0.0+build1" }
+
+      it { is_expected.to be_nil }
+    end
+
+    context "when fetching ownership data times out" do
+      before do
+        allow(Dependabot.logger).to receive(:warn)
+        stub_request(:get, pypi_previous_version_url)
+          .to_raise(Excon::Error::Socket.new(IOError.new("socket error")))
+        stub_request(:get, pypi_version_url)
+          .to_raise(OpenSSL::SSL::SSLError.new("ssl error"))
+      end
+
+      it "returns nil and logs the request failures" do
+        expect(maintainer_changes).to be_nil
+        expect(Dependabot.logger).to have_received(:warn)
+          .with(/Error fetching Python package ownership/).at_least(:once)
+      end
+    end
+
+    context "when ownership info is not available for the new version" do
+      before do
+        stub_request(:get, pypi_previous_version_url)
+          .to_return(status: 200, body: fixture("pypi", "pypi_response_ownership_single.json"))
+        stub_request(:get, pypi_version_url)
+          .to_return(status: 200, body: fixture("pypi", "pypi_response_no_ownership.json"))
+      end
+
+      it { is_expected.to be_nil }
+    end
+
+    context "when the version endpoint is not found" do
+      before do
+        stub_request(:get, pypi_previous_version_url)
+          .to_return(status: 404, body: "")
+        stub_request(:get, pypi_version_url)
+          .to_return(status: 200, body: fixture("pypi", "pypi_response_ownership_single.json"))
+      end
+
+      it { is_expected.to be_nil }
     end
   end
 end

@@ -1,7 +1,8 @@
-# typed: strict
+# typed: strong
 # frozen_string_literal: true
 
 require "dependabot/utils"
+require "dependabot/package/npm_package_json"
 require "dependabot/npm_and_yarn/file_parser/lockfile_parser"
 require "sorbet-runtime"
 
@@ -31,7 +32,8 @@ module Dependabot
             package_files_requiring_update.include?(file) ||
               package_required_lockfile?(file) ||
               workspaces_lockfile?(file)
-          end, T.nilable(T::Array[DependencyFile])
+          end,
+          T.nilable(T::Array[DependencyFile])
         )
       end
 
@@ -40,7 +42,8 @@ module Dependabot
         @package_files_requiring_update ||= T.let(
           dependency_files.select do |file|
             dependency_manifest_requirements.include?(file.name)
-          end, T.nilable(T::Array[DependencyFile])
+          end,
+          T.nilable(T::Array[DependencyFile])
         )
       end
 
@@ -66,8 +69,9 @@ module Dependabot
       def dependency_manifest_requirements
         @dependency_manifest_requirements ||= T.let(
           updated_dependencies.flat_map do |dep|
-            dep.requirements.map { |requirement| requirement[:file] }
-          end, T.nilable(T::Array[String])
+            dep.requirements.filter_map(&:file)
+          end,
+          T.nilable(T::Array[String])
         )
       end
 
@@ -82,9 +86,10 @@ module Dependabot
 
       sig { params(lockfile: DependencyFile).returns(T::Boolean) }
       def workspaces_lockfile?(lockfile)
-        return false unless ["yarn.lock", "package-lock.json", "pnpm-lock.yaml"].include?(lockfile.name)
+        return false unless ["yarn.lock", "package-lock.json", "pnpm-lock.yaml", "bun.lock", "npm-shrinkwrap.json"]
+                            .include?(lockfile.name)
 
-        return false unless parsed_root_package_json["workspaces"] || dependency_files.any? do |file|
+        return false unless root_package_json_document.workspaces? || dependency_files.any? do |file|
           file.name.end_with?("pnpm-workspace.yaml") && File.dirname(file.name) == File.dirname(lockfile.name)
         end
 
@@ -96,7 +101,8 @@ module Dependabot
         @root_lockfile ||= T.let(
           lockfiles.find do |file|
             File.dirname(file.name) == "."
-          end, T.nilable(DependencyFile)
+          end,
+          T.nilable(DependencyFile)
         )
       end
 
@@ -105,17 +111,19 @@ module Dependabot
         @lockfiles ||= T.let(
           dependency_files.select do |file|
             lockfile?(file)
-          end, T.nilable(T::Array[DependencyFile])
+          end,
+          T.nilable(T::Array[DependencyFile])
         )
       end
 
-      sig { returns(T::Hash[String, T.untyped]) }
-      def parsed_root_package_json
-        @parsed_root_package_json ||= T.let(
+      sig { returns(Dependabot::Package::NpmPackageJson) }
+      def root_package_json_document
+        @root_package_json_document ||= T.let(
           begin
             package = T.must(dependency_files.find { |f| f.name == "package.json" })
-            JSON.parse(T.must(package.content))
-          end, T.nilable(T::Hash[String, T.untyped])
+            Dependabot::Package::NpmPackageJson.from_file(package)
+          end,
+          T.nilable(Dependabot::Package::NpmPackageJson)
         )
       end
 
@@ -148,6 +156,7 @@ module Dependabot
           "package-lock.json",
           "yarn.lock",
           "pnpm-lock.yaml",
+          "bun.lock",
           "npm-shrinkwrap.json"
         )
       end

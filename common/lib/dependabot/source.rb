@@ -63,8 +63,7 @@ module Dependabot
       (?:#{CODECOMMIT_SOURCE})
     /x
 
-    IGNORED_PROVIDER_HOSTS = T.let(%w(gitbox.apache.org svn.apache.org fuchsia.googlesource.com).freeze,
-                                   T::Array[String])
+    IGNORED_PROVIDER_HOSTS = %w(gitbox.apache.org svn.apache.org fuchsia.googlesource.com).freeze
 
     sig { returns(String) }
     attr_accessor :provider
@@ -124,16 +123,36 @@ module Dependabot
       )
     end
 
+    @github_enterprise_cache = T.let({}, T::Hash[String, T::Boolean])
+
+    sig { void }
+    def self.reset_github_enterprise_cache!
+      @github_enterprise_cache.clear
+    end
+
     sig { params(base_url: String).returns(T::Boolean) }
     def self.github_enterprise?(base_url)
-      resp = Excon.get(File.join(base_url, "status"))
-      resp.status == 200 &&
-        # Alternatively: resp.headers["Server"] == "GitHub.com", but this
-        # currently doesn't work with development environments
-        ((resp.headers["X-GitHub-Request-Id"] && !resp.headers["X-GitHub-Request-Id"]&.empty?) || false)
-    rescue StandardError
-      false
+      return T.must(@github_enterprise_cache[base_url]) if @github_enterprise_cache.key?(base_url)
+
+      result = detect_github_enterprise(base_url)
+      @github_enterprise_cache[base_url] = result unless result.nil?
+      result || false
     end
+
+    sig { params(base_url: String).returns(T.nilable(T::Boolean)) }
+    def self.detect_github_enterprise(base_url)
+      resp = Excon.get(File.join(base_url, "status"))
+      return false if resp.status == 404
+
+      return unless resp.status == 200
+
+      # Alternatively: resp.headers["Server"] == "GitHub.com", but this
+      # currently doesn't work with development environments
+      (resp.headers["X-GitHub-Request-Id"] && !resp.headers["X-GitHub-Request-Id"]&.empty?) || false
+    rescue StandardError
+      nil
+    end
+    private_class_method :detect_github_enterprise
 
     sig do
       params(
@@ -147,8 +166,16 @@ module Dependabot
         api_endpoint: T.nilable(String)
       ).void
     end
-    def initialize(provider:, repo:, directory: nil, directories: nil, branch: nil, commit: nil,
-                   hostname: nil, api_endpoint: nil)
+    def initialize(
+      provider:,
+      repo:,
+      directory: nil,
+      directories: nil,
+      branch: nil,
+      commit: nil,
+      hostname: nil,
+      api_endpoint: nil
+    )
       if (hostname.nil? ^ api_endpoint.nil?) && (provider != "codecommit")
         msg = "Both hostname and api_endpoint must be specified if either " \
               "are. Alternatively, both may be left blank to use the " \
@@ -194,7 +221,13 @@ module Dependabot
 
     sig { returns(String) }
     def organization
-      T.must(repo.split("/").first)
+      case provider
+      when "azure"
+        parts = repo.split("/_git/")
+        T.must(T.must(parts.first).split("/").last(2).first)
+      else
+        T.must(repo.split("/").first)
+      end
     end
 
     sig { returns(String) }
@@ -202,7 +235,7 @@ module Dependabot
       raise "Project is an Azure DevOps concept only" unless provider == "azure"
 
       parts = repo.split("/_git/")
-      return T.must(T.must(parts.first).split("/").last) if parts.first&.split("/")&.count == 2
+      return T.must(T.must(parts.first).split("/").last) if parts.first&.split("/")&.count&.>=(2)
 
       T.must(parts.last)
     end

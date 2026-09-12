@@ -10,11 +10,15 @@ require "dependabot/shared_helpers"
 require "dependabot/errors"
 require "dependabot/go_modules/requirement"
 require "dependabot/go_modules/resolvability_errors"
+require "dependabot/go_modules/package/package_details_fetcher"
+require "dependabot/go_modules/azure_devops_path_normalizer"
+require "dependabot/package/package_latest_version_finder"
+require "dependabot/update_checkers/cooldown_calculation"
 
 module Dependabot
   module GoModules
     class UpdateChecker
-      class LatestVersionFinder
+      class LatestVersionFinder < Dependabot::Package::PackageLatestVersionFinder
         extend T::Sig
 
         RESOLVABILITY_ERROR_REGEXES = T.let(
@@ -44,8 +48,8 @@ module Dependabot
             credentials: T::Array[Dependabot::Credential],
             ignored_versions: T::Array[String],
             security_advisories: T::Array[Dependabot::SecurityAdvisory],
-            goprivate: String,
-            raise_on_ignored: T::Boolean
+            raise_on_ignored: T::Boolean,
+            cooldown_options: T.nilable(Dependabot::Package::ReleaseCooldownOptions)
           )
             .void
         end
@@ -55,8 +59,8 @@ module Dependabot
           credentials:,
           ignored_versions:,
           security_advisories:,
-          goprivate:,
-          raise_on_ignored: false
+          raise_on_ignored: false,
+          cooldown_options: nil
         )
           @dependency          = dependency
           @dependency_files    = dependency_files
@@ -64,17 +68,44 @@ module Dependabot
           @ignored_versions    = ignored_versions
           @security_advisories = security_advisories
           @raise_on_ignored    = raise_on_ignored
-          @goprivate           = goprivate
+          @cooldown_options    = cooldown_options
+          super(
+            dependency: dependency,
+            dependency_files: dependency_files,
+            credentials: credentials,
+            ignored_versions: ignored_versions,
+            security_advisories: security_advisories,
+            cooldown_options: cooldown_options,
+            raise_on_ignored: raise_on_ignored,
+            options: {}
+          )
         end
 
-        sig { returns(T.nilable(Dependabot::Version)) }
-        def latest_version
-          @latest_version ||= T.let(fetch_latest_version, T.nilable(Dependabot::Version))
+        sig do
+          override.params(language_version: T.nilable(T.any(String, Dependabot::Version)))
+                  .returns(T.nilable(Dependabot::Version))
+        end
+        def latest_version(language_version: nil)
+          @latest_version ||= T.let(
+            fetch_latest_version(language_version: language_version),
+            T.nilable(Dependabot::Version)
+          )
         end
 
-        sig { returns(T.nilable(Dependabot::Version)) }
-        def lowest_security_fix_version
-          @lowest_security_fix_version ||= T.let(fetch_lowest_security_fix_version, T.nilable(Dependabot::Version))
+        sig do
+          override.params(language_version: T.nilable(T.any(String, Dependabot::Version)))
+                  .returns(T.nilable(Dependabot::Version))
+        end
+        def lowest_security_fix_version(language_version: nil)
+          @lowest_security_fix_version ||= T.let(
+            fetch_lowest_security_fix_version(language_version: language_version),
+            T.nilable(Dependabot::Version)
+          )
+        end
+
+        sig { override.returns(T::Boolean) }
+        def cooldown_enabled?
+          true
         end
 
         private
@@ -94,126 +125,179 @@ module Dependabot
         sig { returns(T::Array[Dependabot::SecurityAdvisory]) }
         attr_reader :security_advisories
 
-        sig { returns(T.nilable(Dependabot::Version)) }
-        def fetch_latest_version
-          candidate_versions = available_versions
-          candidate_versions = filter_prerelease_versions(candidate_versions)
-          candidate_versions = filter_ignored_versions(candidate_versions)
-          # Adding the psuedo-version to the list to avoid downgrades
-          candidate_versions << version_class.new(dependency.version) if PSEUDO_VERSION_REGEX.match?(dependency.version)
+        sig { returns(T.nilable(Dependabot::Package::ReleaseCooldownOptions)) }
+        attr_reader :cooldown_options
 
-          candidate_versions.max
+        sig { returns(T::Array[Dependabot::Package::PackageRelease]) }
+        def available_versions_details
+          @available_versions_details ||= T.let(
+            Package::PackageDetailsFetcher.new(
+              dependency: dependency,
+              dependency_files: dependency_files,
+              credentials: credentials
+            ).fetch_available_versions,
+            T.nilable(T::Array[Dependabot::Package::PackageRelease])
+          )
         end
 
-        sig { returns(T.nilable(Dependabot::Version)) }
-        def fetch_lowest_security_fix_version
-          relevant_versions = available_versions
+        # rubocop:disable Lint/UnusedMethodArgument
+        sig do
+          params(language_version: T.nilable(T.any(String, Dependabot::Version)))
+            .returns(T.nilable(Dependabot::Version))
+        end
+        def fetch_latest_version(language_version: nil)
+          candidate_versions = available_versions_details
+          candidate_versions = filter_prerelease_versions(candidate_versions)
+          candidate_versions = filter_ignored_versions(candidate_versions)
+          candidate_versions = lazy_filter_cooldown_versions(candidate_versions)
+          # Adding the psuedo-version to the list to avoid downgrades
+          if PSEUDO_VERSION_REGEX.match?(dependency.version)
+            candidate_versions << Dependabot::Package::PackageRelease.new(
+              version: GoModules::Version.new(dependency.version)
+            )
+          end
+
+          candidate_versions.max_by(&:version)&.version
+        end
+
+        sig do
+          params(releases: T::Array[Dependabot::Package::PackageRelease], check_max: T::Boolean)
+            .returns(T::Array[Dependabot::Package::PackageRelease])
+        end
+        def lazy_filter_cooldown_versions(releases, check_max: true)
+          return releases unless cooldown_enabled?
+          return releases unless cooldown_options
+
+          Dependabot.logger.info("Initializing cooldown filter")
+
+          sorted_releases = if check_max
+                              releases.sort_by(&:version).reverse
+                            else
+                              releases.sort_by(&:version)
+                            end
+
+          filtered_versions = []
+          cooldown_filtered_versions = 0
+
+          # Iterate through the sorted versions lazily, filtering out cooldown versions
+          sorted_releases.each do |release|
+            if in_cooldown_period?(release)
+              Dependabot.logger.info("Filtered out (cooldown) : #{release}")
+              cooldown_filtered_versions += 1
+              next
+            end
+
+            filtered_versions << release
+            break
+          end
+
+          Dependabot.logger.info("Filtered out #{cooldown_filtered_versions} version(s) due to cooldown")
+
+          filtered_versions
+        end
+
+        # rubocop:disable Metrics/AbcSize
+        sig { params(release: Dependabot::Package::PackageRelease).returns(T::Boolean) }
+        def in_cooldown_period?(release)
+          begin
+            dependency_name = AzureDevopsPathNormalizer.normalize(dependency.name)
+            release_info = SharedHelpers.run_shell_command(
+              "go list -m -json #{dependency_name}@#{release.details.[]('version_string')}",
+              fingerprint: "go list -m -json <dependency_name>"
+            )
+          rescue Dependabot::SharedHelpers::HelperSubprocessFailed => e
+            Dependabot.logger.info("Error while fetching release date info: #{e.message}")
+            return false
+          end
+
+          release.instance_variable_set(
+            :@released_at, JSON.parse(release_info)["Time"] ? Time.parse(JSON.parse(release_info)["Time"]) : nil
+          )
+
+          return false unless release.released_at
+
+          current_version = version_class.correct?(dependency.version) ? version_class.new(dependency.version) : nil
+          days = cooldown_days_for(current_version, release.version)
+          in_cooldown = Dependabot::UpdateCheckers::CooldownCalculation
+                        .within_cooldown_window?(T.must(release.released_at), days)
+
+          if in_cooldown
+            passed_days = (Time.now.to_i - release.released_at.to_i) / (24 * 60 * 60)
+            Dependabot.logger.info(
+              "Version #{release.version}, Release date: #{release.released_at}." \
+              " Days since release: #{passed_days} (cooldown days: #{days})"
+            )
+          end
+
+          in_cooldown
+        end
+        # rubocop:enable Metrics/AbcSize
+
+        sig do
+          override.returns(T.nilable(Dependabot::Package::PackageDetails))
+        end
+        def package_details
+          @package_details ||= T.let(
+            Dependabot::Package::PackageDetails.new(
+              dependency: dependency,
+              releases: available_versions_details.reverse.uniq(&:version)
+            ),
+            T.nilable(Dependabot::Package::PackageDetails)
+          )
+        end
+
+        sig do
+          params(language_version: T.nilable(T.any(String, Dependabot::Version)))
+            .returns(T.nilable(Dependabot::Version))
+        end
+        def fetch_lowest_security_fix_version(language_version: nil)
+          relevant_versions = available_versions_details
           relevant_versions = filter_prerelease_versions(relevant_versions)
-          relevant_versions = Dependabot::UpdateCheckers::VersionFilters.filter_vulnerable_versions(relevant_versions,
-                                                                                                    security_advisories)
+          # Add pseudo-versions from advisory boundaries after the prerelease filter.
+          # The Go proxy only indexes tagged releases, so commit-based pseudo-version
+          # fix boundaries won't appear in the version list. They're not traditional
+          # prereleases and must always be considered as candidates.
+          relevant_versions += pseudo_versions_from_advisory_boundaries
+          relevant_versions = Dependabot::UpdateCheckers::VersionFilters.filter_vulnerable_versions(
+            relevant_versions,
+            security_advisories
+          )
           relevant_versions = filter_ignored_versions(relevant_versions)
           relevant_versions = filter_lower_versions(relevant_versions)
 
-          relevant_versions.min
+          relevant_versions.min_by(&:version)&.version
         end
+        # rubocop:enable Lint/UnusedMethodArgument
 
-        sig { returns(T::Array[Dependabot::Version]) }
-        def available_versions
-          @available_versions ||= T.let(fetch_available_versions, T.nilable(T::Array[Dependabot::Version]))
-        end
+        # When an advisory's fix boundary is a pseudo-version (e.g. "< 2.3.1-0.20260320110106-0b84568fffcc"),
+        # the Go module proxy won't include it in its version list. Extract those pseudo-versions
+        # from the advisory requirement strings so they can be considered as fix candidates.
+        # Only pseudo-versions strictly greater than the current version are returned to avoid
+        # unnecessary processing of versions that would be discarded by filter_lower_versions anyway.
+        sig { returns(T::Array[Dependabot::Package::PackageRelease]) }
+        def pseudo_versions_from_advisory_boundaries
+          current = dependency.numeric_version
 
-        sig { returns(T::Array[Dependabot::Version]) }
-        def fetch_available_versions
-          SharedHelpers.in_a_temporary_directory do
-            SharedHelpers.with_git_configured(credentials: credentials) do
-              manifest = parse_manifest
+          security_advisories.flat_map do |advisory|
+            advisory.vulnerable_version_strings.flat_map do |req_string|
+              # Parse each constraint in requirement strings like
+              # ">= 1.1.0, < 2.3.1-0.20260320110106-0b84568fffcc" and extract
+              # any pseudo-version boundary that represents a possible fix.
+              req_string.to_s.split(",").filter_map do |constraint|
+                version_str = constraint.gsub(/\A\s*[<>=!~^]+\s*v?/, "").strip
+                next unless PSEUDO_VERSION_REGEX.match?(version_str)
+                next unless version_class.correct?(version_str)
 
-              # Set up an empty go.mod so 'go list -m' won't attempt to download dependencies. This
-              # appears to be a side effect of operating with modules included in GOPRIVATE. We'll
-              # retain any exclude directives to omit those versions.
-              File.write("go.mod", "module dummy\n")
-              manifest["Exclude"]&.each do |r|
-                SharedHelpers.run_shell_command("go mod edit -exclude=#{r['Path']}@#{r['Version']}")
+                candidate = version_class.new(version_str)
+                next if current && candidate <= current
+
+                Dependabot::Package::PackageRelease.new(
+                  version: candidate,
+                  details: { "version_string" => version_str }
+                )
               end
-
-              # Turn off the module proxy for private dependencies
-              env = { "GOPRIVATE" => @goprivate }
-
-              versions_json = SharedHelpers.run_shell_command(
-                "go list -m -versions -json #{dependency.name}",
-                fingerprint: "go list -m -versions -json <dependency_name>",
-                env: env
-              )
-              version_strings = JSON.parse(versions_json)["Versions"]
-
-              return [version_class.new(dependency.version)] if version_strings.nil?
-
-              version_strings.select { |v| version_class.correct?(v) }
-                             .map { |v| version_class.new(v) }
             end
-          end
-        rescue SharedHelpers::HelperSubprocessFailed => e
-          retry_count ||= 0
-          retry_count += 1
-          retry if transitory_failure?(e) && retry_count < 2
-
-          ResolvabilityErrors.handle(e.message, goprivate: @goprivate)
-        end
-
-        sig { params(error: StandardError).returns(T::Boolean) }
-        def transitory_failure?(error)
-          return true if error.message.include?("EOF")
-
-          error.message.include?("Internal Server Error")
-        end
-
-        sig { returns(T.nilable(Dependabot::DependencyFile)) }
-        def go_mod
-          @go_mod ||= T.let(dependency_files.find { |f| f.name == "go.mod" }, T.nilable(Dependabot::DependencyFile))
-        end
-
-        sig { returns(T::Hash[String, T.untyped]) }
-        def parse_manifest
-          SharedHelpers.in_a_temporary_directory do
-            File.write("go.mod", T.must(go_mod).content)
-            json = SharedHelpers.run_shell_command("go mod edit -json")
-
-            JSON.parse(json) || {}
-          end
-        end
-
-        sig { params(versions_array: T::Array[Dependabot::Version]).returns(T::Array[Dependabot::Version]) }
-        def filter_prerelease_versions(versions_array)
-          return versions_array if wants_prerelease?
-
-          filtered = versions_array.reject(&:prerelease?)
-          if versions_array.count > filtered.count
-            Dependabot.logger.info("Filtered out #{versions_array.count - filtered.count} pre-release versions")
-          end
-          filtered
-        end
-
-        sig { params(versions_array: T::Array[Dependabot::Version]).returns(T::Array[Dependabot::Version]) }
-        def filter_lower_versions(versions_array)
-          return versions_array unless dependency.numeric_version
-
-          versions_array
-            .select { |version| version > dependency.numeric_version }
-        end
-
-        sig { params(versions_array: T::Array[Dependabot::Version]).returns(T::Array[Dependabot::Version]) }
-        def filter_ignored_versions(versions_array)
-          filtered = versions_array
-                     .reject { |v| ignore_requirements.any? { |r| r.satisfied_by?(v) } }
-          if @raise_on_ignored && filter_lower_versions(filtered).empty? && filter_lower_versions(versions_array).any?
-            raise AllVersionsIgnored
-          end
-
-          if versions_array.count > filtered.count
-            Dependabot.logger.info("Filtered out #{versions_array.count - filtered.count} ignored versions")
-          end
-
-          filtered
+          end.uniq(&:version)
         end
 
         sig { returns(T::Boolean) }
@@ -221,25 +305,10 @@ module Dependabot
           @wants_prerelease ||= T.let(
             begin
               current_version = dependency.numeric_version
-              !current_version&.prerelease?.nil?
+              current_version&.prerelease? || false
             end,
             T.nilable(T::Boolean)
           )
-        end
-
-        sig { returns(T::Array[Dependabot::Requirement]) }
-        def ignore_requirements
-          ignored_versions.flat_map { |req| requirement_class.requirements_array(req) }
-        end
-
-        sig { returns(T.class_of(Dependabot::Requirement)) }
-        def requirement_class
-          dependency.requirement_class
-        end
-
-        sig { returns(T.class_of(Dependabot::Version)) }
-        def version_class
-          dependency.version_class
         end
       end
     end

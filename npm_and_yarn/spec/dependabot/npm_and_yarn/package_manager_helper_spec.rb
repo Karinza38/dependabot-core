@@ -63,8 +63,12 @@ RSpec.describe Dependabot::NpmAndYarn::PackageManagerHelper do
   end
 
   let(:lockfiles) { { npm: npm_lockfile, yarn: yarn_lockfile, pnpm: pnpm_lockfile } }
+
+  let(:register_config_files) { {} }
+
   let(:package_json) { { "packageManager" => "npm@7" } }
-  let(:helper) { described_class.new(package_json, lockfiles: lockfiles) }
+  let(:config) { Dependabot::Package::NpmPackageManagerConfig.from_package_json(package_json) }
+  let(:helper) { described_class.new(config, lockfiles, register_config_files, []) }
 
   describe "#package_manager" do
     context "when npm lockfile exists" do
@@ -109,12 +113,275 @@ RSpec.describe Dependabot::NpmAndYarn::PackageManagerHelper do
       end
     end
 
+    context "with engines field for pnpm >=10" do
+      let(:lockfiles) { {} }
+      let(:package_json) { { "engines" => { "pnpm" => ">=10" } } }
+
+      it "returns a PNPMPackageManager instance from engines field" do
+        expect(helper.package_manager).to be_a(Dependabot::NpmAndYarn::PNPMPackageManager)
+        expect(helper.package_manager.detected_version).to eq("11")
+      end
+    end
+
+    context "with engines field for package manager with '^' constraint and missing patch version" do
+      let(:lockfiles) { {} }
+      let(:package_json) { { "engines" => { "pnpm" => "^10.11" } } }
+
+      it "returns a PNPMPackageManager instance from engines field" do
+        expect(helper.package_manager).to be_a(Dependabot::NpmAndYarn::PNPMPackageManager)
+        expect(helper.package_manager.detected_version).to eq("10.11.0")
+      end
+    end
+
+    context "with engines field for package manager with '^' constraint and missing minor/patch version" do
+      let(:lockfiles) { {} }
+      let(:package_json) { { "engines" => { "npm" => "^10" } } }
+
+      it "returns a NpmPackageManager instance from engines field" do
+        expect(helper.package_manager).to be_a(Dependabot::NpmAndYarn::NpmPackageManager)
+        expect(helper.package_manager.detected_version).to eq("10")
+      end
+    end
+
+    context "with engines field for npm >=11.0.0" do
+      let(:lockfiles) { {} }
+      let(:package_json) { { "engines" => { "npm" => ">=11.0.0" } } }
+
+      it "returns an NpmPackageManager instance from engines field" do
+        expect(helper.package_manager).to be_a(Dependabot::NpmAndYarn::NpmPackageManager)
+        expect(helper.package_manager.detected_version).to eq("11")
+      end
+
+      it "supports npm version 11" do
+        npm_package_manager = helper.package_manager
+        expect(npm_package_manager.supported_versions).to include(Dependabot::Version.new("11"))
+      end
+
+      it "does not throw unsupported version error" do
+        expect { helper.package_manager.raise_if_unsupported! }.not_to raise_error
+      end
+    end
+
+    context "with OR constraints where the lower branch is on the right" do
+      let(:lockfiles) { {} }
+      let(:package_json) { { "engines" => { "pnpm" => ">=10 || >=7 <9" } } }
+
+      it "selects the highest matching supported pnpm version" do
+        expect(helper.package_manager).to be_a(Dependabot::NpmAndYarn::PNPMPackageManager)
+        expect(helper.package_manager.detected_version).to eq("11")
+      end
+    end
+
     context "when neither lockfile, packageManager, nor engines field exists" do
       let(:lockfiles) { {} }
       let(:package_json) { {} }
 
       it "returns default package manager" do
         expect(helper.package_manager).to be_a(Dependabot::NpmAndYarn::NpmPackageManager)
+      end
+    end
+
+    context "when package manager is no longer supported" do
+      subject(:package_manager) { helper.package_manager }
+
+      let(:lockfiles) { { npm: npm_lockfile } }
+      let(:package_json) { { "packageManager" => "npm@6" } }
+      let(:npm_lockfile) do
+        instance_double(
+          Dependabot::DependencyFile,
+          name: "package-lock.json",
+          content: <<~LOCKFILE
+            {
+              "name": "example-npm-project",
+              "version": "1.0.0",
+              "lockfileVersion": 1,
+              "requires": true,
+              "dependencies": {
+                "lodash": {
+                  "version": "4.17.21",
+                  "resolved": "https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz",
+                  "integrity": "sha512-abc123"
+                }
+              }
+            }
+          LOCKFILE
+        )
+      end
+
+      it "returns the unsupported package manager" do
+        expect(package_manager.detected_version.to_s).to eq "6"
+        expect(package_manager.unsupported?).to be true
+      end
+    end
+  end
+
+  describe "#setup" do
+    context "when lockfile specifies a deprecated version" do
+      subject(:package_manager) { helper.package_manager }
+
+      let(:lockfiles) { { npm: npm_lockfile } }
+      let(:package_json) { { "packageManager" => "npm@6" } }
+      let(:npm_lockfile) do
+        instance_double(
+          Dependabot::DependencyFile,
+          name: "package-lock.json",
+          content: <<~LOCKFILE
+            {
+              "name": "example-npm-project",
+              "version": "1.0.0",
+              "lockfileVersion": 1,
+              "requires": true,
+              "dependencies": {
+                "lodash": {
+                  "version": "4.17.21",
+                  "resolved": "https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz",
+                  "integrity": "sha512-abc123"
+                }
+              }
+            }
+          LOCKFILE
+        )
+      end
+
+      it "returns the deprecated version" do
+        expect(package_manager.detected_version.to_s).to eq "6"
+      end
+    end
+  end
+
+  describe "#detect_version" do
+    let(:helper) { described_class.new(config, lockfiles, register_config_files, []) }
+
+    context "when packageManager field exists" do
+      let(:package_json) { { "packageManager" => "npm@7.5.2" } }
+
+      context "with a selected engine" do
+        let(:package_json) do
+          { "packageManager" => "npm@7.5.2", "engines" => { "npm" => ">=7.0.0 <8.0.0" } }
+        end
+
+        context "when package manager lockfile exists" do
+          let(:lockfiles) { { npm: npm_lockfile } }
+
+          it "returns the packageManager field value version over engines and lockfile" do
+            expect(helper.detect_version("npm")).to eq("7.5.2")
+          end
+        end
+
+        context "when package manager lockfile does not exist" do
+          let(:lockfiles) { {} }
+
+          it "returns the packageManager field value version over engines" do
+            expect(helper.detect_version("npm")).to eq("7.5.2")
+          end
+        end
+      end
+
+      context "with multiple engines including the selected one" do
+        let(:package_json) do
+          {
+            "packageManager" => "npm",
+            "engines" => { "npm" => "8.0.0", "yarn" => "2.0.0" }
+          }
+        end
+
+        context "when package manager lockfile exists" do
+          let(:lockfiles) { { npm: npm_lockfile } }
+
+          it "returns engines version over lockfile" do
+            expect(helper.detect_version("npm")).to eq("8.0.0")
+          end
+        end
+
+        context "when package manager lockfile does not exist" do
+          let(:lockfiles) { {} }
+
+          it "returns the engines version" do
+            expect(helper.detect_version("npm")).to eq("8.0.0")
+          end
+        end
+      end
+
+      context "with no engine" do
+        context "when package manager lockfile exists" do
+          let(:lockfiles) { { npm: npm_lockfile } }
+
+          it "returns the packageManager field version" do
+            expect(helper.detect_version("npm")).to eq("7.5.2")
+          end
+        end
+
+        context "when package manager lockfile does not exist" do
+          let(:lockfiles) { {} }
+
+          it "returns the packageManager field version" do
+            expect(helper.detect_version("npm")).to eq("7.5.2")
+          end
+        end
+      end
+
+      context "with a malformed packageManager" do
+        context "when package manager version is not specified correctly" do
+          it "returns the nil packageManager version" do
+            expect(helper.detect_version("npm^@1.2.3")).to be_nil
+          end
+        end
+      end
+    end
+
+    context "when packageManager field does not exist" do
+      let(:package_json) { {} }
+
+      context "with engines specifying the selected package manager" do
+        let(:package_json) { { "engines" => { "npm" => "8.0.0" } } }
+
+        context "when package manager lockfile exists" do
+          let(:lockfiles) { { npm: npm_lockfile } }
+
+          it "returns engines version over lockfile" do
+            expect(helper.detect_version("npm")).to eq("8.0.0")
+          end
+        end
+
+        context "when package manager lockfile does not exist" do
+          let(:lockfiles) { {} }
+
+          it "returns the engines version" do
+            expect(helper.detect_version("npm")).to eq("8.0.0")
+          end
+        end
+      end
+
+      context "with no engines and no lockfile" do
+        let(:lockfiles) { {} }
+
+        it "returns nil as no version can be detected" do
+          expect(helper.detect_version("npm")).to be_nil
+        end
+      end
+
+      context "with no engines and a lockfile for the selected package manager" do
+        let(:lockfiles) { { npm: npm_lockfile } }
+
+        it "returns the version inferred from the lockfile" do
+          expect(helper.detect_version("npm")).to eq("8")
+        end
+      end
+
+      context "with no engines and a lockfile for a different package manager" do
+        let(:lockfiles) { { yarn: yarn_lockfile } }
+
+        it "returns nil as no version can be detected for the selected package manager" do
+          expect(helper.detect_version("npm")).to be_nil
+        end
+      end
+
+      context "with no engines and multiple lockfiles" do
+        let(:lockfiles) { { npm: npm_lockfile, yarn: yarn_lockfile } }
+
+        it "returns the version inferred from the lockfile matching the selected package manager" do
+          expect(helper.detect_version("npm")).to eq("8")
+        end
       end
     end
   end
@@ -131,7 +398,7 @@ RSpec.describe Dependabot::NpmAndYarn::PackageManagerHelper do
     context "when the installed version matches the expected format" do
       before do
         allow(Dependabot::SharedHelpers).to receive(:run_shell_command)
-          .with("corepack npm -v", fingerprint: "corepack npm -v").and_return("7.5.2")
+          .with("corepack npm -v", fingerprint: "corepack npm -v", env: nil).and_return("7.5.2")
       end
 
       it "returns the raw installed version" do
@@ -139,10 +406,71 @@ RSpec.describe Dependabot::NpmAndYarn::PackageManagerHelper do
       end
     end
 
+    context "when npm has an explicitly requested version" do
+      let(:package_json) { { "packageManager" => "npm@10.2.3" } }
+
+      before do
+        allow(helper).to receive(:package_manager).and_return(
+          Dependabot::NpmAndYarn::NpmPackageManager.new(detected_version: "10.2.3")
+        )
+        allow(Dependabot::NpmAndYarn::Helpers).to receive(:package_manager_version)
+          .with("npm").and_return(nil, "10.2.3")
+      end
+
+      it "installs the requested version" do
+        expect(Dependabot::SharedHelpers).to receive(:run_shell_command).with(
+          "corepack install npm@10.2.3 --global --cache-only",
+          fingerprint: "corepack install <name>@<version> --global --cache-only"
+        )
+
+        expect(helper.installed_version("npm")).to eq("10.2.3")
+      end
+    end
+
+    context "when the npm version is inferred from the lockfile" do
+      let(:package_json) { {} }
+
+      before do
+        allow(helper).to receive(:package_manager).and_return(
+          Dependabot::NpmAndYarn::NpmPackageManager.new(detected_version: "7")
+        )
+        allow(Dependabot::NpmAndYarn::Helpers).to receive(:package_manager_version)
+          .with("npm").and_return(nil)
+      end
+
+      it "uses the inferred version without installing it" do
+        expect(Dependabot::SharedHelpers).not_to receive(:run_shell_command)
+          .with(/corepack install npm/, anything)
+
+        expect(helper.installed_version("npm")).to eq("7")
+      end
+    end
+
+    context "when the pnpm version is inferred from the lockfile" do
+      let(:package_json) { {} }
+
+      before do
+        allow(helper).to receive(:package_manager).and_return(
+          Dependabot::NpmAndYarn::PNPMPackageManager.new(detected_version: "7")
+        )
+        allow(Dependabot::NpmAndYarn::Helpers).to receive(:package_manager_version)
+          .with("pnpm").and_return(nil, "7.1.0")
+      end
+
+      it "installs the inferred version" do
+        expect(Dependabot::SharedHelpers).to receive(:run_shell_command).with(
+          "corepack install pnpm@7 --global --cache-only",
+          fingerprint: "corepack install <name>@<version> --global --cache-only"
+        )
+
+        expect(helper.installed_version("pnpm")).to eq("7.1.0")
+      end
+    end
+
     context "when the installed version not found returns inferred version" do
       before do
         allow(Dependabot::SharedHelpers).to receive(:run_shell_command)
-          .with("corepack yarn -v", fingerprint: "corepack yarn -v")
+          .with("corepack yarn -v", fingerprint: "corepack yarn -v", env: nil)
           .and_return("1")
         allow(Dependabot::NpmAndYarn::Helpers).to receive(:yarn_version_numeric).and_return(1)
       end
@@ -157,14 +485,14 @@ RSpec.describe Dependabot::NpmAndYarn::PackageManagerHelper do
     context "when memoization is in effect" do
       before do
         allow(Dependabot::SharedHelpers).to receive(:run_shell_command)
-          .with("corepack pnpm -v", fingerprint: "corepack pnpm -v").and_return("7.1.0")
+          .with("corepack pnpm -v", fingerprint: "corepack pnpm -v", env: nil).and_return("7.1.0")
         # Pre-cache the result
         helper.installed_version("pnpm")
       end
 
       it "does not re-run the shell command and uses the cached version" do
         expect(Dependabot::SharedHelpers).not_to receive(:run_shell_command)
-          .with("corepack pnpm -v", fingerprint: "corepack pnpm -v")
+          .with("corepack pnpm -v", fingerprint: "corepack pnpm -v", env: nil)
         expect(helper.installed_version("pnpm")).to eq("7.1.0")
       end
     end
@@ -201,6 +529,192 @@ RSpec.describe Dependabot::NpmAndYarn::PackageManagerHelper do
         expect(requirement).to be_a(Dependabot::NpmAndYarn::Requirement)
         expect(requirement.constraints).to eq(["= 7.5.0"])
       end
+
+      context "when package manager lockfile does not exist" do
+        let(:lockfiles) { {} }
+
+        it "returns a requirement for npm with the correct constraints" do
+          # NOTE: This is a regression test for a previous bug where calling
+          # helper.package_manager will mutate helper's internal state and break
+          # subsequent calls to helper.find_engine_constraints_as_requirement.
+          expect(helper.package_manager).to be_a(Dependabot::NpmAndYarn::NpmPackageManager)
+
+          requirement = helper.find_engine_constraints_as_requirement("npm")
+          expect(requirement).to be_a(Dependabot::NpmAndYarn::Requirement)
+          expect(requirement.constraints).to eq([">= 6.0.0", "< 8.0.0"])
+        end
+      end
+    end
+
+    context "when the engines field contains valid constraints with pnpm" do
+      let(:package_json) do
+        {
+          "name" => "example",
+          "version" => "1.0.0",
+          "engines" => {
+            "pnpm" => ">=10"
+          }
+        }
+      end
+
+      it "returns a requirement for pnpm with the correct fixed version" do
+        requirement = helper.find_engine_constraints_as_requirement("pnpm")
+        expect(requirement).to be_a(Dependabot::NpmAndYarn::Requirement)
+        expect(requirement.constraints).to eq([">= 10"])
+      end
+    end
+
+    context "when the engines field contains npm >=11.0.0 constraint" do
+      let(:package_json) do
+        {
+          "name" => "example",
+          "version" => "1.0.0",
+          "engines" => {
+            "npm" => ">=11.0.0"
+          }
+        }
+      end
+
+      it "returns a requirement for npm with the correct constraints" do
+        requirement = helper.find_engine_constraints_as_requirement("npm")
+        expect(requirement).to be_a(Dependabot::NpmAndYarn::Requirement)
+        expect(requirement.constraints).to eq([">= 11.0.0"])
+      end
+
+      it "validates that npm version 11 satisfies the constraint" do
+        requirement = helper.find_engine_constraints_as_requirement("npm")
+        npm_version_eleven = Dependabot::Version.new("11.6.2")
+        expect(requirement.satisfied_by?(npm_version_eleven)).to be(true)
+      end
+
+      it "validates that npm version 10 does not satisfy the constraint" do
+        requirement = helper.find_engine_constraints_as_requirement("npm")
+        npm_version_ten = Dependabot::Version.new("10.9.3")
+        expect(requirement.satisfied_by?(npm_version_ten)).to be(false)
+      end
+    end
+
+    context "when the engines field contains a caret OR constraint" do
+      let(:package_json) do
+        {
+          "name" => "example",
+          "version" => "1.0.0",
+          "engines" => {
+            "node" => "^22 || >=24"
+          }
+        }
+      end
+
+      it "expands caret constraints into separate comparators" do
+        allow(Dependabot::NpmAndYarn::Helpers).to receive(:node_version).and_return("22.6.0")
+
+        requirement = helper.find_engine_constraints_as_requirement("node")
+
+        expect(requirement).to be_a(Dependabot::NpmAndYarn::Requirement)
+        expect(requirement.constraints).to eq([">= 22.0.0", "< 23.0.0"])
+      end
+
+      it "selects the matching OR branch for current node version" do
+        allow(Dependabot::NpmAndYarn::Helpers).to receive(:node_version).and_return("24.2.0")
+
+        requirement = helper.find_engine_constraints_as_requirement("node")
+
+        expect(requirement).to be_a(Dependabot::NpmAndYarn::Requirement)
+        expect(requirement.constraints).to eq([">= 24"])
+      end
+
+      it "falls back to the first OR branch when current node version is unavailable" do
+        allow(Dependabot::NpmAndYarn::Helpers).to receive(:node_version).and_return(nil)
+
+        requirement = helper.find_engine_constraints_as_requirement("node")
+
+        expect(requirement).to be_a(Dependabot::NpmAndYarn::Requirement)
+        expect(requirement.constraints).to eq([">= 22.0.0", "< 23.0.0"])
+      end
+
+      context "when one OR branch is invalid" do
+        let(:package_json) do
+          {
+            "name" => "example",
+            "version" => "1.0.0",
+            "engines" => {
+              "node" => "^22 || invalid"
+            }
+          }
+        end
+
+        it "logs a warning and returns nil" do
+          expect(Dependabot.logger).to receive(:warn).with(/Unrecognized constraint format for node: \^22 \|\| invalid/)
+
+          requirement = helper.find_engine_constraints_as_requirement("node")
+
+          expect(requirement).to be_nil
+        end
+      end
+
+      context "when one OR branch is a wildcard" do
+        let(:package_json) do
+          {
+            "name" => "example",
+            "version" => "1.0.0",
+            "engines" => {
+              "node" => "* || >=24"
+            }
+          }
+        end
+
+        it "returns nil without logging an unrecognized warning" do
+          allow(Dependabot.logger).to receive(:warn)
+
+          requirement = helper.find_engine_constraints_as_requirement("node")
+
+          expect(requirement).to be_nil
+          expect(Dependabot.logger).not_to have_received(:warn)
+            .with(/Unrecognized constraint format for node/)
+        end
+      end
+    end
+
+    context "when the engines field contains an explicit comparator OR constraint" do
+      let(:package_json) do
+        {
+          "name" => "example",
+          "version" => "1.0.0",
+          "engines" => {
+            "node" => ">=22.0.0 <23.0.0 || >=24"
+          }
+        }
+      end
+
+      it "splits the first OR branch into separate comparators" do
+        allow(Dependabot::NpmAndYarn::Helpers).to receive(:node_version).and_return("22.6.0")
+
+        requirement = helper.find_engine_constraints_as_requirement("node")
+
+        expect(requirement).to be_a(Dependabot::NpmAndYarn::Requirement)
+        expect(requirement.constraints).to eq([">= 22.0.0", "< 23.0.0"])
+      end
+
+      context "when the lower branch appears on the right" do
+        let(:package_json) do
+          {
+            "name" => "example",
+            "version" => "1.0.0",
+            "engines" => {
+              "node" => ">=24 || >=22.0.0 <23.0.0"
+            }
+          }
+        end
+
+        it "selects the higher matching branch" do
+          allow(Dependabot::NpmAndYarn::Helpers).to receive(:node_version).and_return("24.2.0")
+
+          requirement = helper.find_engine_constraints_as_requirement("node")
+
+          expect(requirement).to be_a(Dependabot::NpmAndYarn::Requirement)
+          expect(requirement.constraints).to eq([">= 24"])
+        end
+      end
     end
 
     context "when the engines field does not contain the specified package manager" do
@@ -232,6 +746,44 @@ RSpec.describe Dependabot::NpmAndYarn::PackageManagerHelper do
 
       it "logs an error and returns nil" do
         expect(Dependabot.logger).to receive(:warn).with(/Unrecognized constraint format for npm: invalid/)
+        requirement = helper.find_engine_constraints_as_requirement("npm")
+        expect(requirement).to be_nil
+      end
+    end
+
+    context "when constraints are valid" do
+      let(:package_json) { { "engines" => { "npm" => ">= 6.0.0 < 8.0.0" } } }
+
+      it "returns a requirement object with correct constraints" do
+        requirement = helper.find_engine_constraints_as_requirement("npm")
+        expect(requirement).to be_a(Dependabot::NpmAndYarn::Requirement)
+        expect(requirement.constraints).to eq([">= 6.0.0", "< 8.0.0"])
+      end
+    end
+
+    context "when constraints are empty" do
+      let(:package_json) { { "engines" => { "npm" => "" } } }
+
+      it "returns nil" do
+        requirement = helper.find_engine_constraints_as_requirement("npm")
+        expect(requirement).to be_nil
+      end
+    end
+
+    context "when constraints are nil" do
+      let(:package_json) { { "engines" => {} } }
+
+      it "returns nil" do
+        requirement = helper.find_engine_constraints_as_requirement("npm")
+        expect(requirement).to be_nil
+      end
+    end
+
+    context "when constraints contain an invalid format" do
+      let(:package_json) { { "engines" => { "npm" => "invalid-constraint" } } }
+
+      it "logs a warning and returns nil" do
+        expect(Dependabot.logger).to receive(:warn).with(/Unrecognized constraint format for npm/)
         requirement = helper.find_engine_constraints_as_requirement("npm")
         expect(requirement).to be_nil
       end

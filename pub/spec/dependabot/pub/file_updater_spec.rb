@@ -11,7 +11,7 @@ require_common_spec "file_updaters/shared_examples_for_file_updaters"
 
 RSpec.describe Dependabot::Pub::FileUpdater do
   let(:project) { "can_update" }
-  let(:dev_null) { WEBrick::Log.new("/dev/null", 7) }
+  let(:dev_null) { WEBrick::Log.new(File::NULL, 7) }
   let(:server) { WEBrick::HTTPServer.new({ Port: 0, AccessLog: [], Logger: dev_null }) }
   let(:dependency_files) do
     files = project_dependency_files(project)
@@ -46,6 +46,8 @@ RSpec.describe Dependabot::Pub::FileUpdater do
       server.unmount "/api/packages/#{package}"
     end
     server.shutdown
+
+    FileUtils.rm_rf("/tmp/flutter")
   end
 
   before do
@@ -74,46 +76,6 @@ RSpec.describe Dependabot::Pub::FileUpdater do
 
   def lockfile(files)
     files.find { |f| f.name == "pubspec.lock" }.content
-  end
-
-  describe "#updated_files_regex" do
-    subject(:updated_files_regex) { described_class.updated_files_regex }
-
-    it "is not empty" do
-      expect(updated_files_regex).not_to be_empty
-    end
-
-    context "when files match the regex patterns" do
-      it "returns true for files that should be updated" do
-        matching_files = [
-          "pubspec.yaml",
-          "pubspec.lock",
-          "packages/foo_bar/pubspec.yaml",
-          "packages/foo_bar/pubspec.lock"
-        ]
-
-        matching_files.each do |file_name|
-          expect(updated_files_regex).to(be_any { |regex| file_name.match?(regex) })
-        end
-      end
-
-      it "returns false for files that should not be updated" do
-        non_matching_files = [
-          "README.md",
-          ".github/workflow/main.yml",
-          "some_random_file.rb",
-          "requirements.txt",
-          "package-lock.json",
-          "package.json",
-          "Gemfile",
-          "Gemfile.lock"
-        ]
-
-        non_matching_files.each do |file_name|
-          expect(updated_files_regex).not_to(be_any { |regex| file_name.match?(regex) })
-        end
-      end
-    end
   end
 
   describe "#updated_dependency_files unlock none" do
@@ -153,6 +115,30 @@ RSpec.describe Dependabot::Pub::FileUpdater do
       expect(lockfile(updated_files)).to include(
         "sha256: \"6d4193120997ecfd09acf0e313f13dc122b119e5eca87ef57a7d065ec9183762\""
       )
+    end
+  end
+
+  describe "#updated_dependency_files unlock none with a pinned flutter sdk constraint" do
+    let(:project) { "preserves_pinned_flutter_sdk_constraint" }
+    let(:dependency) do
+      Dependabot::Dependency.new(
+        name: "collection",
+        version: "1.15.0",
+        requirements: [],
+        previous_version: "1.14.13",
+        package_manager: "pub"
+      )
+    end
+
+    def sdks_block(content)
+      content[/^sdks:\n(?:  .*\n)*/]
+    end
+
+    it "does not widen the exact flutter sdk constraint recorded in pubspec.lock" do
+      updated_files = updater.updated_dependency_files
+      expect(lockfile(updated_files)).to include "version: \"1.15.0\""
+      expect(sdks_block(lockfile(updated_files))).to eq sdks_block(lockfile(dependency_files))
+      expect(lockfile(updated_files)).to include "flutter: \"3.24.0\""
     end
   end
 

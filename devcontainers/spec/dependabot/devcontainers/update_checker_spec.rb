@@ -32,9 +32,11 @@ RSpec.describe Dependabot::Devcontainers::UpdateChecker do
       credentials: github_credentials,
       security_advisories: security_advisories,
       ignored_versions: ignored_versions,
-      raise_on_ignored: raise_on_ignored
+      raise_on_ignored: raise_on_ignored,
+      update_cooldown: update_cooldown
     )
   end
+  let(:update_cooldown) { nil }
 
   it_behaves_like "an update checker"
 
@@ -112,6 +114,146 @@ RSpec.describe Dependabot::Devcontainers::UpdateChecker do
         let(:raise_on_ignored) { true }
 
         it { is_expected.to eq("2.0.0") }
+      end
+    end
+  end
+
+  describe "#latest_version with cooldown filter" do
+    subject(:latest_version) { checker.latest_version.to_s }
+
+    include_context "when the config is in root"
+
+    let(:devcontainer_url) { "https://ghcr.io/v2/codspace/versioning/foo/manifests/2.11.1" }
+    let(:name) { "ghcr.io/codspace/versioning/foo" }
+    let(:current_version) { "1.1.0" }
+    let(:update_cooldown) do
+      Dependabot::Package::ReleaseCooldownOptions.new(
+        default_days: 90,
+        semver_major_days: 90,
+        semver_minor_days: 90,
+        semver_patch_days: 90,
+        include: [],
+        exclude: []
+      )
+    end
+
+    before do
+      allow(Time).to receive(:now).and_return(Time.parse("2024-01-01T17:30:00.000Z"))
+
+      # stubbing the token request and devcontainer metadata
+      stub_request(:get, "https://ghcr.io/token?scope=repository:codspace/versioning/foo:pull&service=ghcr.io")
+        .to_return(status: 200, body: fixture("projects/cooldown", "token.json"))
+      stub_request(:get, devcontainer_url).to_return(
+        status: 200, body: fixture("projects/cooldown", "package_metadata.json")
+      )
+    end
+
+    after do
+      Dependabot::Experiments.reset!
+    end
+
+    context "when latest version is required with cooldown applied" do
+      it { is_expected.to eq("2.11.0") }
+    end
+  end
+
+  describe "#updated_requirements" do
+    subject(:updated_requirements) { checker.updated_requirements }
+
+    let(:dependency) do
+      Dependabot::Dependency.new(
+        name: "ghcr.io/devcontainers/features/docker-outside-of-docker",
+        version: "1.9.1",
+        requirements: [{
+          file: ".devcontainer/devcontainer.json",
+          requirement: "1",
+          groups: ["feature"],
+          source: nil
+        }],
+        package_manager: "devcontainers"
+      )
+    end
+    let(:checker) do
+      described_class.new(
+        dependency: dependency,
+        dependency_files: [],
+        repo_contents_path: nil,
+        credentials: github_credentials,
+        security_advisories: [],
+        ignored_versions: [],
+        raise_on_ignored: false
+      )
+    end
+
+    context "when published tags include precision-matching tags" do
+      before do
+        allow(Dependabot::SharedHelpers).to receive(:run_shell_command)
+          .and_return('{"publishedTags": ["1", "1.9.1", "1.10.0", "2", "2.0.0"]}')
+      end
+
+      it "returns the latest version at the same precision" do
+        expect(updated_requirements.first[:requirement]).to eq("2")
+        expect(checker.latest_version.to_s).to eq("2.0.0")
+      end
+
+      context "with additional requirement payload" do
+        before do
+          dependency.requirements.first[:source] = { "type" => "feature", "custom" => "source" }
+          dependency.requirements.first[:metadata] = { "custom" => "metadata" }
+          dependency.requirements.first[:custom] = "top-level"
+        end
+
+        it "preserves the full requirement payload and nested key style" do
+          requirement = updated_requirements.first
+
+          expect(requirement[:custom]).to eq("top-level")
+          expect(requirement.metadata).to eq({ "custom" => "metadata" })
+          expect(requirement.source_hash).to eq({ "type" => "feature", "custom" => "source" })
+        end
+      end
+
+      context "with a malformed requirement" do
+        before { dependency.requirements.first[:requirement] = 123 }
+
+        it "raises a type error" do
+          expect { updated_requirements }
+            .to raise_error(TypeError, "requirement must be a string, :unfixable, or nil")
+        end
+      end
+    end
+
+    context "when published tags only include full semver without precision-matching tags (minor update)" do
+      before do
+        allow(Dependabot::SharedHelpers).to receive(:run_shell_command)
+          .and_return('{"publishedTags": ["1.9.1", "1.10.0"]}')
+      end
+
+      it "preserves the major-only pin by truncating the latest version" do
+        expect(updated_requirements.first[:requirement]).to eq("1")
+        expect(checker.latest_version.to_s).to eq("1.10.0")
+      end
+    end
+
+    context "when published tags only include full semver without precision-matching tags (major bump)" do
+      before do
+        allow(Dependabot::SharedHelpers).to receive(:run_shell_command)
+          .and_return('{"publishedTags": ["1.9.1", "2.0.0"]}')
+      end
+
+      it "updates the major-only pin to the new major by truncating" do
+        expect(updated_requirements.first[:requirement]).to eq("2")
+        expect(checker.latest_version.to_s).to eq("2.0.0")
+      end
+    end
+
+    context "when there are no published tags" do
+      before do
+        allow(Dependabot::SharedHelpers).to receive(:run_shell_command)
+          .and_return('{"publishedTags": []}')
+      end
+
+      it "keeps the original requirement instead of emitting a nil requirement" do
+        expect(updated_requirements.first[:requirement]).to eq("1")
       end
     end
   end

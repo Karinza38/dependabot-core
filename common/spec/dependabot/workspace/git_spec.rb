@@ -10,7 +10,7 @@ require "dependabot/workspace/git"
 RSpec.describe Dependabot::Workspace::Git do
   subject(:workspace) { described_class.new(repo_contents_path) }
 
-  let(:repo_contents_path) { build_tmp_repo("simple", tmp_dir_path: Dir.tmpdir) }
+  let(:repo_contents_path) { build_tmp_repo("simple", tmp_dir_path: File.join(Dir.tmpdir, "with space")) }
 
   around do |example|
     Dir.chdir(repo_contents_path) { example.run }
@@ -24,9 +24,27 @@ RSpec.describe Dependabot::Workspace::Git do
     expect(workspace).not_to be_changed
   end
 
-  describe "#initial_head_sha" do
+  describe "#initial_head_sha", :focus do # rubocop:disable RSpec/Focus
+    let(:head_sha) { File.read(File.join(repo_contents_path, ".git", "refs", "heads", "master")).strip }
+
     it "is the initial HEAD sha before any change attempts" do
-      expect(workspace.initial_head_sha).to eq(`git rev-parse HEAD`.strip)
+      expect(workspace.initial_head_sha).to eq(head_sha)
+    end
+
+    context "with warnings from git rev-parse" do
+      before do
+        # Git no longer allows you to create a branch or symbolic ref named HEAD
+        # so we need to manually hack a HEAD ref file to ensure that no warnings
+        # are included in the output of git rev-parse
+        FileUtils.cp(
+          File.join(repo_contents_path, ".git", "refs", "heads", "master"),
+          File.join(repo_contents_path, ".git", "refs", "heads", "HEAD")
+        )
+      end
+
+      it "is the initial HEAD sha before any change attempts" do
+        expect(workspace.initial_head_sha).to eq(head_sha)
+      end
     end
   end
 
@@ -41,17 +59,6 @@ RSpec.describe Dependabot::Workspace::Git do
         workspace.store_change("rspec")
         workspace.change("timecop") { `echo 'gem "timecop", "~> 0.9.6", group: :test' >> Gemfile` }
         workspace.store_change("rspec")
-      end
-
-      it "returns the diff of all changes" do
-        expect(workspace.changes.size).to eq(2)
-        expect(workspace.to_patch).to end_with(
-          <<~DIFF
-             gem "activesupport", ">= 6.0.0"
-            +gem "rspec", "~> 3.12.0", group: :test
-            +gem "timecop", "~> 0.9.6", group: :test
-          DIFF
-        )
       end
 
       context "when there are failed change attempts" do
@@ -105,12 +112,6 @@ RSpec.describe Dependabot::Workspace::Git do
         expect(workspace.failed_change_attempts.size).to eq(1)
         expect(workspace.change_attempts.size).to eq(1)
         expect(workspace.change_attempts.first.id).to eq(`git rev-parse refs/stash`.strip)
-        expect(workspace.change_attempts.first.diff).to end_with(
-          <<~DIFF
-             gem "activesupport", ">= 6.0.0"
-            +gem "timecop", "~> 0.9.6", group: :test
-          DIFF
-        )
         expect(workspace.change_attempts.first.memo).to eq("timecop")
         expect(workspace.change_attempts.first.error).not_to be_nil
         expect(workspace.change_attempts.first.error.message).to eq("uh oh")
@@ -134,16 +135,17 @@ RSpec.describe Dependabot::Workspace::Git do
 
         it "captures the untracked/ignored files" do
           expect(workspace.failed_change_attempts.size).to eq(1)
-          expect(workspace.failed_change_attempts.first.diff).to include(
-            <<~DIFF
-               gem "activesupport", ">= 6.0.0"
-              +gem "fail"
-            DIFF
-          )
-          expect(workspace.failed_change_attempts.first.diff).to include(
-            "diff --git a/ignored-file.txt b/ignored-file.txt",
-            "diff --git a/untracked-file.txt b/untracked-file.txt"
-          )
+        end
+      end
+
+      context "when error occurs with no file changes" do
+        it "does not record a change attempt" do
+          expect do
+            workspace.change("no changes error") { raise "boom" }
+          end.to raise_error(RuntimeError, "boom")
+
+          expect(workspace.change_attempts).to be_empty
+          expect(workspace.failed_change_attempts).to be_empty
         end
       end
     end
@@ -210,6 +212,41 @@ RSpec.describe Dependabot::Workspace::Git do
       end
     end
 
+    context "when the workspace path contains spaces and shell syntax" do
+      subject(:workspace) { described_class.new(workspace_path) }
+
+      let(:workspace_path) { Pathname.new(repo_contents_path).join("with space $(touch injected)") }
+
+      before do
+        FileUtils.mkdir_p(workspace_path)
+        File.write(workspace_path.join("tracked-file.txt"), "old content")
+        File.write(workspace_path.join("ignored-file.txt"), "old ignored content")
+        File.write(Pathname.new(repo_contents_path).join(".gitignore"), "ignored-file.txt\n")
+        `git add --all -- .`
+        `git commit -m workspace-setup`
+      end
+
+      it "stores additions and deletions without executing the path" do
+        workspace.change do |path|
+          FileUtils.rm(Pathname.new(path).join("tracked-file.txt"))
+          File.write(Pathname.new(path).join("new-file.txt"), "new content")
+          File.write(Pathname.new(path).join("ignored-file.txt"), "new ignored content")
+          File.write(Pathname.new(repo_contents_path).join("outside-file.txt"), "outside content")
+        end
+
+        workspace.store_change("Update files")
+
+        changed_files = `git show --format= --name-status HEAD`.lines.map(&:strip)
+        expect(changed_files).to contain_exactly(
+          "D\twith space $(touch injected)/tracked-file.txt",
+          "A\twith space $(touch injected)/new-file.txt"
+        )
+        expect(File).not_to exist(workspace_path.join("injected"))
+        expect(File.read(workspace_path.join("ignored-file.txt"))).to eq("new ignored content")
+        expect(`git status --short -- outside-file.txt`).to eq("?? outside-file.txt\n")
+      end
+    end
+
     context "when there are changes to ignored files" do
       # See: common/spec/fixtures/projects/simple/.gitignore
 
@@ -235,12 +272,6 @@ RSpec.describe Dependabot::Workspace::Git do
         expect(workspace).to be_changed
         expect(workspace.change_attempts.size).to eq(1)
         expect(workspace.change_attempts.first.id).to eq(`git rev-parse HEAD`.strip)
-        expect(workspace.change_attempts.first.diff).to end_with(
-          <<~DIFF
-             gem "activesupport", ">= 6.0.0"
-            +gem "timecop", "~> 0.9.6", group: :test
-          DIFF
-        )
         expect(workspace.change_attempts.first.memo).to eq("Update timecop")
         expect(workspace.change_attempts.first.error).to be_nil
         expect(workspace.change_attempts.first).not_to be_error

@@ -158,6 +158,26 @@ RSpec.describe Dependabot::MetadataFinders::Base::ChangelogFinder do
           expect(WebMock).to have_requested(:get, github_url).once
         end
 
+        context "when the repository also contains a submodule" do
+          let(:github_response) do
+            files = JSON.parse(fixture("github", "business_files.json"))
+            files << {
+              "type" => "submodule",
+              "name" => "vendor",
+              "path" => "vendor",
+              "url" => "#{github_url}vendor",
+              "html_url" => nil,
+              "download_url" => nil
+            }
+            JSON.dump(files)
+          end
+
+          it "ignores the submodule" do
+            expect(changelog_url)
+              .to eq("https://github.com/gocardless/business/blob/master/CHANGELOG.md")
+          end
+        end
+
         context "when given a suggested_changelog_url" do
           let(:suggested_changelog_url) do
             "https://github.com/mperham/sidekiq/blob/master/Pro-Changes.md"
@@ -184,6 +204,42 @@ RSpec.describe Dependabot::MetadataFinders::Base::ChangelogFinder do
               .to eq(
                 "https://github.com/mperham/sidekiq/blob/master/Pro-Changes.md"
               )
+          end
+
+          context "when the suggested repository response is malformed" do
+            before do
+              stub_request(:get, "https://api.github.com/repos/mperham/sidekiq/contents/")
+                .to_return(
+                  status: 200,
+                  body: JSON.dump([{ type: 1 }]),
+                  headers: { "Content-Type" => "application/json" }
+                )
+            end
+
+            it "attributes the error to the suggested repository" do
+              expect { changelog_url }
+                .to raise_error(Dependabot::PrivateSourceBadResponse) do |error|
+                  expect(error.source).to eq("https://github.com/mperham/sidekiq")
+                end
+            end
+
+            context "when a primary source is also present" do
+              let(:finder) do
+                described_class.new(
+                  source: source,
+                  credentials: credentials,
+                  dependency: dependency,
+                  suggested_changelog_url: suggested_changelog_url
+                )
+              end
+
+              it "still attributes the error to the suggested repository" do
+                expect { changelog_url }
+                  .to raise_error(Dependabot::PrivateSourceBadResponse) do |error|
+                    expect(error.source).to eq("https://github.com/mperham/sidekiq")
+                  end
+              end
+            end
           end
 
           context "when there is a fragment in the URL" do
@@ -254,6 +310,55 @@ RSpec.describe Dependabot::MetadataFinders::Base::ChangelogFinder do
                 "CHANGELOG.md"
               )
           end
+        end
+      end
+
+      context "with a file containing changelog name in the middle" do
+        let(:github_response) do
+          fixture("github", "business_files_with_misleading_release_doc.json")
+        end
+
+        before do
+          stub_request(:get, github_url + "?ref=v1.4.0")
+            .to_return(status: github_status,
+                       body: github_response,
+                       headers: { "Content-Type" => "application/json" })
+        end
+
+        it { is_expected.to be_nil }
+      end
+
+      context "with a JSON file with changelog-like name" do
+        let(:github_response) do
+          fixture("github", "business_files_with_json_release.json")
+        end
+
+        before do
+          stub_request(:get, github_url + "?ref=v1.4.0")
+            .to_return(status: github_status,
+                       body: github_response,
+                       headers: { "Content-Type" => "application/json" })
+        end
+
+        it "excludes the JSON file from changelog detection" do
+          expect(changelog_url).to be_nil
+        end
+      end
+
+      context "with a JSON file named release-versions.json" do
+        let(:github_response) do
+          fixture("github", "business_files_with_release_versions_json.json")
+        end
+
+        before do
+          stub_request(:get, github_url + "?ref=v1.4.0")
+            .to_return(status: github_status,
+                       body: github_response,
+                       headers: { "Content-Type" => "application/json" })
+        end
+
+        it "excludes the JSON file from changelog detection" do
+          expect(changelog_url).to be_nil
         end
       end
 
@@ -351,8 +456,10 @@ RSpec.describe Dependabot::MetadataFinders::Base::ChangelogFinder do
 
         it "gets the right URL" do
           expect(changelog_url)
-            .to eq("https://github.com/gocardless/business/blob/master/module" \
-                   "/CHANGELOG.md")
+            .to eq(
+              "https://github.com/gocardless/business/blob/master/module" \
+              "/CHANGELOG.md"
+            )
         end
 
         it "caches the call to GitHub" do
@@ -379,8 +486,10 @@ RSpec.describe Dependabot::MetadataFinders::Base::ChangelogFinder do
 
           it "gets the right URL" do
             expect(changelog_url)
-              .to eq("https://github.com/gocardless/business/blob/master" \
-                     "/CHANGELOG.md")
+              .to eq(
+                "https://github.com/gocardless/business/blob/master" \
+                "/CHANGELOG.md"
+              )
           end
         end
       end
@@ -436,8 +545,10 @@ RSpec.describe Dependabot::MetadataFinders::Base::ChangelogFinder do
 
           it "gets the right URL" do
             expect(changelog_url)
-              .to eq("https://github.com/gocardless/business/blob/master/" \
-                     "CHANGELOG.md")
+              .to eq(
+                "https://github.com/gocardless/business/blob/master/" \
+                "CHANGELOG.md"
+              )
           end
         end
       end
@@ -492,8 +603,10 @@ RSpec.describe Dependabot::MetadataFinders::Base::ChangelogFinder do
 
           it "finds the changelog as normal" do
             expect(changelog_url)
-              .to eq("https://github.com/gocardless/business/blob/master/" \
-                     "CHANGELOG.md")
+              .to eq(
+                "https://github.com/gocardless/business/blob/master/" \
+                "CHANGELOG.md"
+              )
           end
         end
 
@@ -503,8 +616,10 @@ RSpec.describe Dependabot::MetadataFinders::Base::ChangelogFinder do
 
           it "finds the changelog as normal" do
             expect(changelog_url)
-              .to eq("https://github.com/gocardless/business/blob/master/" \
-                     "CHANGELOG.md")
+              .to eq(
+                "https://github.com/gocardless/business/blob/master/" \
+                "CHANGELOG.md"
+              )
           end
         end
       end
@@ -607,18 +722,22 @@ RSpec.describe Dependabot::MetadataFinders::Base::ChangelogFinder do
       context "with credentials" do
         let(:credentials) do
           [
-            Dependabot::Credential.new({
-              "type" => "git_source",
-              "host" => "github.com",
-              "username" => "x-access-token",
-              "password" => "token"
-            }),
-            Dependabot::Credential.new({
-              "type" => "git_source",
-              "host" => "dev.azure.com",
-              "username" => "greysteil",
-              "password" => "secret_token"
-            })
+            Dependabot::Credential.new(
+              {
+                "type" => "git_source",
+                "host" => "github.com",
+                "username" => "x-access-token",
+                "password" => "token"
+              }
+            ),
+            Dependabot::Credential.new(
+              {
+                "type" => "git_source",
+                "host" => "dev.azure.com",
+                "username" => "greysteil",
+                "password" => "secret_token"
+              }
+            )
           ]
         end
 
@@ -881,7 +1000,7 @@ RSpec.describe Dependabot::MetadataFinders::Base::ChangelogFinder do
           let(:expected_pruned_changelog) do
             "## v2.2.0\n" \
               "- [Fetch all history for all tags and branches when " \
-              "fetch-depth=0](https://github.com/actions/checkout/pull/258)\n" \
+              "fetch-depth=0](https://github.com/actions/checkout/pull/258)\n"
           end
 
           context "when there's a new ref" do

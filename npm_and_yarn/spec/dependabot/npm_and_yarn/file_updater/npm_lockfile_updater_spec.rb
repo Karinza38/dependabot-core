@@ -19,10 +19,12 @@ RSpec.describe Dependabot::NpmAndYarn::FileUpdater::NpmLockfileUpdater do
   let(:dependencies) { [dependency] }
 
   let(:credentials) do
-    [Dependabot::Credential.new({
-      "type" => "git_source",
-      "host" => "github.com"
-    })]
+    [Dependabot::Credential.new(
+      {
+        "type" => "git_source",
+        "host" => "github.com"
+      }
+    )]
   end
 
   let(:dependency) do
@@ -58,159 +60,16 @@ RSpec.describe Dependabot::NpmAndYarn::FileUpdater::NpmLockfileUpdater do
     files.find { |f| f.name == "package-lock.json" }
   end
 
-  # Variable to control the npm fallback version feature flag
-  let(:npm_fallback_version_above_v6_enabled) { true }
-
   let(:tmp_path) { Dependabot::Utils::BUMP_TMP_DIR_PATH }
-
-  # Variable to control the enabling feature flag for the corepack fix
-  let(:enable_corepack_for_npm_and_yarn) { true }
 
   before do
     FileUtils.mkdir_p(tmp_path)
     allow(Dependabot::Experiments).to receive(:enabled?)
-      .with(:npm_fallback_version_above_v6).and_return(npm_fallback_version_above_v6_enabled)
-    allow(Dependabot::Experiments).to receive(:enabled?)
-      .with(:enable_corepack_for_npm_and_yarn).and_return(enable_corepack_for_npm_and_yarn)
+      .with(:enable_audit_fix_fallback).and_return(true)
   end
 
   after do
     Dependabot::Experiments.reset!
-  end
-
-  describe "npm 6 specific" do
-    # NOTE: This is no longer failing in npm 8
-    context "with a corrupted npm lockfile (version missing)" do
-      let(:npm_fallback_version_above_v6_enabled) { false }
-      let(:files) { project_dependency_files("npm6/version_missing") }
-
-      it "raises a helpful error" do
-        expect { updated_npm_lock_content }
-          .to raise_error(Dependabot::DependencyFileNotResolvable) do |error|
-          expect(error.message)
-            .to include(
-              "lockfile has some corrupt entries with missing versions"
-            )
-        end
-      end
-    end
-
-    # NOTE: This spec takes forever to run using npm 8
-    context "when a git src dependency doesn't have a valid package.json" do
-      let(:npm_fallback_version_above_v6_enabled) { false }
-      let(:files) { project_dependency_files("npm6/git_missing_version") }
-
-      let(:dependency_name) { "raven-js" }
-      let(:requirements) do
-        [{
-          requirement: nil,
-          file: "package.json",
-          groups: ["dependencies"],
-          source: {
-            type: "git",
-            url: "https://github.com/getsentry/raven-js",
-            branch: nil,
-            ref: ref
-          }
-        }]
-      end
-      let(:previous_requirements) do
-        [{
-          requirement: nil,
-          file: "package.json",
-          groups: ["dependencies"],
-          source: {
-            type: "git",
-            url: "https://github.com/getsentry/raven-js",
-            branch: nil,
-            ref: old_ref
-          }
-        }]
-      end
-      let(:previous_version) { "c2b377e7a254264fd4a1fe328e4e3cfc9e245570" }
-      let(:version) { "70b24ed25b73cc15472b2bd1c6032e22bf20d112" }
-      let(:ref) { "4.4.1" }
-      let(:old_ref) { "3.23.1" }
-
-      it "raises a DependencyFileNotResolvable error" do
-        expect { updated_npm_lock_content }
-          .to raise_error(Dependabot::DependencyFileNotResolvable)
-      end
-    end
-
-    context "when dealing with git sub-dependency with invalid from that is updating from an npm5 lockfile" do
-      let(:npm_fallback_version_above_v6_enabled) { false }
-      let(:files) { project_dependency_files("npm5/git_sub_dep_invalid") }
-
-      it "cleans up from field and successfully updates" do
-        updated_fetch_factory_version =
-          JSON.parse(updated_npm_lock_content)
-              .fetch("dependencies")["fetch-factory"]["version"]
-        expect(updated_fetch_factory_version).to eq("0.0.2")
-      end
-    end
-
-    # NOTE: This no longer raises in npm 8
-    context "when there is a private git dep we don't have access to" do
-      let(:npm_fallback_version_above_v6_enabled) { false }
-      let(:files) { project_dependency_files("npm6/github_dependency_private") }
-
-      let(:dependency_name) { "strict-uri-encode" }
-      let(:version) { "1.1.0" }
-      let(:requirements) { [] }
-
-      it "raises a helpful error" do
-        expect { updated_npm_lock_content }
-          .to raise_error(Dependabot::GitDependenciesNotReachable) do |error|
-          expect(error.dependency_urls)
-            .to eq(
-              [
-                "https://github.com/hmarr/dependabot-test-private-npm-package.git/"
-              ]
-            )
-        end
-      end
-    end
-
-    context "when there is a dep hosted in github registry and no auth token is provided" do
-      let(:npm_fallback_version_above_v6_enabled) { false }
-      let(:files) { project_dependency_files("npm/simple_with_github_with_no_auth_token") }
-
-      let(:dependency_name) { "@Codertocat/hello-world-npm" }
-      let(:version) { "1.1.0" }
-      let(:requirements) { [] }
-
-      it "raises a helpful error" do
-        expect { updated_npm_lock_content }
-          .to raise_error(Dependabot::InvalidGitAuthToken) do |error|
-          expect(error.message)
-            .to eq(
-              "Missing or invalid authentication token while accessing github package : " \
-              "https://npm.pkg.github.com/@Codertocat%2fhello-world-npm"
-            )
-        end
-      end
-    end
-
-    context "when there is a dep hosted in github registry and invalid auth token is provided" do
-      let(:npm_fallback_version_above_v6_enabled) { false }
-      let(:files) { project_dependency_files("npm/simple_with_github_with_invalid_auth_token") }
-
-      let(:dependency_name) { "@Codertocat/hello-world-npm" }
-      let(:version) { "1.1.0" }
-      let(:requirements) { [] }
-
-      it "raises a helpful error" do
-        expect { updated_npm_lock_content }
-          .to raise_error(Dependabot::InvalidGitAuthToken) do |error|
-          expect(error.message)
-            .to eq(
-              "Missing or invalid authentication token while accessing github package : " \
-              "https://npm.pkg.github.com/@Codertocat%2fhello-world-npm"
-            )
-        end
-      end
-    end
   end
 
   describe "npm 8 specific" do
@@ -272,8 +131,12 @@ RSpec.describe Dependabot::NpmAndYarn::FileUpdater::NpmLockfileUpdater do
       let(:files) { project_dependency_files("npm8/simple_no_indentation") }
 
       it "defaults to npm and uses two spaces" do
-        expected_updated_npm_lock_content = fixture("updated_projects", "npm8", "simple_no_indentation",
-                                                    "package-lock.json")
+        expected_updated_npm_lock_content = fixture(
+          "updated_projects",
+          "npm8",
+          "simple_no_indentation",
+          "package-lock.json"
+        )
         expect(updated_npm_lock_content).to eq(expected_updated_npm_lock_content)
       end
     end
@@ -282,8 +145,12 @@ RSpec.describe Dependabot::NpmAndYarn::FileUpdater::NpmLockfileUpdater do
       let(:files) { project_dependency_files("npm8/lockfile_with_newline") }
 
       it "ignores the newline when calculating indentation" do
-        expected_updated_npm_lock_content = fixture("updated_projects", "npm8", "lockfile_with_newline",
-                                                    "package-lock.json")
+        expected_updated_npm_lock_content = fixture(
+          "updated_projects",
+          "npm8",
+          "lockfile_with_newline",
+          "package-lock.json"
+        )
         expect(updated_npm_lock_content).to eq(expected_updated_npm_lock_content)
       end
     end
@@ -375,8 +242,49 @@ RSpec.describe Dependabot::NpmAndYarn::FileUpdater::NpmLockfileUpdater do
     end
   end
 
+  context "when dealing with workspace with nested optional peer dependencies" do
+    let(:dependency_name) { "semver" }
+    let(:version) { "7.7.1" }
+    let(:previous_version) { "7.6.3" }
+    let(:requirements) do
+      [{
+        file: "packages/app/package.json",
+        requirement: "7.7.1",
+        groups: ["dependencies"],
+        source: nil
+      }]
+    end
+    let(:previous_requirements) do
+      [{
+        file: "packages/app/package.json",
+        requirement: "7.6.3",
+        groups: ["dependencies"],
+        source: nil
+      }]
+    end
+
+    let(:files) { project_dependency_files("npm8/workspace_with_nested_optional_peer_deps") }
+
+    it "preserves nested optional peer dependencies during workspace cleanup" do
+      parsed_lockfile = JSON.parse(updated_npm_lock_content)
+      packages = parsed_lockfile["packages"]
+
+      # Verify the updated dependency
+      expect(packages["node_modules/semver"]["version"]).to eq("7.7.1")
+
+      # Verify nested optional peer dependency (chokidar@3.6.0 under @nestjs/schematics)
+      # is still present - this is the exact scenario from the reported issue where npm's
+      # --package-lock-only removes nested optional peer deps during workspace cleanup
+      nested_chokidar = packages["node_modules/@nestjs/schematics/node_modules/chokidar"]
+      expect(nested_chokidar).not_to be_nil
+      expect(nested_chokidar["version"]).to eq("3.6.0")
+      expect(nested_chokidar["optional"]).to be(true)
+      expect(nested_chokidar["peer"]).to be(true)
+    end
+  end
+
   context "with a registry that times out" do
-    registry_source = "https://registry.npm.com"
+    let(:registry_source) { "https://registry.npm.com" }
     let(:files) { project_dependency_files("npm/simple_with_registry_that_times_out") }
     let(:error) { Dependabot::PrivateSourceTimedOut.new(registry_source) }
 
@@ -386,312 +294,329 @@ RSpec.describe Dependabot::NpmAndYarn::FileUpdater::NpmLockfileUpdater do
     end
   end
 
-  %w(npm6 npm8).each do |npm_version|
-    describe "#{npm_version} updates" do
-      let(:npm_fallback_version_above_v6_enabled) { false } if npm_version == "npm6"
-      let(:files) { project_dependency_files("#{npm_version}/simple") }
+  describe "npm updates" do
+    let(:files) { project_dependency_files("npm8/simple") }
+
+    it "has details of the updated item" do
+      parsed_lockfile = JSON.parse(updated_npm_lock_content)
+      expect(parsed_lockfile["dependencies"]["fetch-factory"]["version"])
+        .to eq("0.0.2")
+    end
+
+    context "when the requirement has not been updated" do
+      let(:requirements) { previous_requirements }
 
       it "has details of the updated item" do
         parsed_lockfile = JSON.parse(updated_npm_lock_content)
         expect(parsed_lockfile["dependencies"]["fetch-factory"]["version"])
           .to eq("0.0.2")
-      end
 
-      context "when the requirement has not been updated" do
-        let(:requirements) { previous_requirements }
-
-        it "has details of the updated item" do
-          parsed_lockfile = JSON.parse(updated_npm_lock_content)
-          expect(parsed_lockfile["dependencies"]["fetch-factory"]["version"])
-            .to eq("0.0.2")
-
-          expect(
-            parsed_lockfile.dig(
-              "dependencies", "fetch-factory", "requires", "es6-promise"
-            )
-          ).to eq("^3.0.2")
-        end
-      end
-
-      context "when dealing with git sub-dependency with invalid from" do
-        let(:files) { project_dependency_files("#{npm_version}/git_sub_dep_invalid_from") }
-
-        it "cleans up from field and successfully updates" do
-          expect(JSON.parse(updated_npm_lock_content)["dependencies"]["fetch-factory"]["version"])
-            .to eq("0.0.2")
-        end
-      end
-
-      context "when updating both top level and sub dependencies" do
-        let(:files) do
-          project_dependency_files("#{npm_version}/transitive_dependency_locked_by_intermediate_top_and_sub")
-        end
-        let(:dependencies) do
-          [
-            Dependabot::Dependency.new(
-              name: "@dependabot-fixtures/npm-transitive-dependency",
-              version: "1.0.1",
-              previous_version: "1.0.0",
-              requirements: [{
-                file: "package.json",
-                requirement: "1.0.1",
-                groups: ["dependencies"],
-                source: {
-                  type: "registry",
-                  url: "https://registry.npmjs.org"
-                }
-              }],
-              previous_requirements: [{
-                file: "package.json",
-                requirement: "1.0.0",
-                groups: ["dependencies"],
-                source: {
-                  type: "registry",
-                  url: "https://registry.npmjs.org"
-                }
-              }],
-              package_manager: "npm_and_yarn"
-            ),
-            Dependabot::Dependency.new(
-              name: "@dependabot-fixtures/npm-intermediate-dependency",
-              version: "0.0.2",
-              previous_version: "0.0.1",
-              requirements: [],
-              previous_requirements: [],
-              package_manager: "npm_and_yarn"
-            )
-          ]
-        end
-
-        it "updates top level and sub dependencies" do
-          expected_updated_npm_lock_content = fixture(
-            "updated_projects",
-            npm_version,
-            "transitive_dependency_locked_by_intermediate_top_and_sub",
-            "package-lock.json"
+        expect(
+          parsed_lockfile.dig(
+            "dependencies", "fetch-factory", "requires", "es6-promise"
           )
-          expect(updated_npm_lock_content).to eq(expected_updated_npm_lock_content)
-        end
+        ).to eq("^3.0.2")
       end
     end
 
-    describe "#{npm_version} errors" do
-      let(:npm_fallback_version_above_v6_enabled) { false } if npm_version == "npm6"
-      context "with a sub dependency name that can't be found" do
-        let(:files) { project_dependency_files("#{npm_version}/github_sub_dependency_name_missing") }
+    context "when dealing with git sub-dependency with invalid from" do
+      let(:files) { project_dependency_files("npm8/git_sub_dep_invalid_from") }
 
-        let(:dependency_name) { "test-missing-dep-name-npm-package" }
-        let(:requirements) do
-          [{
-            requirement: nil,
-            file: "package.json",
-            groups: ["dependencies"],
-            source: {
-              type: "git",
-              url: "https://github.com/dependabot-fixtures/" \
-                   "test-missing-dep-name-npm-package",
-              branch: nil,
-              ref: ref
-            }
-          }]
-        end
-        let(:previous_requirements) do
-          [{
-            requirement: nil,
-            file: "package.json",
-            groups: ["dependencies"],
-            source: {
-              type: "git",
-              url: "https://github.com/dependabot-fixtures/" \
-                   "test-missing-dep-name-npm-package",
-              branch: nil,
-              ref: old_ref
-            }
-          }]
-        end
-        let(:previous_version) { "1be88e036981a8511eacf3f20e0a21507349988d" }
-        let(:version) { "346e79a12f34c5937bf0f016bced0723f864fe19" }
-        let(:ref) { "v1.0.1" }
-        let(:old_ref) { "v1.0.0" }
+      it "cleans up from field and successfully updates" do
+        expect(JSON.parse(updated_npm_lock_content)["dependencies"]["fetch-factory"]["version"])
+          .to eq("0.0.2")
+      end
+    end
 
-        it "raises a helpful error" do
-          expect { updated_npm_lock_content }
-            .to raise_error(Dependabot::DependencyFileNotResolvable)
-        end
+    context "when updating both top level and sub dependencies" do
+      let(:files) do
+        project_dependency_files("npm8/transitive_dependency_locked_by_intermediate_top_and_sub")
+      end
+      let(:dependencies) do
+        [
+          Dependabot::Dependency.new(
+            name: "@dependabot-fixtures/npm-transitive-dependency",
+            version: "1.0.1",
+            previous_version: "1.0.0",
+            requirements: [{
+              file: "package.json",
+              requirement: "1.0.1",
+              groups: ["dependencies"],
+              source: {
+                type: "registry",
+                url: "https://registry.npmjs.org"
+              }
+            }],
+            previous_requirements: [{
+              file: "package.json",
+              requirement: "1.0.0",
+              groups: ["dependencies"],
+              source: {
+                type: "registry",
+                url: "https://registry.npmjs.org"
+              }
+            }],
+            package_manager: "npm_and_yarn"
+          ),
+          Dependabot::Dependency.new(
+            name: "@dependabot-fixtures/npm-intermediate-dependency",
+            version: "0.0.2",
+            previous_version: "0.0.1",
+            requirements: [],
+            previous_requirements: [],
+            package_manager: "npm_and_yarn"
+          )
+        ]
       end
 
-      context "with an invalid requirement in the package.json" do
-        let(:files) { project_dependency_files("#{npm_version}/invalid_requirement") }
+      it "updates top level and sub dependencies" do
+        expected_updated_npm_lock_content = fixture(
+          "updated_projects",
+          "npm8",
+          "transitive_dependency_locked_by_intermediate_top_and_sub",
+          "package-lock.json"
+        )
+        expect(updated_npm_lock_content).to eq(expected_updated_npm_lock_content)
+      end
+    end
 
-        it "raises a helpful error" do
-          expect { updated_npm_lock_content }
-            .to raise_error(Dependabot::DependencyFileNotResolvable)
-        end
+    context "when updating a subdependency in a workspace repo" do
+      let(:files) { project_dependency_files("npm8/workspace_subdependency_update") }
+
+      let(:dependency_name) { "lodash" }
+      let(:version) { "3.10.2" }
+      let(:previous_version) { "3.10.1" }
+      let(:requirements) { [] }
+      let(:previous_requirements) { [] }
+
+      it "falls back to npm audit fix when npm update is a no-op" do
+        # Simulate npm update being a no-op (transitive dep not in package.json)
+        allow(Dependabot::NpmAndYarn::NativeHelpers)
+          .to receive_messages(run_npm8_subdependency_update_command: "", run_npm_audit_fix_command: "")
+
+        expect(Dependabot::NpmAndYarn::NativeHelpers)
+          .to receive(:run_npm_audit_fix_command).once
+
+        updated_npm_lock_content
+      end
+    end
+  end
+
+  describe "npm errors" do
+    context "with a sub dependency name that can't be found" do
+      let(:files) { project_dependency_files("npm8/github_sub_dependency_name_missing") }
+
+      let(:dependency_name) { "test-missing-dep-name-npm-package" }
+      let(:requirements) do
+        [{
+          requirement: nil,
+          file: "package.json",
+          groups: ["dependencies"],
+          source: {
+            type: "git",
+            url: "https://github.com/dependabot-fixtures/" \
+                 "test-missing-dep-name-npm-package",
+            branch: nil,
+            ref: ref
+          }
+        }]
+      end
+      let(:previous_requirements) do
+        [{
+          requirement: nil,
+          file: "package.json",
+          groups: ["dependencies"],
+          source: {
+            type: "git",
+            url: "https://github.com/dependabot-fixtures/" \
+                 "test-missing-dep-name-npm-package",
+            branch: nil,
+            ref: old_ref
+          }
+        }]
+      end
+      let(:previous_version) { "1be88e036981a8511eacf3f20e0a21507349988d" }
+      let(:version) { "346e79a12f34c5937bf0f016bced0723f864fe19" }
+      let(:ref) { "v1.0.1" }
+      let(:old_ref) { "v1.0.0" }
+
+      it "raises a helpful error" do
+        expect { updated_npm_lock_content }
+          .to raise_error(Dependabot::DependencyFileNotResolvable)
+      end
+    end
+
+    context "with an invalid requirement in the package.json" do
+      let(:files) { project_dependency_files("npm8/invalid_requirement") }
+
+      it "raises a helpful error" do
+        expect { updated_npm_lock_content }
+          .to raise_error(Dependabot::DependencyFileNotResolvable)
+      end
+    end
+
+    context "when updating to a nonexistent version" do
+      let(:files) { project_dependency_files("npm8/simple") }
+
+      let(:dependency_name) { "fetch-factory" }
+      let(:version) { "5.0.2" }
+      let(:requirements) do
+        [{
+          file: "package.json",
+          requirement: "^5.0.2",
+          groups: ["dependencies"],
+          source: nil
+        }]
       end
 
-      context "when updating to a nonexistent version" do
-        let(:files) { project_dependency_files("#{npm_version}/simple") }
+      it "raises an unhandled error" do
+        expect { updated_npm_lock_content }
+          .to raise_error(Dependabot::InconsistentRegistryResponse)
+      end
+    end
 
-        let(:dependency_name) { "fetch-factory" }
-        let(:version) { "5.0.2" }
-        let(:requirements) do
-          [{
-            file: "package.json",
-            requirement: "^5.0.2",
-            groups: ["dependencies"],
-            source: nil
-          }]
-        end
+    context "with a dependency that can't be found" do
+      let(:files) { project_dependency_files("npm8/nonexistent_dependency_yanked_version") }
 
-        it "raises an unhandled error" do
-          expect { updated_npm_lock_content }
-            .to raise_error(Dependabot::InconsistentRegistryResponse)
-        end
+      it "raises a helpful error" do
+        expect { updated_npm_lock_content }
+          .to raise_error(Dependabot::PrivateSourceAuthenticationFailure)
+      end
+    end
+
+    context "with a git reference that Yarn would find but npm wouldn't" do
+      let(:files) { project_dependency_files("npm8/git_dependency_yarn_ref") }
+
+      it "raises a helpful error" do
+        expect { updated_npm_lock_content }
+          .to raise_error(Dependabot::DependencyFileNotResolvable)
+      end
+    end
+
+    context "when scoped sub dependency version is missing" do
+      let(:files) { project_dependency_files("npm8/github_scoped_sub_dependency_version_missing") }
+
+      let(:dependency_name) do
+        "@dependabot/test-missing-scoped-dep-version-npm-package"
+      end
+      let(:requirements) do
+        [{
+          requirement: nil,
+          file: "package.json",
+          groups: ["dependencies"],
+          source: {
+            type: "git",
+            url: "https://github.com/dependabot-fixtures/" \
+                 "test-missing-scoped-dep-version-npm-package",
+            branch: nil,
+            ref: ref
+          }
+        }]
+      end
+      let(:previous_requirements) do
+        [{
+          requirement: nil,
+          file: "package.json",
+          groups: ["dependencies"],
+          source: {
+            type: "git",
+            url: "https://github.com/dependabot-fixtures/" \
+                 "test-missing-scoped-dep-version-npm-package",
+            branch: nil,
+            ref: old_ref
+          }
+        }]
+      end
+      let(:previous_version) { "fe5138f33735fb07891d348cd1e985fe3134211c" }
+      let(:version) { "7abd161c8eba336f06173f0a97bc8decc3cd9c2c" }
+      let(:ref) { "v1.0.4" }
+      let(:old_ref) { "v1.0.3" }
+
+      it "raises an error" do
+        expect { updated_npm_lock_content }
+          .to raise_error(Dependabot::InconsistentRegistryResponse)
+      end
+    end
+
+    context "when sub dependency version is missing" do
+      let(:files) { project_dependency_files("npm8/github_sub_dependency_version_missing") }
+
+      let(:dependency_name) { "test-missing-dep-version-npm-package" }
+      let(:requirements) do
+        [{
+          requirement: nil,
+          file: "package.json",
+          groups: ["dependencies"],
+          source: {
+            type: "git",
+            url: "https://github.com/dependabot-fixtures/" \
+                 "test-missing-dep-version-npm-package",
+            branch: nil,
+            ref: ref
+          }
+        }]
+      end
+      let(:previous_requirements) do
+        [{
+          requirement: nil,
+          file: "package.json",
+          groups: ["dependencies"],
+          source: {
+            type: "git",
+            url: "https://github.com/dependabot-fixtures/" \
+                 "test-missing-dep-version-npm-package",
+            branch: nil,
+            ref: old_ref
+          }
+        }]
+      end
+      let(:previous_version) { "f56186c1643a9a09a86dfe09b1890921330c28bb" }
+      let(:version) { "3deb2768be1591f2fdbdec40aa6a63ba6b270b40" }
+      let(:ref) { "v1.0.3" }
+      let(:old_ref) { "v1.0.2" }
+
+      it "raises an error" do
+        expect { updated_npm_lock_content }
+          .to raise_error(Dependabot::SharedHelpers::HelperSubprocessFailed)
+      end
+    end
+
+    context "with an invalid package name" do
+      let(:files) { project_dependency_files("npm8/invalid_package_name") }
+      let(:dependency_name) { "fetch-factory:" }
+
+      it "raises a helpful error" do
+        expect { updated_npm_lock_content }
+          .to raise_error(Dependabot::DependencyFileNotResolvable)
+      end
+    end
+
+    context "with a dependency version that can't be found" do
+      let(:files) { project_dependency_files("npm8/yanked_version") }
+
+      let(:dependency_name) { "etag" }
+      let(:version) { "1.8.0" }
+      let(:previous_version) { "1.0.0" }
+      let(:requirements) do
+        [{
+          file: "package.json",
+          requirement: "^1.0.0",
+          groups: ["dependencies"],
+          source: nil
+        }]
+      end
+      let(:previous_requirements) do
+        [{
+          file: "package.json",
+          requirement: "^1.0.0",
+          groups: ["dependencies"],
+          source: nil
+        }]
       end
 
-      context "with a dependency that can't be found" do
-        let(:files) { project_dependency_files("#{npm_version}/nonexistent_dependency_yanked_version") }
-
-        it "raises a helpful error" do
-          expect { updated_npm_lock_content }
-            .to raise_error(Dependabot::PrivateSourceAuthenticationFailure)
-        end
-      end
-
-      context "with a git reference that Yarn would find but npm wouldn't" do
-        let(:files) { project_dependency_files("#{npm_version}/git_dependency_yarn_ref") }
-
-        it "raises a helpful error" do
-          expect { updated_npm_lock_content }
-            .to raise_error(Dependabot::DependencyFileNotResolvable)
-        end
-      end
-
-      context "when scoped sub dependency version is missing" do
-        let(:files) { project_dependency_files("#{npm_version}/github_scoped_sub_dependency_version_missing") }
-
-        let(:dependency_name) do
-          "@dependabot/test-missing-scoped-dep-version-npm-package"
-        end
-        let(:requirements) do
-          [{
-            requirement: nil,
-            file: "package.json",
-            groups: ["dependencies"],
-            source: {
-              type: "git",
-              url: "https://github.com/dependabot-fixtures/" \
-                   "test-missing-scoped-dep-version-npm-package",
-              branch: nil,
-              ref: ref
-            }
-          }]
-        end
-        let(:previous_requirements) do
-          [{
-            requirement: nil,
-            file: "package.json",
-            groups: ["dependencies"],
-            source: {
-              type: "git",
-              url: "https://github.com/dependabot-fixtures/" \
-                   "test-missing-scoped-dep-version-npm-package",
-              branch: nil,
-              ref: old_ref
-            }
-          }]
-        end
-        let(:previous_version) { "fe5138f33735fb07891d348cd1e985fe3134211c" }
-        let(:version) { "7abd161c8eba336f06173f0a97bc8decc3cd9c2c" }
-        let(:ref) { "v1.0.4" }
-        let(:old_ref) { "v1.0.3" }
-
-        it "raises an error" do
-          expect { updated_npm_lock_content }
-            .to raise_error(Dependabot::InconsistentRegistryResponse)
-        end
-      end
-
-      context "when sub dependency version is missing" do
-        let(:files) { project_dependency_files("#{npm_version}/github_sub_dependency_version_missing") }
-
-        let(:dependency_name) { "test-missing-dep-version-npm-package" }
-        let(:requirements) do
-          [{
-            requirement: nil,
-            file: "package.json",
-            groups: ["dependencies"],
-            source: {
-              type: "git",
-              url: "https://github.com/dependabot-fixtures/" \
-                   "test-missing-dep-version-npm-package",
-              branch: nil,
-              ref: ref
-            }
-          }]
-        end
-        let(:previous_requirements) do
-          [{
-            requirement: nil,
-            file: "package.json",
-            groups: ["dependencies"],
-            source: {
-              type: "git",
-              url: "https://github.com/dependabot-fixtures/" \
-                   "test-missing-dep-version-npm-package",
-              branch: nil,
-              ref: old_ref
-            }
-          }]
-        end
-        let(:previous_version) { "f56186c1643a9a09a86dfe09b1890921330c28bb" }
-        let(:version) { "3deb2768be1591f2fdbdec40aa6a63ba6b270b40" }
-        let(:ref) { "v1.0.3" }
-        let(:old_ref) { "v1.0.2" }
-
-        it "raises an error" do
-          expect { updated_npm_lock_content }
-            .to raise_error(Dependabot::SharedHelpers::HelperSubprocessFailed)
-        end
-      end
-
-      context "with an invalid package name" do
-        let(:files) { project_dependency_files("#{npm_version}/invalid_package_name") }
-        let(:dependency_name) { "fetch-factory:" }
-
-        it "raises a helpful error" do
-          expect { updated_npm_lock_content }
-            .to raise_error(Dependabot::DependencyFileNotResolvable)
-        end
-      end
-
-      context "with a dependency version that can't be found" do
-        let(:files) { project_dependency_files("#{npm_version}/yanked_version") }
-
-        let(:dependency_name) { "etag" }
-        let(:version) { "1.8.0" }
-        let(:previous_version) { "1.0.0" }
-        let(:requirements) do
-          [{
-            file: "package.json",
-            requirement: "^1.0.0",
-            groups: ["dependencies"],
-            source: nil
-          }]
-        end
-        let(:previous_requirements) do
-          [{
-            file: "package.json",
-            requirement: "^1.0.0",
-            groups: ["dependencies"],
-            source: nil
-          }]
-        end
-
-        it "raises a helpful error" do
-          expect { updated_npm_lock_content }
-            .to raise_error(Dependabot::DependencyFileNotResolvable)
-        end
+      it "raises a helpful error" do
+        expect { updated_npm_lock_content }
+          .to raise_error(Dependabot::DependencyFileNotResolvable)
       end
     end
   end
@@ -706,49 +631,6 @@ RSpec.describe Dependabot::NpmAndYarn::FileUpdater::NpmLockfileUpdater do
     it "raises a helpful error" do
       expect(error.source).to eq(npmrc_content[:registry])
       expect(error.to_s).to include(npmrc_content[:registry])
-    end
-  end
-
-  context "when updating a git source dependency that is not pinned to a hash" do
-    subject(:parsed_lock_file) { JSON.parse(updated_npm_lock_content) }
-
-    let(:npm_fallback_version_above_v6_enabled) { false }
-    let(:files) { project_dependency_files("npm6/ghpr_no_hash_pinning") }
-    let(:dependency_name) { "npm6-dependency" }
-    let(:version) { "HEAD" }
-    let(:previous_version) { "5d1be9ff4e12eb17c04591bba13aad6d71c86a1b" }
-    let(:requirements) do
-      [{
-        file: "package.json",
-        requirement: nil,
-        groups: ["dependencies"],
-        source: {
-          type: "git",
-          url: "https://github.com/dependabot-fixtures/npm6-dependency",
-          branch: nil,
-          ref: "master"
-        }
-      }]
-    end
-    let(:previous_requirements) do
-      [{
-        file: "package.json",
-        requirement: nil,
-        groups: ["dependencies"],
-        source: {
-          type: "git",
-          url: "https://github.com/dependabot-fixtures/npm6-dependency",
-          branch: nil,
-          ref: "master"
-        }
-      }]
-    end
-
-    it "pins the version to a hash and ensures that the `from` field matches the original constraint" do
-      expect(parsed_lock_file["dependencies"]["npm6-dependency"]["version"])
-        .to match(%r{github:dependabot-fixtures/npm6-dependency#[0-9a-z]{40}})
-      expect(parsed_lock_file["dependencies"]["npm6-dependency"]["from"])
-        .to eq("github:dependabot-fixtures/npm6-dependency")
     end
   end
 
@@ -1071,6 +953,36 @@ RSpec.describe Dependabot::NpmAndYarn::FileUpdater::NpmLockfileUpdater do
         end
       end
     end
+
+    context "with invalid package manager specification" do
+      let(:response) do
+        "Invalid package manager specification in package.json (npm@>=10.9.0); expected a semver version"
+      end
+
+      it "raises a helpful error" do
+        expect { updated_npm_lock }.to raise_error(Dependabot::DependencyFileNotResolvable) do |error|
+          expect(error.message)
+            .to include("Invalid package manager specification in package.json")
+            .and include("The packageManager field must specify a valid semver version")
+        end
+      end
+    end
+
+    context "with invalid npm authentication configuration error" do
+      let(:response) do
+        "npm warn using --force Recommended protections disabled.
+        npm error code ERR_INVALID_AUTH
+        npm error Invalid auth configuration found: `_auth` must be renamed"
+      end
+
+      it "raises a helpful error" do
+        expect { updated_npm_lock }.to raise_error(Dependabot::PrivateSourceAuthenticationFailure) do |error|
+          expect(error.message)
+            .to include("Invalid npm authentication configuration found")
+            .and include("The _auth setting in .npmrc needs to be scoped to the specific registry")
+        end
+      end
+    end
   end
 
   context "with a override that conflicts with direct dependency" do
@@ -1131,17 +1043,7 @@ RSpec.describe Dependabot::NpmAndYarn::FileUpdater::NpmLockfileUpdater do
     end
     let(:previous_requirements) { requirements }
 
-    context "when npm version is 6" do
-      let(:npm_fallback_version_above_v6_enabled) { false }
-
-      it "raises a helpful error" do
-        expect { updated_npm_lock_content }.to raise_error(Dependabot::DependencyFileNotResolvable)
-      end
-    end
-
     context "when npm version is 8" do
-      let(:npm_fallback_version_above_v6_enabled) { true }
-
       it "do not raises an error" do
         expect(updated_npm_lock_content).not_to be_nil
       end
@@ -1189,6 +1091,695 @@ RSpec.describe Dependabot::NpmAndYarn::FileUpdater::NpmLockfileUpdater do
           .to include(
             "Error while updating peer dependency."
           )
+      end
+    end
+  end
+
+  context "when updating optional dependencies" do
+    let(:files) { project_dependency_files("npm8/optional_dependency_update") }
+    let(:dependency_name) { "@rollup/rollup-linux-x64-gnu" }
+    let(:version) { "4.53.2" }
+    let(:previous_version) { "4.52.5" }
+    let(:requirements) do
+      [{
+        file: "package.json",
+        requirement: "^4.53.2",
+        groups: ["optionalDependencies"],
+        source: nil
+      }]
+    end
+    let(:previous_requirements) do
+      [{
+        file: "package.json",
+        requirement: "^4.52.5",
+        groups: ["optionalDependencies"],
+        source: nil
+      }]
+    end
+
+    it "uses --save-optional flag for optional dependencies" do
+      # Test the private method that identifies optional dependencies
+      expect(updater.send(:optional_dependency?, dependency)).to be(true)
+
+      # Test that npm_install_args returns correct package specification
+      install_arg = updater.send(:npm_install_args, dependency)
+      expect(install_arg).to eq("@rollup/rollup-linux-x64-gnu@4.53.2")
+
+      # Test the run_npm_install_lockfile_only method includes --save-optional
+      expect(Dependabot::NpmAndYarn::Helpers).to receive(:run_npm_command) do |command, _options|
+        expect(command).to include("--save-optional")
+        expect(command).to include("--package-lock-only")
+        expect(command).to include("--force")
+        expect(command).to include("@rollup/rollup-linux-x64-gnu@4.53.2")
+        ""
+      end
+
+      # Call the method that would trigger the npm command
+      updater.send(:run_npm_install_lockfile_only, [install_arg], has_optional_dependencies: true)
+    end
+
+    context "when updating both regular and optional dependencies" do
+      let(:files) { project_dependency_files("npm8/mixed_dependencies") }
+      let(:dependencies) { [regular_dependency, optional_dependency_obj] }
+
+      let(:regular_dependency) do
+        Dependabot::Dependency.new(
+          name: "fetch-factory",
+          version: "0.0.2",
+          previous_version: "0.0.1",
+          package_manager: "npm_and_yarn",
+          requirements: [{
+            file: "package.json",
+            requirement: "^0.0.2",
+            groups: ["dependencies"],
+            source: nil
+          }],
+          previous_requirements: [{
+            file: "package.json",
+            requirement: "^0.0.1",
+            groups: ["dependencies"],
+            source: nil
+          }]
+        )
+      end
+
+      let(:optional_dependency_obj) do
+        Dependabot::Dependency.new(
+          name: "@rollup/rollup-linux-x64-gnu",
+          version: "4.53.2",
+          previous_version: "4.52.5",
+          package_manager: "npm_and_yarn",
+          requirements: [{
+            file: "package.json",
+            requirement: "^4.53.2",
+            groups: ["optionalDependencies"],
+            source: nil
+          }],
+          previous_requirements: [{
+            file: "package.json",
+            requirement: "^4.52.5",
+            groups: ["optionalDependencies"],
+            source: nil
+          }]
+        )
+      end
+
+      it "handles regular and optional dependencies with different flags" do
+        regular_install_arg = updater.send(:npm_install_args, regular_dependency)
+        optional_install_arg = updater.send(:npm_install_args, optional_dependency_obj)
+
+        # Test run_npm_install_lockfile_only without --save-optional for regular deps
+        expect(Dependabot::NpmAndYarn::Helpers).to receive(:run_npm_command) do |command, _options|
+          expect(command).not_to include("--save-optional")
+          expect(command).to include("--package-lock-only")
+          expect(command).to include("--force")
+          ""
+        end
+        updater.send(:run_npm_install_lockfile_only, [regular_install_arg], has_optional_dependencies: false)
+
+        # Test run_npm_install_lockfile_only with --save-optional for optional deps
+        expect(Dependabot::NpmAndYarn::Helpers).to receive(:run_npm_command) do |command, _options|
+          expect(command).to include("--save-optional")
+          expect(command).to include("--package-lock-only")
+          expect(command).to include("--force")
+          ""
+        end
+        updater.send(:run_npm_install_lockfile_only, [optional_install_arg], has_optional_dependencies: true)
+      end
+
+      context "when verifying lockfile content" do
+        it "correctly updates lockfile with optional dependencies staying in optionalDependencies section" do
+          # Use actual file update process without mocking the core functionality
+          expected_updated_content = fixture(
+            "updated_projects", "npm8", "optional_dependency_update", "package-lock.json"
+          )
+
+          # Create an updater with the correct optional dependency
+          test_updater = described_class.new(
+            lockfile: package_lock,
+            dependency_files: files,
+            dependencies: [dependency],
+            credentials: credentials
+          )
+
+          # Mock the npm command to return success but don't override the file reading
+          allow(Dependabot::NpmAndYarn::Helpers).to receive(:run_npm_command) do |command, _options|
+            # Verify the command includes --save-optional for optional dependencies
+            expect(command).to include("--save-optional")
+            expect(command).to include("@rollup/rollup-linux-x64-gnu@4.53.2")
+            ""
+          end
+
+          # Mock the file reading after npm update to return our expected content
+          original_file_read = File.method(:read)
+          allow(File).to receive(:read) do |path|
+            if path.end_with?("package-lock.json") && path.include?("tmp")
+              expected_updated_content
+            else
+              original_file_read.call(path)
+            end
+          end
+
+          result = test_updater.send(:updated_lockfile_content)
+          parsed_result = JSON.parse(result)
+
+          # Verify the dependency was updated to the correct version
+          expect(parsed_result.dig("packages", "node_modules/@rollup/rollup-linux-x64-gnu", "version"))
+            .to eq("4.53.2")
+
+          # Critical: Verify the dependency remains marked as optional
+          expect(parsed_result.dig("packages", "node_modules/@rollup/rollup-linux-x64-gnu", "optional"))
+            .to be(true)
+
+          # Critical: Verify optionalDependencies section has the updated version
+          expect(parsed_result.dig("packages", "", "optionalDependencies", "@rollup/rollup-linux-x64-gnu"))
+            .to eq("^4.53.2")
+
+          # Critical: Ensure the optional dependency is NOT moved to the dependencies section
+          dependencies_section = parsed_result.dig("packages", "", "dependencies")
+          expect(dependencies_section).not_to have_key("@rollup/rollup-linux-x64-gnu") if dependencies_section
+        end
+
+        it "handles mixed dependencies correctly without moving optional deps to dependencies section" do
+          # Test with mixed dependencies scenario
+          mixed_files = project_dependency_files("npm8/mixed_dependencies")
+
+          # Create dependencies for both regular and optional
+          mixed_regular_dep = Dependabot::Dependency.new(
+            name: "fetch-factory",
+            version: "0.0.2",
+            previous_version: "0.0.1",
+            package_manager: "npm_and_yarn",
+            requirements: [{
+              file: "package.json",
+              requirement: "^0.0.2",
+              groups: ["dependencies"],
+              source: nil
+            }],
+            previous_requirements: [{
+              file: "package.json",
+              requirement: "^0.0.1",
+              groups: ["dependencies"],
+              source: nil
+            }]
+          )
+
+          mixed_optional_dep = Dependabot::Dependency.new(
+            name: "@rollup/rollup-linux-x64-gnu",
+            version: "4.53.2",
+            previous_version: "4.52.5",
+            package_manager: "npm_and_yarn",
+            requirements: [{
+              file: "package.json",
+              requirement: "^4.53.2",
+              groups: ["optionalDependencies"],
+              source: nil
+            }],
+            previous_requirements: [{
+              file: "package.json",
+              requirement: "^4.52.5",
+              groups: ["optionalDependencies"],
+              source: nil
+            }]
+          )
+
+          mixed_updater = described_class.new(
+            lockfile: mixed_files.find { |f| f.name == "package-lock.json" },
+            dependency_files: mixed_files,
+            dependencies: [mixed_regular_dep, mixed_optional_dep],
+            credentials: credentials
+          )
+
+          expected_mixed_content = fixture(
+            "updated_projects", "npm8", "mixed_dependencies", "package-lock.json"
+          )
+
+          # Mock npm commands - should be called twice, once for each dependency
+          allow(Dependabot::NpmAndYarn::Helpers).to receive(:run_npm_command).and_return("")
+
+          # Mock file reading to return expected content
+          original_file_read = File.method(:read)
+          allow(File).to receive(:read) do |path|
+            if path.end_with?("package-lock.json") && path.include?("tmp")
+              expected_mixed_content
+            else
+              original_file_read.call(path)
+            end
+          end
+
+          result = mixed_updater.updated_lockfile.content
+          parsed_result = JSON.parse(result)
+
+          # Verify the dependency was updated
+          expect(parsed_result.dig("packages", "node_modules/@rollup/rollup-linux-x64-gnu", "version"))
+            .to eq("4.53.2")
+
+          # Verify optional dependency is still marked as optional
+          expect(parsed_result.dig("packages", "node_modules/@rollup/rollup-linux-x64-gnu", "optional"))
+            .to be(true)
+
+          # Verify regular dependency is NOT marked as optional
+          expect(parsed_result.dig("packages", "node_modules/fetch-factory"))
+            .not_to have_key("optional")
+
+          # Critical verification: dependencies structure
+          root_package = parsed_result.dig("packages", "")
+          expect(root_package["dependencies"]).to include("fetch-factory" => "^0.0.2")
+          expect(root_package["optionalDependencies"]).to include("@rollup/rollup-linux-x64-gnu" => "^4.53.2")
+
+          # The key fix: optional dependency should NOT be in dependencies section
+          expect(root_package["dependencies"]).not_to have_key("@rollup/rollup-linux-x64-gnu")
+        end
+      end
+    end
+
+    describe "#run_npm_install_lockfile_only" do
+      let(:files) { project_dependency_files("npm8/simple") }
+      let(:install_args) { ["lodash@4.18.1"] }
+
+      context "when security_updates_only is true" do
+        let(:updater) do
+          described_class.new(
+            lockfile: package_lock,
+            dependency_files: files,
+            dependencies: dependencies,
+            credentials: credentials,
+            security_updates_only: true
+          )
+        end
+
+        it "passes --min-release-age=0 to override the .npmrc setting" do
+          expect(Dependabot::NpmAndYarn::Helpers).to receive(:run_npm_command) do |command, _options|
+            expect(command).to include("--min-release-age=0")
+            expect(command).to include("--package-lock-only")
+            expect(command).to include("--force")
+            ""
+          end
+
+          updater.send(:run_npm_install_lockfile_only, install_args)
+        end
+      end
+
+      context "when security_updates_only is false (default)" do
+        it "does not pass --min-release-age=0" do
+          expect(Dependabot::NpmAndYarn::Helpers).to receive(:run_npm_command) do |command, _options|
+            expect(command).not_to include("--min-release-age=0")
+            expect(command).to include("--package-lock-only")
+            ""
+          end
+
+          updater.send(:run_npm_install_lockfile_only, install_args)
+        end
+      end
+
+      context "when the running npm does not support --min-release-age" do
+        let(:updater) do
+          described_class.new(
+            lockfile: package_lock,
+            dependency_files: files,
+            dependencies: dependencies,
+            credentials: credentials,
+            security_updates_only: true
+          )
+        end
+
+        before do
+          allow(Dependabot::NpmAndYarn::Helpers)
+            .to receive(:npm_supports_min_release_age?).and_return(false)
+        end
+
+        it "omits --min-release-age entirely (the flag would be rejected)" do
+          expect(Dependabot::NpmAndYarn::Helpers).to receive(:run_npm_command) do |command, _options|
+            expect(command).not_to include("--min-release-age")
+            expect(command).to include("--package-lock-only")
+            ""
+          end
+
+          updater.send(:run_npm_install_lockfile_only, install_args)
+        end
+      end
+
+      context "when update_cooldown sets a release-age floor (regular update)" do
+        let(:updater) do
+          described_class.new(
+            lockfile: package_lock,
+            dependency_files: files,
+            dependencies: dependencies,
+            credentials: credentials,
+            release_age_days: 7
+          )
+        end
+
+        it "passes --min-release-age with the cooldown day count" do
+          expect(Dependabot::NpmAndYarn::Helpers).to receive(:run_npm_command) do |command, _options|
+            expect(command).to include("--min-release-age=7")
+            expect(command).to include("--package-lock-only")
+            ""
+          end
+
+          updater.send(:run_npm_install_lockfile_only, install_args)
+        end
+
+        # Regression coverage for the cooldown-vs-min-release-age conflict
+        # (dependabot/dependabot-core#13165): the longest release-age wins.
+        context "when the .npmrc already sets min-release-age" do
+          context "when the user's gate is longer than the cooldown" do
+            let(:files) do
+              project_dependency_files("npm8/simple") +
+                [Dependabot::DependencyFile.new(name: ".npmrc", content: "min-release-age=30")]
+            end
+
+            it "leaves the explicit .npmrc value untouched" do
+              expect(Dependabot::NpmAndYarn::Helpers).to receive(:run_npm_command) do |command, _options|
+                # User's 30 days is longer than the 7 day cooldown, so no CLI override is injected.
+                expect(command).not_to include("--min-release-age")
+                ""
+              end
+
+              updater.send(:run_npm_install_lockfile_only, install_args)
+            end
+          end
+
+          context "when the cooldown is longer than the user's gate" do
+            let(:files) do
+              project_dependency_files("npm8/simple") +
+                [Dependabot::DependencyFile.new(name: ".npmrc", content: "min-release-age=3")]
+            end
+
+            it "overrides with the longer cooldown value" do
+              expect(Dependabot::NpmAndYarn::Helpers).to receive(:run_npm_command) do |command, _options|
+                # Cooldown 7 days is longer than the user's 3 days, so it wins.
+                expect(command).to include("--min-release-age=7")
+                ""
+              end
+
+              updater.send(:run_npm_install_lockfile_only, install_args)
+            end
+          end
+        end
+      end
+    end
+
+    describe "#run_npm8_subdependency_updater" do
+      let(:files) { project_dependency_files("npm8/subdependency_update") }
+      let(:dependency_name) { "acorn" }
+      let(:version) { "5.7.4" }
+      let(:previous_version) { "5.5.3" }
+      let(:requirements) { [] }
+      let(:previous_requirements) { [] }
+
+      before do
+        allow(Dependabot::NpmAndYarn::NativeHelpers)
+          .to receive_messages(run_npm8_subdependency_update_command: "", run_npm_audit_fix_command: "")
+      end
+
+      context "when security_updates_only is true" do
+        let(:updater) do
+          described_class.new(
+            lockfile: package_lock,
+            dependency_files: files,
+            dependencies: dependencies,
+            credentials: credentials,
+            security_updates_only: true
+          )
+        end
+
+        it "passes --min-release-age=0 to override any .npmrc gate" do
+          updated_npm_lock_content
+
+          expect(Dependabot::NpmAndYarn::NativeHelpers)
+            .to have_received(:run_npm8_subdependency_update_command)
+            .with(["acorn"], min_release_age_arg: "--min-release-age=0")
+        end
+      end
+
+      context "when security_updates_only is false (default)" do
+        it "does not request a release-age gate" do
+          updated_npm_lock_content
+
+          expect(Dependabot::NpmAndYarn::NativeHelpers)
+            .to have_received(:run_npm8_subdependency_update_command)
+            .with(["acorn"], min_release_age_arg: nil)
+        end
+      end
+
+      context "when update_cooldown sets a release-age floor (regular update)" do
+        let(:updater) do
+          described_class.new(
+            lockfile: package_lock,
+            dependency_files: files,
+            dependencies: dependencies,
+            credentials: credentials,
+            release_age_days: 7
+          )
+        end
+
+        it "passes the cooldown floor so transitive updates are held back too" do
+          updated_npm_lock_content
+
+          expect(Dependabot::NpmAndYarn::NativeHelpers)
+            .to have_received(:run_npm8_subdependency_update_command)
+            .with(["acorn"], min_release_age_arg: "--min-release-age=7")
+        end
+      end
+    end
+
+    describe "#optional_dependency?" do
+      it "correctly identifies optional dependencies" do
+        optional_dep = Dependabot::Dependency.new(
+          name: "@rollup/rollup-linux-x64-gnu",
+          version: "4.53.2",
+          package_manager: "npm_and_yarn",
+          requirements: [{
+            file: "package.json",
+            requirement: "^4.53.2",
+            groups: ["optionalDependencies"],
+            source: nil
+          }]
+        )
+
+        regular_dep = Dependabot::Dependency.new(
+          name: "regular-package",
+          version: "1.0.0",
+          package_manager: "npm_and_yarn",
+          requirements: [{
+            file: "package.json",
+            requirement: "^1.0.0",
+            groups: ["dependencies"],
+            source: nil
+          }]
+        )
+
+        # Create a simple updater instance to test the private method
+        test_updater = described_class.new(
+          lockfile: files.find { |f| f.name == "package-lock.json" },
+          dependency_files: files,
+          dependencies: [optional_dep],
+          credentials: credentials
+        )
+
+        expect(test_updater.send(:optional_dependency?, optional_dep)).to be(true)
+        expect(test_updater.send(:optional_dependency?, regular_dep)).to be(false)
+      end
+    end
+
+    describe "Helpers.build_corepack_env_variables" do
+      let(:files) { project_dependency_files("npm8/simple") }
+
+      context "when resolving Corepack environment variables" do
+        context "with npm_registry credentials" do
+          let(:test_credentials) do
+            [
+              Dependabot::Credential.new(
+                {
+                  "type" => "npm_registry",
+                  "registry" => "https://npm.private.registry",
+                  "token" => "secret_token",
+                  "replaces-base" => true
+                }
+              )
+            ]
+          end
+
+          before do
+            Dependabot::NpmAndYarn::Helpers.dependency_files = files
+            Dependabot::NpmAndYarn::Helpers.credentials = test_credentials
+          end
+
+          it "returns both registry and token environment variables" do
+            env_vars = Dependabot::NpmAndYarn::Helpers.send(:build_corepack_env_variables)
+            expect(env_vars).to eq(
+              {
+                "COREPACK_NPM_REGISTRY" => "https://npm.private.registry",
+                "npm_config_registry" => "https://npm.private.registry",
+                "COREPACK_NPM_TOKEN" => "secret_token",
+                "registry" => "https://npm.private.registry"
+              }
+            )
+          end
+        end
+
+        context "with npm_registry credentials but replaces-base is false" do
+          let(:test_credentials) do
+            [
+              Dependabot::Credential.new(
+                {
+                  "type" => "npm_registry",
+                  "registry" => "https://npm.private.registry",
+                  "token" => "secret_token",
+                  "replaces-base" => false
+                }
+              )
+            ]
+          end
+
+          before do
+            Dependabot::NpmAndYarn::Helpers.dependency_files = files
+            Dependabot::NpmAndYarn::Helpers.credentials = test_credentials
+          end
+
+          it "returns empty hash" do
+            env_vars = Dependabot::NpmAndYarn::Helpers.send(:build_corepack_env_variables)
+            expect(env_vars).to eq({})
+          end
+        end
+
+        context "without npm_registry credentials" do
+          before do
+            Dependabot::NpmAndYarn::Helpers.dependency_files = files
+            Dependabot::NpmAndYarn::Helpers.credentials = credentials
+          end
+
+          it "returns empty hash" do
+            env_vars = Dependabot::NpmAndYarn::Helpers.send(:build_corepack_env_variables)
+            expect(env_vars).to eq({})
+          end
+        end
+
+        context "with .npmrc file containing registry" do
+          let(:test_files) do
+            project_dependency_files("npm8/simple") + [
+              Dependabot::DependencyFile.new(
+                name: ".npmrc",
+                content: "registry=https://custom.registry.com\n_authToken=custom_token"
+              )
+            ]
+          end
+
+          before do
+            Dependabot::NpmAndYarn::Helpers.dependency_files = test_files
+            Dependabot::NpmAndYarn::Helpers.credentials = credentials
+          end
+
+          it "returns registry and token from .npmrc" do
+            env_vars = Dependabot::NpmAndYarn::Helpers.send(:build_corepack_env_variables)
+            expect(env_vars).to eq(
+              {
+                "COREPACK_NPM_REGISTRY" => "https://custom.registry.com",
+                "npm_config_registry" => "https://custom.registry.com",
+                "COREPACK_NPM_TOKEN" => "custom_token",
+                "registry" => "https://custom.registry.com"
+              }
+            )
+          end
+        end
+
+        context "with .yarnrc file containing registry" do
+          let(:test_files) do
+            project_dependency_files("npm8/simple") + [
+              Dependabot::DependencyFile.new(
+                name: ".yarnrc",
+                content: "registry \"https://yarn.registry.com\"\n_authToken \"yarn_token\""
+              )
+            ]
+          end
+
+          before do
+            Dependabot::NpmAndYarn::Helpers.dependency_files = test_files
+            Dependabot::NpmAndYarn::Helpers.credentials = credentials
+          end
+
+          it "returns registry and token from .yarnrc" do
+            env_vars = Dependabot::NpmAndYarn::Helpers.send(:build_corepack_env_variables)
+            expect(env_vars).to eq(
+              {
+                "COREPACK_NPM_REGISTRY" => "https://yarn.registry.com",
+                "npm_config_registry" => "https://yarn.registry.com",
+                "COREPACK_NPM_TOKEN" => "yarn_token",
+                "registry" => "https://yarn.registry.com"
+              }
+            )
+          end
+        end
+
+        context "with .yarnrc.yml file containing registry" do
+          let(:test_files) do
+            project_dependency_files("npm8/simple") + [
+              Dependabot::DependencyFile.new(
+                name: ".yarnrc.yml",
+                content: "npmRegistryServer: https://yarn2.registry.com\nnpmAuthToken: yarn2_token"
+              )
+            ]
+          end
+
+          before do
+            Dependabot::NpmAndYarn::Helpers.dependency_files = test_files
+            Dependabot::NpmAndYarn::Helpers.credentials = credentials
+          end
+
+          it "returns registry and token from .yarnrc.yml" do
+            env_vars = Dependabot::NpmAndYarn::Helpers.send(:build_corepack_env_variables)
+            expect(env_vars).to eq(
+              {
+                "COREPACK_NPM_REGISTRY" => "https://yarn2.registry.com",
+                "npm_config_registry" => "https://yarn2.registry.com",
+                "COREPACK_NPM_TOKEN" => "yarn2_token",
+                "registry" => "https://yarn2.registry.com"
+              }
+            )
+          end
+        end
+
+        context "when credentials take priority over config files" do
+          let(:test_credentials) do
+            [
+              Dependabot::Credential.new(
+                {
+                  "type" => "npm_registry",
+                  "registry" => "https://creds.registry.com",
+                  "token" => "creds_token",
+                  "replaces-base" => true
+                }
+              )
+            ]
+          end
+
+          let(:test_files) do
+            project_dependency_files("npm8/simple") + [
+              Dependabot::DependencyFile.new(
+                name: ".npmrc",
+                content: "registry=https://npmrc.registry.com\n_authToken=npmrc_token"
+              )
+            ]
+          end
+
+          before do
+            Dependabot::NpmAndYarn::Helpers.dependency_files = test_files
+            Dependabot::NpmAndYarn::Helpers.credentials = test_credentials
+          end
+
+          it "uses credentials over .npmrc" do
+            env_vars = Dependabot::NpmAndYarn::Helpers.send(:build_corepack_env_variables)
+            expect(env_vars).to eq(
+              {
+                "COREPACK_NPM_REGISTRY" => "https://creds.registry.com",
+                "npm_config_registry" => "https://creds.registry.com",
+                "COREPACK_NPM_TOKEN" => "creds_token",
+                "registry" => "https://creds.registry.com"
+              }
+            )
+          end
+        end
       end
     end
   end

@@ -25,8 +25,13 @@ module Dependabot
       sig { returns(T.nilable(Dependabot::Source)) }
       attr_reader :source
 
-      sig { returns(T::Hash[Symbol, T.untyped]) }
+      sig { returns(T::Hash[Symbol, T.anything]) }
       attr_reader :options
+
+      sig { returns(T::Boolean) }
+      def reject_external_code?
+        @reject_external_code
+      end
 
       sig do
         params(
@@ -35,12 +40,18 @@ module Dependabot
           repo_contents_path: T.nilable(String),
           credentials: T::Array[Dependabot::Credential],
           reject_external_code: T::Boolean,
-          options: T::Hash[Symbol, T.untyped]
+          options: T::Hash[Symbol, T.anything]
         )
           .void
       end
-      def initialize(dependency_files:, source:, repo_contents_path: nil,
-                     credentials: [], reject_external_code: false, options: {})
+      def initialize(
+        dependency_files:,
+        source:,
+        repo_contents_path: nil,
+        credentials: [],
+        reject_external_code: false,
+        options: {}
+      )
         @dependency_files = dependency_files
         @repo_contents_path = repo_contents_path
         @credentials = credentials
@@ -57,6 +68,30 @@ module Dependabot
       sig { returns(T.nilable(Ecosystem)) }
       def ecosystem
         nil
+      end
+
+      # This is an optional public method that ecosystems can implement to allow collaborating classes, such as
+      # the ecosystem's DependencyGrapher to run native commands inside the parser's context.
+      #
+      # This is typically used to retrieve information about the relationships between dependencies that is not
+      # currently used as part of a Dependabot update to avoid adding latency to the parser's normal function.
+      #
+      # Any use of this method should be considered a candidate to become part of the parser's normal function
+      # when some of the following things have been addressed:
+      # - We have more broadly rolled out the Dependabot graph capability across ecosystems
+      # - We make the relationship information applicable to updates with new transitive update strategies
+      # - We work on ingesting pre-computed dependency snapshots
+      sig { params(_command: String).returns(String) }
+      def run_in_parsed_context(_command)
+        raise Dependabot::NotImplemented, "No run_parsed_context utility method is provided for this ecosystem."
+      end
+
+      # Enables alias extraction so that aliased packages are parsed using the
+      # real package name rather than being skipped. Must be called before #parse.
+      # This is a no-op for ecosystems that don't support aliases.
+      sig { void }
+      def dealias_packages!
+        options[:dealias_packages] = true
       end
 
       private

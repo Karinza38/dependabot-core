@@ -1,7 +1,8 @@
-# typed: true
+# typed: strict
 # frozen_string_literal: true
 
 require "bundler"
+require "sorbet-runtime"
 
 require "dependabot/shared_helpers"
 require "dependabot/errors"
@@ -14,6 +15,8 @@ module Dependabot
   module Bundler
     class FileUpdater
       class LockfileUpdater
+        extend T::Sig
+
         require_relative "gemfile_updater"
         require_relative "gemspec_updater"
         require_relative "gemspec_sanitizer"
@@ -23,9 +26,42 @@ module Dependabot
         LOCKFILE_ENDING = /(?<ending>\s*(?:RUBY VERSION|BUNDLED WITH).*)/m
         GIT_DEPENDENCIES_SECTION = /GIT\n.*?\n\n(?!GIT)/m
         GIT_DEPENDENCY_DETAILS = /GIT\n.*?\n\n/m
+        # No `/m`: it would let the greedy `.*` in `entries` match newlines and
+        # swallow the trailing `BUNDLED WITH` section. `^` is line-anchored anyway.
+        CHECKSUMS_SECTION = /(^CHECKSUMS\n)(?<entries>(?:^  .*\n)+)/
+        BUNDLER_CHECKSUM_ENTRY_REGEX = /^  bundler \([^)]+\).*\n?$/
+
+        sig do
+          params(
+            dependencies: T::Array[Dependabot::Dependency],
+            dependency_files: T::Array[Dependabot::DependencyFile],
+            credentials: T::Array[Dependabot::Credential],
+            options: T::Hash[Symbol, T.untyped],
+            repo_contents_path: T.nilable(String)
+          ).void
+        end
+        def initialize(
+          dependencies:,
+          dependency_files:,
+          credentials:,
+          options:,
+          repo_contents_path: nil
+        )
+          @dependencies = dependencies
+          @dependency_files = dependency_files
+          @repo_contents_path = repo_contents_path
+          @credentials = credentials
+          @options = options
+          @updated_lockfile_content = T.let(nil, T.nilable(String))
+          @gemfile = T.let(nil, T.nilable(Dependabot::DependencyFile))
+          @lockfile = T.let(nil, T.nilable(Dependabot::DependencyFile))
+          @evaled_gemfiles = T.let(nil, T.nilable(T::Array[Dependabot::DependencyFile]))
+          @bundler_version = T.let(nil, T.nilable(String))
+        end
 
         # Can't be a constant because some of these don't exist in bundler
         # 1.15, which Heroku uses, which causes an exception on boot.
+        sig { returns(T::Array[T.class_of(::Bundler::Source::Path)]) }
         def gemspec_sources
           [
             ::Bundler::Source::Path,
@@ -33,21 +69,13 @@ module Dependabot
           ]
         end
 
-        def initialize(dependencies:, dependency_files:,
-                       repo_contents_path: nil, credentials:, options:)
-          @dependencies = dependencies
-          @dependency_files = dependency_files
-          @repo_contents_path = repo_contents_path
-          @credentials = credentials
-          @options = options
-        end
-
+        sig { returns(String) }
         def updated_lockfile_content
           @updated_lockfile_content ||=
             begin
               updated_content = build_updated_lockfile
 
-              raise "Expected content to change!" if lockfile.content == updated_content
+              raise "Expected content to change!" if T.must(lockfile).content == updated_content
 
               updated_content
             end
@@ -55,14 +83,24 @@ module Dependabot
 
         private
 
+        sig { returns(T::Array[Dependabot::Dependency]) }
         attr_reader :dependencies
+
+        sig { returns(T::Array[Dependabot::DependencyFile]) }
         attr_reader :dependency_files
+
+        sig { returns(T.nilable(String)) }
         attr_reader :repo_contents_path
+
+        sig { returns(T::Array[Dependabot::Credential]) }
         attr_reader :credentials
+
+        sig { returns(T::Hash[Symbol, T.untyped]) }
         attr_reader :options
 
+        sig { returns(String) }
         def build_updated_lockfile
-          base_dir = dependency_files.first.directory
+          base_dir = T.must(dependency_files.first).directory
           lockfile_body =
             SharedHelpers.in_a_temporary_repo_directory(
               base_dir,
@@ -75,8 +113,8 @@ module Dependabot
                 function: "update_lockfile",
                 options: options,
                 args: {
-                  gemfile_name: gemfile.name,
-                  lockfile_name: lockfile.name,
+                  gemfile_name: T.must(gemfile).name,
+                  lockfile_name: T.must(lockfile).name,
                   dir: tmp_dir,
                   credentials: credentials,
                   dependencies: dependencies.map(&:to_h)
@@ -90,9 +128,10 @@ module Dependabot
           raise
         end
 
+        sig { void }
         def write_temporary_dependency_files
-          File.write(gemfile.name, prepared_gemfile_content(gemfile))
-          File.write(lockfile.name, sanitized_lockfile_body)
+          File.write(T.must(gemfile).name, prepared_gemfile_content(T.must(gemfile)))
+          File.write(T.must(lockfile).name, sanitized_lockfile_body)
 
           write_gemspecs(top_level_gemspecs)
           write_ruby_version_file
@@ -108,22 +147,25 @@ module Dependabot
           end
         end
 
+        sig { void }
         def write_ruby_version_file
           return unless ruby_version_file
 
-          path = ruby_version_file.name
+          path = T.must(ruby_version_file).name
           FileUtils.mkdir_p(Pathname.new(path).dirname)
-          File.write(path, ruby_version_file.content)
+          File.write(path, T.must(ruby_version_file).content)
         end
 
+        sig { void }
         def write_tool_versions_file
           return unless tool_versions_file
 
-          path = tool_versions_file.name
+          path = T.must(tool_versions_file).name
           FileUtils.mkdir_p(Pathname.new(path).dirname)
-          File.write(path, tool_versions_file.content)
+          File.write(path, T.must(tool_versions_file).content)
         end
 
+        sig { params(files: T::Array[Dependabot::DependencyFile]).void }
         def write_gemspecs(files)
           files.each do |file|
             path = file.name
@@ -133,6 +175,7 @@ module Dependabot
           end
         end
 
+        sig { void }
         def write_specification_files
           specification_files.each do |file|
             path = file.name
@@ -141,6 +184,7 @@ module Dependabot
           end
         end
 
+        sig { void }
         def write_imported_ruby_files
           imported_ruby_files.each do |file|
             path = file.name
@@ -149,38 +193,110 @@ module Dependabot
           end
         end
 
+        sig { returns(T::Array[Dependabot::DependencyFile]) }
         def path_gemspecs
           all = dependency_files.select { |f| f.name.end_with?(".gemspec") }
           all - top_level_gemspecs
         end
 
+        sig { returns(T::Array[Dependabot::DependencyFile]) }
         def imported_ruby_files
           dependency_files
             .select { |f| f.name.end_with?(".rb") }
             .reject { |f| f.name == "gems.rb" }
         end
 
+        sig { returns(T::Array[Dependabot::DependencyFile]) }
         def top_level_gemspecs
           dependency_files
             .select { |file| file.name.end_with?(".gemspec") && Pathname.new(file.name).dirname.to_s == "." }
         end
 
+        sig { returns(T.nilable(Dependabot::DependencyFile)) }
         def ruby_version_file
           dependency_files.find { |f| f.name == ".ruby-version" }
         end
 
+        sig { returns(T.nilable(Dependabot::DependencyFile)) }
         def tool_versions_file
           dependency_files.find { |f| f.name == ".tool-versions" }
         end
 
+        sig { params(lockfile_body: String).returns(String) }
         def post_process_lockfile(lockfile_body)
           lockfile_body = reorder_git_dependencies(lockfile_body)
+          lockfile_body = strip_new_bundler_checksum(lockfile_body)
+          lockfile_body = restore_bundler_checksum(lockfile_body)
           replace_lockfile_ending(lockfile_body)
         end
 
+        sig { params(lockfile_body: String).returns(String) }
+        def strip_new_bundler_checksum(lockfile_body)
+          return lockfile_body unless should_strip_bundler_checksum?
+
+          checksums_section = lockfile_body.match(CHECKSUMS_SECTION)
+          return lockfile_body unless checksums_section
+
+          entries = T.must(checksums_section[:entries])
+          stripped_entries = entries.lines.reject { |line| line.match?(BUNDLER_CHECKSUM_ENTRY_REGEX) }.join
+
+          lockfile_body.sub(CHECKSUMS_SECTION) { "CHECKSUMS\n#{stripped_entries}" }
+        end
+
+        sig { returns(T::Boolean) }
+        def should_strip_bundler_checksum?
+          lockfile_content = T.must(lockfile).content
+          return false unless lockfile_content&.include?("CHECKSUMS\n")
+
+          # Strip a bundler self-checksum only when the original CHECKSUMS
+          # section did not contain one. If the original pins one,
+          # restore_bundler_checksum separately swaps a generated entry back to
+          # the original when present. Dependabot must not introduce a missing
+          # entry: the runner's regular-gem install can calculate a checksum that
+          # a default-gem install cannot (ruby/rubygems#9512), and its runtime
+          # bundler version need not match BUNDLED WITH because Dependabot does
+          # not manage that version. This can add unrelated or mismatched
+          # metadata and cause lockfile churn.
+          checksums_section = lockfile_content.match(CHECKSUMS_SECTION)
+          !(checksums_section && T.must(checksums_section[:entries]).match?(BUNDLER_CHECKSUM_ENTRY_REGEX))
+        end
+
+        sig { params(lockfile_body: String).returns(String) }
+        def restore_bundler_checksum(lockfile_body)
+          original_entry = original_bundler_checksum_entry
+          return lockfile_body unless original_entry
+
+          checksums_section = lockfile_body.match(CHECKSUMS_SECTION)
+          return lockfile_body unless checksums_section
+
+          entries = T.must(checksums_section[:entries])
+          return lockfile_body unless entries.match?(BUNDLER_CHECKSUM_ENTRY_REGEX)
+
+          restored_entries = entries.lines.map do |line|
+            line.match?(BUNDLER_CHECKSUM_ENTRY_REGEX) ? original_entry : line
+          end.join
+
+          lockfile_body.sub(CHECKSUMS_SECTION) { "CHECKSUMS\n#{restored_entries}" }
+        end
+
+        sig { returns(T.nilable(String)) }
+        def original_bundler_checksum_entry
+          checksums_section = T.must(lockfile).content&.match(CHECKSUMS_SECTION)
+          return nil unless checksums_section
+
+          entry = T.must(checksums_section[:entries]).lines.find do |line|
+            line.match?(BUNDLER_CHECKSUM_ENTRY_REGEX)
+          end
+          return nil unless entry
+
+          "#{entry.chomp}\n"
+        end
+
+        sig { params(lockfile_body: String).returns(String) }
         def reorder_git_dependencies(lockfile_body)
           new_section = lockfile_body.match(GIT_DEPENDENCIES_SECTION)&.to_s
-          old_section = lockfile.content.match(GIT_DEPENDENCIES_SECTION)&.to_s
+          lockfile_content = T.must(lockfile).content
+          old_section = lockfile_content&.match(GIT_DEPENDENCIES_SECTION)&.to_s
 
           return lockfile_body unless new_section && old_section
 
@@ -190,8 +306,10 @@ module Dependabot
           return lockfile_body unless new_deps.count == old_deps.count
 
           reordered_new_section = new_deps.sort_by do |new_dep_details|
-            remote = new_dep_details.match(/remote: (?<remote>.*\n)/)[:remote]
-            i = old_deps.index { |details| details.include?(remote) }
+            dep_string = T.cast(new_dep_details, String)
+            match_result = dep_string.match(/remote: (?<remote>.*\n)/)
+            remote = match_result ? match_result[:remote] : ""
+            i = old_deps.index { |details| details.include?(T.must(remote)) }
 
             # If this dependency isn't in the old lockfile then we can't rely
             # on that (presumably outdated) lockfile to do reordering.
@@ -205,15 +323,18 @@ module Dependabot
           lockfile_body.gsub(new_section, reordered_new_section)
         end
 
+        sig { params(lockfile_body: String).returns(String) }
         def replace_lockfile_ending(lockfile_body)
           # Re-add the old `BUNDLED WITH` version (and remove the RUBY VERSION
           # if it wasn't previously present in the lockfile)
+          lockfile_content = T.must(lockfile).content
           lockfile_body.gsub(
             LOCKFILE_ENDING,
-            lockfile.content.match(LOCKFILE_ENDING)&.[](:ending) || "\n"
+            lockfile_content&.match(LOCKFILE_ENDING)&.[](:ending) || "\n"
           )
         end
 
+        sig { params(path: String, gemspec_content: String).returns(String) }
         def sanitized_gemspec_content(path, gemspec_content)
           new_version = replacement_version_for_gemspec(path, gemspec_content)
 
@@ -222,6 +343,7 @@ module Dependabot
             .rewrite(gemspec_content)
         end
 
+        sig { params(path: String, gemspec_content: String).returns(String) }
         def replacement_version_for_gemspec(path, gemspec_content)
           return "0.0.1" unless lockfile
 
@@ -233,9 +355,10 @@ module Dependabot
             CachedLockfileParser.parse(sanitized_lockfile_body).specs
                                 .select { |s| s.name == gem_name && gemspec_sources.include?(s.source.class) }
 
-          gemspec_specs.first&.version || "0.0.1"
+          gemspec_specs.first&.version&.to_s || "0.0.1"
         end
 
+        sig { params(file: Dependabot::DependencyFile).returns(String) }
         def prepared_gemfile_content(file)
           content = updated_gemfile_content(file)
 
@@ -246,6 +369,7 @@ module Dependabot
           content
         end
 
+        sig { params(file: Dependabot::DependencyFile).returns(String) }
         def updated_gemfile_content(file)
           GemfileUpdater.new(
             dependencies: dependencies,
@@ -253,6 +377,7 @@ module Dependabot
           ).updated_gemfile_content
         end
 
+        sig { params(gemspec: Dependabot::DependencyFile).returns(String) }
         def updated_gemspec_content(gemspec)
           GemspecUpdater.new(
             dependencies: dependencies,
@@ -260,11 +385,13 @@ module Dependabot
           ).updated_gemspec_content
         end
 
+        sig { returns(T.nilable(Dependabot::DependencyFile)) }
         def gemfile
           @gemfile ||= dependency_files.find { |f| f.name == "Gemfile" } ||
                        dependency_files.find { |f| f.name == "gems.rb" }
         end
 
+        sig { returns(T.nilable(Dependabot::DependencyFile)) }
         def lockfile
           @lockfile ||=
             dependency_files.find { |f| f.name == "Gemfile.lock" } ||
@@ -272,10 +399,13 @@ module Dependabot
         end
 
         # TODO: Stop sanitizing the lockfile once we have bundler 2 installed
+        sig { returns(String) }
         def sanitized_lockfile_body
-          lockfile.content.gsub(LOCKFILE_ENDING, "")
+          content = T.must(lockfile).content
+          T.must(content).gsub(LOCKFILE_ENDING, "")
         end
 
+        sig { returns(T::Array[Dependabot::DependencyFile]) }
         def evaled_gemfiles
           @evaled_gemfiles ||=
             dependency_files
@@ -288,10 +418,12 @@ module Dependabot
             .reject(&:support_file?)
         end
 
+        sig { returns(T::Array[Dependabot::DependencyFile]) }
         def specification_files
           dependency_files.select { |f| f.name.end_with?(".specification") }
         end
 
+        sig { returns(String) }
         def bundler_version
           @bundler_version ||= Helpers.bundler_version(lockfile)
         end

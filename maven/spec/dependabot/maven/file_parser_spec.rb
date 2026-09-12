@@ -2,9 +2,12 @@
 # frozen_string_literal: true
 
 require "spec_helper"
+require "dependabot/dependency"
 require "dependabot/dependency_file"
 require "dependabot/source"
+require "dependabot/file_parsers/base/dependency_set"
 require "dependabot/maven/file_parser"
+require "dependabot/maven/file_parser/maven_dependency_parser"
 require_common_spec "file_parsers/shared_examples_for_file_parsers"
 
 RSpec.describe Dependabot::Maven::FileParser do
@@ -118,6 +121,33 @@ RSpec.describe Dependabot::Maven::FileParser do
       end
     end
 
+    context "with target-file" do
+      let(:files) { [targetfile, pom] }
+      let(:targetfile) do
+        Dependabot::DependencyFile.new(name: "releng/myproject.target", content: targetfile_body)
+      end
+      let(:targetfile_body) { fixture("target-files", "example.target") }
+
+      describe "the sole dependency" do
+        subject(:dependency) { dependencies[3] }
+
+        it "has the right details" do
+          expect(dependency).to be_a(Dependabot::Dependency)
+          expect(dependency.name).to eq("commons-io:commons-io")
+          expect(dependency.version).to eq("2.11.0")
+          expect(dependency.requirements).to eq(
+            [{
+              requirement: "2.11.0",
+              file: "releng/myproject.target",
+              groups: [],
+              source: nil,
+              metadata: { packaging_type: "jar" }
+            }]
+          )
+        end
+      end
+    end
+
     context "with rogue whitespace" do
       let(:pom_body) { fixture("poms", "whitespace.xml") }
 
@@ -187,7 +217,7 @@ RSpec.describe Dependabot::Maven::FileParser do
             [{
               requirement: "1.5.8.RELEASE",
               file: "pom.xml",
-              groups: [],
+              groups: ["plugin"],
               source: nil,
               metadata: { packaging_type: "jar" }
             }]
@@ -214,7 +244,7 @@ RSpec.describe Dependabot::Maven::FileParser do
               [{
                 requirement: "1.5.8.RELEASE",
                 file: "pom.xml",
-                groups: [],
+                groups: ["plugin"],
                 source: nil,
                 metadata: { packaging_type: "jar" }
               }]
@@ -251,7 +281,7 @@ RSpec.describe Dependabot::Maven::FileParser do
             [{
               requirement: "0.9.4",
               file: "pom.xml",
-              groups: [],
+              groups: ["plugin"],
               source: nil,
               metadata: { packaging_type: "jar" }
             }]
@@ -271,7 +301,7 @@ RSpec.describe Dependabot::Maven::FileParser do
             [{
               requirement: "9.1",
               file: "pom.xml",
-              groups: [],
+              groups: ["plugin"],
               source: nil,
               metadata: { packaging_type: "jar" }
             }]
@@ -354,7 +384,7 @@ RSpec.describe Dependabot::Maven::FileParser do
             [{
               requirement: "1.5.8.RELEASE",
               file: "pom.xml",
-              groups: [],
+              groups: ["plugin"],
               source: nil,
               metadata: { packaging_type: "jar" }
             }]
@@ -710,7 +740,7 @@ RSpec.describe Dependabot::Maven::FileParser do
             [{
               requirement: "3.0.0-M1",
               file: "pom.xml",
-              groups: [],
+              groups: ["plugin"],
               source: nil,
               metadata: {
                 property_name: "maven-javadoc-plugin.version",
@@ -720,7 +750,7 @@ RSpec.describe Dependabot::Maven::FileParser do
             }, {
               requirement: "2.10.4",
               file: "pom.xml",
-              groups: [],
+              groups: ["plugin"],
               source: nil,
               metadata: { packaging_type: "jar" }
             }]
@@ -1061,6 +1091,254 @@ RSpec.describe Dependabot::Maven::FileParser do
               }
             }]
           )
+        end
+      end
+    end
+
+    context "with a native maven dependency tree parse" do
+      before do
+        dependency_set = Dependabot::FileParsers::Base::DependencySet.new
+        dependency_set << Dependabot::Dependency.new(
+          name: "com.dependabot:basic-pom",
+          version: "0.0.1-RELEASE",
+          package_manager: "maven",
+          requirements: [{
+            requirement: "0.0.1-RELEASE",
+            file: nil,
+            groups: [],
+            source: nil,
+            metadata: {
+              packaging_type: "jar",
+              classifier: "",
+              pom_file: "pom.xml"
+            }
+          }]
+        )
+        dependency_set << Dependabot::Dependency.new(
+          name: "com.google.guava:guava",
+          version: "23.3-jre",
+          package_manager: "maven",
+          requirements: [{
+            requirement: "23.3-jre",
+            file: nil,
+            groups: [],
+            source: nil,
+            metadata: {
+              packaging_type: "jar",
+              classifier: "",
+              pom_file: "pom.xml"
+            }
+          }]
+        )
+        dependency_set << Dependabot::Dependency.new(
+          name: "org.apache.httpcomponents:httpclient",
+          version: "4.5.3",
+          package_manager: "maven",
+          requirements: [{
+            requirement: "4.5.3",
+            file: nil,
+            groups: [],
+            source: nil,
+            metadata: {
+              packaging_type: "jar",
+              classifier: "",
+              pom_file: "pom.xml"
+            }
+          }]
+        )
+        dependency_set << Dependabot::Dependency.new(
+          name: "io.mockk:mockk",
+          version: "1.0.0",
+          package_manager: "maven",
+          requirements: [{
+            requirement: "1.0.0",
+            file: nil,
+            groups: [],
+            source: nil,
+            metadata: {
+              packaging_type: "jar",
+              classifier: "",
+              pom_file: "pom.xml"
+            }
+          }]
+        )
+        dependency_set << Dependabot::Dependency.new(
+          name: "com.google.code.findbugs:jsr305",
+          version: "1.3.9",
+          package_manager: "maven",
+          requirements: [{
+            requirement: "1.3.9",
+            file: nil,
+            groups: [],
+            source: nil,
+            metadata: {
+              packaging_type: "jar",
+              classifier: "",
+              pom_file: "pom.xml"
+            }
+          }]
+        )
+        dependency_set << Dependabot::Dependency.new(
+          name: "org.apache.httpcomponents:httpcore",
+          version: "4.4.6",
+          package_manager: "maven",
+          requirements: [{
+            requirement: "4.4.6",
+            file: nil,
+            groups: [],
+            source: nil,
+            metadata: {
+              packaging_type: "jar",
+              classifier: "",
+              pom_file: "pom.xml"
+            }
+          }]
+        )
+
+        allow(Dependabot::Maven::FileParser::MavenDependencyParser).to receive(:build_dependency_set)
+          .and_return(dependency_set)
+        allow(Dependabot::Experiments).to receive(:enabled?).and_return(false)
+        allow(Dependabot::Experiments).to receive(:enabled?)
+          .with(:maven_transitive_dependencies).and_return(true)
+      end
+
+      it "merges direct and transitive dependencies" do
+        expect(dependencies.map(&:name))
+          .to match_array(
+            %w(
+              com.dependabot:basic-pom
+              com.google.guava:guava
+              org.apache.httpcomponents:httpclient
+              io.mockk:mockk
+              com.google.code.findbugs:jsr305
+              org.apache.httpcomponents:httpcore
+            )
+          )
+      end
+
+      describe "the first dependency" do
+        subject(:dependency) { dependencies[0] }
+
+        it "has the right details" do
+          expect(dependency).to be_a(Dependabot::Dependency)
+          expect(dependency.name).to eq("com.dependabot:basic-pom")
+          expect(dependency.version).to eq("0.0.1-RELEASE")
+          expect(dependency.requirements).to eq(
+            [{
+              requirement: "0.0.1-RELEASE",
+              file: nil,
+              groups: [],
+              source: nil,
+              metadata: {
+                packaging_type: "jar",
+                classifier: "",
+                pom_file: "pom.xml"
+              }
+            }]
+          )
+        end
+      end
+
+      describe "the second dependency" do
+        subject(:dependency) { dependencies[1] }
+
+        it "has the right details" do
+          expect(dependency).to be_a(Dependabot::Dependency)
+          expect(dependency.name).to eq("com.google.guava:guava")
+          expect(dependency.version).to eq("23.3-jre")
+          expect(dependency.requirements).to eq(
+            [{
+              requirement: "23.3-jre",
+              file: "pom.xml",
+              groups: [],
+              source: nil,
+              metadata: {
+                packaging_type: "jar",
+                classifier: "",
+                pom_file: "pom.xml"
+              }
+            }]
+          )
+        end
+      end
+    end
+
+    context "with maven wrapper files" do
+      let(:wrapper_content) { fixture("wrapper_files", "maven-wrapper-3.9.9-only-script.properties") }
+      let(:wrapper_file) do
+        Dependabot::DependencyFile.new(
+          name: ".mvn/wrapper/maven-wrapper.properties",
+          content: wrapper_content
+        )
+      end
+      let(:files) { [pom, wrapper_file] }
+
+      before do
+        allow(Dependabot::Experiments).to receive(:enabled?).and_return(false)
+        allow(Dependabot::Experiments).to receive(:enabled?)
+          .with(:maven_wrapper_updater).and_return(true)
+      end
+
+      it "includes apache-maven as a dependency" do
+        expect(dependencies.map(&:name)).to include("org.apache.maven:apache-maven")
+      end
+
+      it "includes maven-wrapper as a dependency" do
+        expect(dependencies.map(&:name)).to include("org.apache.maven.wrapper:maven-wrapper")
+      end
+
+      it "sets the correct version for apache-maven" do
+        dep = dependencies.find { |d| d.name == "org.apache.maven:apache-maven" }
+        expect(dep.version).to eq("3.9.9")
+      end
+
+      it "sets the correct version for maven-wrapper" do
+        dep = dependencies.find { |d| d.name == "org.apache.maven.wrapper:maven-wrapper" }
+        expect(dep.version).to eq("3.3.4")
+      end
+
+      it "uses maven-distribution as the source type" do
+        dep = dependencies.find { |d| d.name == "org.apache.maven:apache-maven" }
+        expect(dep.requirements.first[:source][:type]).to eq("maven-distribution")
+      end
+
+      context "when transitive dependency parsing is enabled" do
+        let(:wrapper_content) { fixture("wrapper_files", "maven-wrapper-3.9.6-bin.properties") }
+
+        before do
+          allow(Dependabot::Maven::FileParser::MavenDependencyParser).to receive(:build_dependency_set)
+            .and_return(Dependabot::FileParsers::Base::DependencySet.new)
+          allow(Dependabot::Experiments).to receive(:enabled?)
+            .with(:maven_transitive_dependencies).and_return(true)
+        end
+
+        it "includes the wrapper dependencies" do
+          expect(dependencies.map(&:name)).to include(
+            "org.apache.maven:apache-maven",
+            "org.apache.maven.wrapper:maven-wrapper"
+          )
+        end
+
+        it "preserves every wrapper requirement" do
+          dependency = dependencies.find { |dep| dep.name == "org.apache.maven:apache-maven" }
+          properties = dependency.requirements.map { |requirement| requirement.dig(:source, :property) }
+
+          expect(properties).to contain_exactly("distributionUrl", "wrapperUrl")
+        end
+      end
+
+      context "when the maven_wrapper_updater experiment is disabled" do
+        before do
+          allow(Dependabot::Experiments).to receive(:enabled?)
+            .with(:maven_wrapper_updater).and_return(false)
+        end
+
+        it "does not include apache-maven as a dependency" do
+          expect(dependencies.map(&:name)).not_to include("org.apache.maven:apache-maven")
+        end
+
+        it "does not include maven-wrapper as a dependency" do
+          expect(dependencies.map(&:name)).not_to include("org.apache.maven.wrapper:maven-wrapper")
         end
       end
     end

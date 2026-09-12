@@ -9,7 +9,7 @@ require "dependabot/cargo/file_updater/lockfile_updater"
 RSpec.describe Dependabot::Cargo::FileUpdater::LockfileUpdater do
   let(:updater) do
     described_class.new(
-      dependencies: [dependency],
+      dependencies: dependencies,
       dependency_files: dependency_files,
       credentials: [{
         "type" => "git_source",
@@ -17,6 +17,7 @@ RSpec.describe Dependabot::Cargo::FileUpdater::LockfileUpdater do
       }]
     )
   end
+  let(:dependencies) { [dependency] }
 
   let(:dependency_files) { [manifest, lockfile] }
   let(:manifest) do
@@ -112,16 +113,18 @@ RSpec.describe Dependabot::Cargo::FileUpdater::LockfileUpdater do
     end
 
     context "when the dependency doesn't exist" do
-      random_unlikely_package_name = (0...255).map { ("a".."z").to_a[rand(26)] }.join
-      content = <<~CONTENT
-        [package]
-        name = "foo"
-        version = "0.1.0"
-        authors = ["me"]
+      let(:random_unlikely_package_name) { (0...255).map { ("a".."z").to_a[rand(26)] }.join }
+      let(:content) do
+        <<~CONTENT
+          [package]
+          name = "foo"
+          version = "0.1.0"
+          authors = ["me"]
 
-        [dependencies]
-        #{random_unlikely_package_name} = "99.99.99"
-      CONTENT
+          [dependencies]
+          #{random_unlikely_package_name} = "99.99.99"
+        CONTENT
+      end
 
       let(:manifest) do
         Dependabot::DependencyFile.new(name: "Cargo.toml", content: content)
@@ -137,14 +140,16 @@ RSpec.describe Dependabot::Cargo::FileUpdater::LockfileUpdater do
     end
 
     context "when the package doesn't exist at the git source" do
-      content = <<~CONTENT
-        [package]
-        name = "foo"
-        version = "0.1.0"
-        authors = ["me"]
-        [dependencies]
-        yewtil = { git = "https://github.com/yewstack/yew" }
-      CONTENT
+      let(:content) do
+        <<~CONTENT
+          [package]
+          name = "foo"
+          version = "0.1.0"
+          authors = ["me"]
+          [dependencies]
+          yewtil = { git = "https://github.com/yewstack/yew" }
+        CONTENT
+      end
 
       let(:manifest) do
         Dependabot::DependencyFile.new(name: "Cargo.toml", content: content)
@@ -257,6 +262,348 @@ RSpec.describe Dependabot::Cargo::FileUpdater::LockfileUpdater do
         end
       end
 
+      context "with multiple locked versions of a transitive dependency" do
+        let(:manifest_fixture_name) { "multiple_locked_versions" }
+        let(:lockfile_fixture_name) { "multiple_locked_versions" }
+        let(:dependency_name) { "getrandom" }
+        let(:dependency_version) { "0.4.3" }
+        let(:dependency_previous_version) { "0.4.2" }
+        let(:requirements) { [] }
+        let(:previous_requirements) { [] }
+        let(:updated_getrandom_versions) do
+          TomlRB.parse(updated_lockfile_content).fetch("package")
+                .select { |package| package["name"] == "getrandom" }
+                .map { |package| Gem::Version.new(package.fetch("version")) }
+        end
+
+        it "updates only the requested locked package" do
+          expect(updated_getrandom_versions).to include(Gem::Version.new("0.2.17"))
+          expect(updated_getrandom_versions).to include(
+            satisfy { |version| version >= Gem::Version.new("0.4.3") && version < Gem::Version.new("0.5.0") }
+          )
+          expect(updated_getrandom_versions).not_to include(Gem::Version.new("0.4.2"))
+        end
+
+        context "when more than one locked line is independently updateable" do
+          let(:dependencies) do
+            [
+              Dependabot::Dependency.new(
+                name: "getrandom",
+                version: "0.2.18",
+                previous_version: "0.2.17",
+                requirements: [],
+                previous_requirements: [],
+                package_manager: "cargo"
+              ),
+              dependency
+            ]
+          end
+          let(:commands) { [] }
+
+          before do
+            allow(updater).to receive(:run_cargo_command) do |command, **|
+              commands << command
+
+              content = File.read("Cargo.lock")
+              if command.include?("getrandom:0.2.17")
+                content = content.sub(
+                  %(name = "getrandom"\nversion = "0.2.17"),
+                  %(name = "getrandom"\nversion = "0.2.18")
+                )
+              end
+              if command.include?("getrandom:0.4.2")
+                content = content.sub(
+                  %(name = "getrandom"\nversion = "0.4.2"),
+                  %(name = "getrandom"\nversion = "0.4.3")
+                )
+              end
+              File.write("Cargo.lock", content)
+            end
+          end
+
+          it "applies each exact package update" do
+            expect(updated_lockfile_content).to include(%(name = "getrandom"\nversion = "0.2.18"))
+            expect(updated_lockfile_content).to include(%(name = "getrandom"\nversion = "0.4.3"))
+            expect(commands).to eq(
+              ["cargo update -p getrandom:0.2.17", "cargo update -p getrandom:0.4.2"]
+            )
+          end
+
+          context "when the first command already resolves the second line" do
+            before do
+              allow(updater).to receive(:run_cargo_command) do |command, **|
+                commands << command
+                next unless command.include?("getrandom:0.2.17")
+
+                content = File.read("Cargo.lock")
+                content = content.sub(
+                  %(name = "getrandom"\nversion = "0.2.17"),
+                  %(name = "getrandom"\nversion = "0.2.18")
+                )
+                content = content.sub(
+                  %(name = "getrandom"\nversion = "0.4.2"),
+                  %(name = "getrandom"\nversion = "0.4.3")
+                )
+                File.write("Cargo.lock", content)
+              end
+            end
+
+            it "skips the consumed package specification" do
+              expect(updated_lockfile_content).to include(%(name = "getrandom"\nversion = "0.2.18"))
+              expect(updated_lockfile_content).to include(%(name = "getrandom"\nversion = "0.4.3"))
+              expect(commands).to eq(["cargo update -p getrandom:0.2.17"])
+            end
+          end
+        end
+
+        context "when Cargo leaves the requested lower line unchanged" do
+          let(:dependency_version) { "0.2.18" }
+          let(:dependency_previous_version) { "0.2.17" }
+
+          before do
+            allow(updater).to receive(:run_cargo_command)
+          end
+
+          it "rejects the unchanged package even though a higher line exists" do
+            expect { updated_lockfile_content }.to raise_error("Failed to update getrandom!")
+          end
+        end
+      end
+
+      context "when a shared dependency family in a real workspace needs a lockstep update" do
+        # Regression for issue #16092. Mocking the subprocess (rather than
+        # resolving live) keeps this deterministic: otherwise future
+        # `futures`/transitive releases would drift the lockfile and break the
+        # spec. `tower` pins the shared `futures-*` siblings, so a plain
+        # `cargo update -p futures:0.3.33` is a genuine no-op and only the
+        # `--precise` retry moves the whole family in lockstep.
+        let(:dependency_files) { project_dependency_files("futures_lockstep_workspace") }
+        let(:dependency_name) { "futures" }
+        let(:dependency_version) { "0.3.34" }
+        let(:dependency_previous_version) { "0.3.33" }
+        let(:requirements) do
+          [{ file: "Cargo.toml", requirement: "0.3", groups: ["workspace.dependencies"], source: nil }]
+        end
+        let(:previous_requirements) { requirements }
+        let(:commands) { [] }
+        let(:resolved_lockfile) do
+          fixture("updated_projects", "futures_lockstep_workspace", "Cargo.lock")
+        end
+
+        before do
+          # Read the fixture before the updater changes cwd into a temp dir.
+          resolved = resolved_lockfile
+          allow(updater).to receive(:run_cargo_command) do |command, **|
+            commands << command
+            File.write("Cargo.lock", resolved) if command.include?("--precise")
+          end
+        end
+
+        it "forces --precise so the whole futures family moves to 0.3.34" do
+          expect(updated_lockfile_content).to include(%(name = "futures"\nversion = "0.3.34"))
+          %w(futures futures-channel futures-core futures-executor futures-io
+             futures-macro futures-sink futures-task futures-util).each do |crate|
+            expect(updated_lockfile_content).to include(%(name = "#{crate}"\nversion = "0.3.34"))
+          end
+          expect(updated_lockfile_content).to include(
+            "9a31d2a3fbaaeb2af2368bbdd904aa8e812d3c04a1ee10d3171f52d556e5d0a3"
+          )
+          expect(commands).to eq(
+            [
+              "cargo update -p futures:0.3.33",
+              "cargo update -p futures:0.3.33 --precise 0.3.34"
+            ]
+          )
+        end
+      end
+
+      context "when the target major already coexists and the plain update repoints an edge" do
+        # bitflags coexists at two majors:
+        #   app    -> 1.3.2   (manifest bumped 1.3 -> 2.4)
+        #   keeper -> 1.3.2   (pins 1.3)
+        #   other  -> 2.13.1  (pins 2.4)
+        #
+        # The plain update just repoints app's edge onto the existing 2.13.1:
+        #   app: 1.3.2 -> 2.13.1   (keeper stays 1.3.2)
+        # That is a genuine move, so no `--precise` retry - which would fail
+        # anyway because keeper still needs 1.3.
+        let(:dependency_files) { project_dependency_files("bitflags_coexisting") }
+        let(:dependency_name) { "bitflags" }
+        let(:dependency_version) { "2.13.1" }
+        let(:dependency_previous_version) { "1.3.2" }
+        let(:requirements) do
+          [{ file: "app/Cargo.toml", requirement: "2.4", groups: ["dependencies"], source: nil }]
+        end
+        let(:previous_requirements) { requirements }
+        let(:commands) { [] }
+        let(:resolved_lockfile) do
+          fixture("updated_projects", "bitflags_coexisting", "Cargo.lock")
+        end
+
+        before do
+          resolved = resolved_lockfile
+          allow(updater).to receive(:run_cargo_command) do |command, **|
+            commands << command
+            File.write("Cargo.lock", resolved) unless command.include?("--precise")
+          end
+        end
+
+        it "respects the repointed edge and does not force a doomed --precise" do
+          expect(updated_lockfile_content)
+            .to include(%(name = "app"\nversion = "0.1.0"\ndependencies = [\n "bitflags 2.13.1",))
+          expect(commands).to eq(["cargo update -p bitflags:1.3.2"])
+        end
+      end
+
+      context "when the previous version also exists from another source" do
+        let(:manifest_fixture_name) { "duplicate_source_versions" }
+        let(:lockfile_fixture_name) { "duplicate_source_versions" }
+        let(:dependency_name) { "anyhow" }
+        let(:dependency_version) { "1.0.104" }
+        let(:dependency_previous_version) { "1.0.103" }
+        let(:requirements) { [] }
+        let(:previous_requirements) { [] }
+
+        before do
+          allow(updater).to receive(:run_cargo_command) do
+            content = File.read("Cargo.lock")
+            File.write(
+              "Cargo.lock",
+              content.sub(
+                %(name = "anyhow"\nversion = "1.0.103"\nsource = "registry),
+                %(name = "anyhow"\nversion = "1.0.104"\nsource = "registry)
+              )
+            )
+          end
+        end
+
+        it "accepts the update when a git copy of the previous version remains" do
+          expect(updated_lockfile_content).to include(%(name = "anyhow"\nversion = "1.0.104"\nsource = "registry))
+          expect(updated_lockfile_content).to include(%(version = "1.0.103"\nsource = "git+))
+        end
+
+        context "when Cargo leaves the registry line unchanged" do
+          before do
+            allow(updater).to receive(:run_cargo_command)
+          end
+
+          it "still rejects the unchanged package" do
+            expect { updated_lockfile_content }.to raise_error("Failed to update anyhow!")
+          end
+        end
+
+        context "when only the git line moved to the desired version" do
+          before do
+            allow(updater).to receive(:run_cargo_command) do
+              content = File.read("Cargo.lock")
+              File.write(
+                "Cargo.lock",
+                content.sub(
+                  %(version = "1.0.103"\nsource = "git+),
+                  %(version = "1.0.104"\nsource = "git+)
+                )
+              )
+            end
+          end
+
+          it "rejects the update of the wrong source's line" do
+            expect { updated_lockfile_content }.to raise_error("Failed to update anyhow!")
+          end
+        end
+
+        context "when only the git copy carries the desired version" do
+          let(:dependency) do
+            Dependabot::Dependency.new(
+              name: "anyhow",
+              version: "1.0.104",
+              previous_version: "1.0.103",
+              requirements: [],
+              previous_requirements: [],
+              package_manager: "cargo",
+              metadata: { cargo_package_source: "registry+https://github.com/rust-lang/crates.io-index" }
+            )
+          end
+          let(:registry_entry) do
+            <<~ENTRY
+              [[package]]
+              name = "anyhow"
+              version = "1.0.103"
+              source = "registry+https://github.com/rust-lang/crates.io-index"
+              checksum = "a0d55e7d47770a83cb46b28ea9e11ab7f9a109d1c2ba6a2b26b9563b6ac290f6"
+
+            ENTRY
+          end
+
+          before do
+            allow(updater).to receive(:run_cargo_command) do
+              content = File.read("Cargo.lock")
+              content = content.sub(registry_entry, "")
+              content = content.sub(
+                %(version = "1.0.103"\nsource = "git+),
+                %(version = "1.0.104"\nsource = "git+)
+              )
+              File.write("Cargo.lock", content)
+            end
+          end
+
+          it "does not accept another source's copy of the desired version" do
+            expect { updated_lockfile_content }.to raise_error("Failed to update anyhow!")
+          end
+        end
+      end
+
+      context "when the previous version line is retained by another dependent" do
+        let(:manifest_fixture_name) { "retained_previous_version" }
+        let(:lockfile_fixture_name) { "retained_previous_version" }
+        let(:dependency_name) { "windows-sys" }
+        let(:dependency_version) { "0.59.0" }
+        let(:dependency_previous_version) { "0.52.0" }
+        let(:requirements) do
+          [{ file: "Cargo.toml", requirement: "=0.59.0", groups: ["dependencies"], source: nil }]
+        end
+        let(:previous_requirements) do
+          [{ file: "Cargo.toml", requirement: "=0.52.0", groups: ["dependencies"], source: nil }]
+        end
+
+        it "accepts the update when Cargo keeps the old line for other dependents" do
+          expect(updated_lockfile_content).to include(%(name = "windows-sys"\nversion = "0.59.0"))
+          expect(updated_lockfile_content).to include(%(name = "windows-sys"\nversion = "0.52.0"))
+        end
+      end
+
+      context "when the dependency comes from a sparse registry" do
+        let(:manifest_fixture_name) { "sparse_registry_dependency" }
+        let(:lockfile_fixture_name) { "sparse_registry_dependency" }
+        let(:dependency_name) { "internal-api" }
+        let(:dependency_version) { "1.4.1" }
+        let(:dependency_previous_version) { "1.4.0" }
+        let(:requirements) { [] }
+        let(:previous_requirements) { [] }
+
+        before do
+          allow(updater).to receive(:run_cargo_command) do
+            content = File.read("Cargo.lock")
+            File.write("Cargo.lock", content.sub(%(version = "1.4.0"), %(version = "1.4.1")))
+          end
+        end
+
+        it "validates the update against the sparse registry entry" do
+          expect(updated_lockfile_content).to include(%(name = "internal-api"\nversion = "1.4.1"))
+        end
+
+        context "when a same-name source-less package carries the desired version" do
+          let(:lockfile_fixture_name) { "sparse_registry_workspace_shadow" }
+
+          before do
+            allow(updater).to receive(:run_cargo_command)
+          end
+
+          it "does not accept the workspace package as the update" do
+            expect { updated_lockfile_content }.to raise_error("Failed to update internal-api!")
+          end
+        end
+      end
+
       context "with an old format lockfile" do
         let(:manifest_fixture_name) { "old_lockfile" }
         let(:lockfile_fixture_name) { "old_lockfile" }
@@ -302,6 +649,223 @@ RSpec.describe Dependabot::Cargo::FileUpdater::LockfileUpdater do
             .to include("utf8-ranges#be9b8dfcaf449453cbf83ac85260ee80323f4f77")
         end
 
+        context "when the tracked reference resolves to a different commit" do
+          before do
+            allow(updater).to receive(:run_cargo_command) do
+              content = File.read("Cargo.lock")
+              File.write(
+                "Cargo.lock",
+                content.gsub(
+                  "83141b376b93484341c68fbca3ca110ae5cd2708",
+                  "0123456789abcdef0123456789abcdef01234567"
+                )
+              )
+            end
+          end
+
+          it "accepts the commit Cargo resolved" do
+            expect(updated_lockfile_content)
+              .to include("utf8-ranges#0123456789abcdef0123456789abcdef01234567")
+          end
+        end
+
+        context "when the lockfile only has the crate from another repository" do
+          let(:lockfile_fixture_name) { "git_dependency_foreign_repo" }
+
+          before do
+            allow(updater).to receive(:run_cargo_command)
+          end
+
+          it "does not accept the same-name crate from a different repository" do
+            expect { updated_lockfile_content }.to raise_error("Failed to update utf8-ranges!")
+          end
+        end
+
+        context "when the previous version is an abbreviated SHA and nothing moved" do
+          let(:dependency_previous_version) { "83141b3" }
+
+          before do
+            allow(updater).to receive(:run_cargo_command)
+          end
+
+          it "still rejects the unchanged git line" do
+            expect { updated_lockfile_content }.to raise_error("Failed to update utf8-ranges!")
+          end
+        end
+
+        context "when the same repository is locked at multiple refs" do
+          let(:manifest_fixture_name) { "git_dependency_multiple_refs" }
+          let(:lockfile_fixture_name) { "git_dependency_multiple_refs" }
+          let(:previous_requirements) do
+            [{
+              file: "Cargo.toml",
+              requirement: nil,
+              groups: ["dependencies"],
+              source: {
+                type: "git",
+                url: "https://github.com/BurntSushi/utf8-ranges",
+                branch: "main",
+                ref: nil
+              }
+            }]
+          end
+
+          before do
+            allow(updater).to receive(:run_cargo_command) do
+              content = File.read("Cargo.lock")
+              File.write(
+                "Cargo.lock",
+                content.sub(
+                  "?branch=main#83141b376b93484341c68fbca3ca110ae5cd2708",
+                  "?branch=main#0123456789abcdef0123456789abcdef01234567"
+                )
+              )
+            end
+          end
+
+          it "accepts drift on the targeted ref while the other ref keeps the old commit" do
+            expect(updated_lockfile_content)
+              .to include("?branch=main#0123456789abcdef0123456789abcdef01234567")
+            expect(updated_lockfile_content)
+              .to include("?branch=stable#83141b376b93484341c68fbca3ca110ae5cd2708")
+          end
+
+          context "when another ref already carries the expected commit" do
+            before do
+              allow(updater).to receive(:run_cargo_command) do
+                content = File.read("Cargo.lock")
+                File.write(
+                  "Cargo.lock",
+                  content.sub(
+                    "?branch=stable#83141b376b93484341c68fbca3ca110ae5cd2708",
+                    "?branch=stable#be9b8dfcaf449453cbf83ac85260ee80323f4f77"
+                  )
+                )
+              end
+            end
+
+            it "does not accept the other ref's commit for the targeted line" do
+              expect { updated_lockfile_content }.to raise_error("Failed to update utf8-ranges!")
+            end
+          end
+
+          context "when the dependency tracks the default branch but entries stay ref-qualified" do
+            let(:requirements) { previous_requirements }
+            let(:previous_requirements) do
+              [{
+                file: "Cargo.toml",
+                requirement: nil,
+                groups: ["dependencies"],
+                source: {
+                  type: "git",
+                  url: "https://github.com/BurntSushi/utf8-ranges",
+                  branch: nil,
+                  ref: nil
+                }
+              }]
+            end
+
+            before do
+              allow(updater).to receive(:run_cargo_command) do
+                content = File.read("Cargo.lock")
+                File.write(
+                  "Cargo.lock",
+                  content.sub(
+                    "?branch=main#83141b376b93484341c68fbca3ca110ae5cd2708",
+                    "?branch=main#be9b8dfcaf449453cbf83ac85260ee80323f4f77"
+                  )
+                )
+              end
+            end
+
+            it "rejects the commit still serialized under the old branch" do
+              expect { updated_lockfile_content }.to raise_error("Failed to update utf8-ranges!")
+            end
+          end
+
+          context "when a prefix-related repository carries the expected commit" do
+            let(:lockfile_fixture_name) { "git_dependency_prefix_fork" }
+
+            before do
+              allow(updater).to receive(:run_cargo_command)
+            end
+
+            it "does not accept the crate from the prefix-related repository" do
+              expect { updated_lockfile_content }.to raise_error("Failed to update utf8-ranges!")
+            end
+          end
+        end
+
+        context "when the update changes the tracked tag" do
+          let(:manifest_fixture_name) { "git_dependency_tag_change" }
+          let(:lockfile_fixture_name) { "git_dependency_tag_change" }
+          let(:requirements) do
+            [{
+              file: "Cargo.toml",
+              requirement: nil,
+              groups: ["dependencies"],
+              source: {
+                type: "git",
+                url: "https://github.com/BurntSushi/utf8-ranges",
+                branch: nil,
+                ref: "v2"
+              }
+            }]
+          end
+          let(:previous_requirements) do
+            [{
+              file: "Cargo.toml",
+              requirement: nil,
+              groups: ["dependencies"],
+              source: {
+                type: "git",
+                url: "https://github.com/BurntSushi/utf8-ranges",
+                branch: nil,
+                ref: "v1"
+              }
+            }]
+          end
+
+          context "when the new tag's line drifts while another ref keeps the old commit" do
+            before do
+              allow(updater).to receive(:run_cargo_command) do
+                content = File.read("Cargo.lock")
+                File.write(
+                  "Cargo.lock",
+                  content.sub(
+                    "?tag=v1#83141b376b93484341c68fbca3ca110ae5cd2708",
+                    "?tag=v2#0123456789abcdef0123456789abcdef01234567"
+                  )
+                )
+              end
+            end
+
+            it "accepts the commit resolved for the new tag" do
+              expect(updated_lockfile_content)
+                .to include("?tag=v2#0123456789abcdef0123456789abcdef01234567")
+            end
+          end
+
+          context "when the new tag never appears and another ref carries the expected commit" do
+            before do
+              allow(updater).to receive(:run_cargo_command) do
+                content = File.read("Cargo.lock")
+                File.write(
+                  "Cargo.lock",
+                  content.sub(
+                    "?branch=main#83141b376b93484341c68fbca3ca110ae5cd2708",
+                    "?branch=main#be9b8dfcaf449453cbf83ac85260ee80323f4f77"
+                  )
+                )
+              end
+            end
+
+            it "fails validation instead of accepting the other ref" do
+              expect { updated_lockfile_content }.to raise_error("Failed to update utf8-ranges!")
+            end
+          end
+        end
+
         context "with an ssh URl" do
           let(:manifest_fixture_name) { "git_dependency_ssh" }
           let(:lockfile_fixture_name) { "git_dependency_ssh" }
@@ -322,12 +886,91 @@ RSpec.describe Dependabot::Cargo::FileUpdater::LockfileUpdater do
 
           it "updates the dependency version in the lockfile" do
             expect(updated_lockfile_content)
-              .to include("git+ssh://git@github.com/BurntSushi/utf8-ranges#" \
-                          "be9b8dfcaf449453cbf83ac85260ee80323f4f77")
+              .to include(
+                "git+ssh://git@github.com/BurntSushi/utf8-ranges#" \
+                "be9b8dfcaf449453cbf83ac85260ee80323f4f77"
+              )
             expect(updated_lockfile_content).not_to include("git+https://")
 
             content = updated_lockfile_content
             expect(content.scan('name = "utf8-ranges"').count).to eq(1)
+          end
+        end
+
+        context "with an ssh URL and feature-gated git dependency" do
+          let(:manifest_fixture_name) { "feature_gated_git_dep_ssh" }
+          let(:lockfile_fixture_name) { "feature_gated_git_dep_ssh" }
+          let(:dependency_name) { "time" }
+          let(:dependency_version) { "0.1.40" }
+          let(:dependency_previous_version) { "0.1.38" }
+          let(:requirements) { previous_requirements }
+          let(:previous_requirements) do
+            [{ file: "Cargo.toml", requirement: "0.1.12", groups: [], source: nil }]
+          end
+
+          let(:lockfile_on_disk) { [] }
+
+          before do
+            captured = lockfile_on_disk
+            allow(updater).to receive(:run_cargo_command) do |_command, **_kwargs|
+              lockfile_content = File.read("Cargo.lock")
+              captured << lockfile_content.dup
+
+              old_time = "version = \"0.1.38\"\n" \
+                         "source = \"registry+https://github.com/rust-lang/crates.io-index\"\n" \
+                         "dependencies = [\n" \
+                         " \"kernel32-sys"
+              new_time = "version = \"0.1.40\"\n" \
+                         "source = \"registry+https://github.com/rust-lang/crates.io-index\"\n" \
+                         "dependencies = [\n" \
+                         " \"kernel32-sys"
+              lockfile_content = lockfile_content.gsub(old_time, new_time)
+              lockfile_content = lockfile_content.gsub(
+                "d5d788d3aa77bc0ef3e9621256885555368b47bd495c13dd2e7413c89f845520",
+                "d825be0eb33fda1a7e68012d51e9c7f451dc1a69391e7fdc197060bb8c56667b"
+              )
+
+              # Simulate what cargo does when the lockfile has SSH but the
+              # manifest has HTTPS: it adds a second entry for the git dep
+              # resolved via HTTPS with only default-feature deps. This is
+              # the exact failure mode from the bug report. The fix prevents
+              # this by making the lockfile use HTTPS too, so cargo sees
+              # consistent sources and doesn't create a duplicate.
+              if lockfile_content.include?("git+ssh://")
+                # Bug case: lockfile still has SSH URLs while manifest has
+                # HTTPS, so cargo creates a second entry
+                lockfile_content += <<~ENTRY
+
+                  [[package]]
+                  name = "utf8-ranges"
+                  version = "1.0.0"
+                  source = "git+https://github.com/BurntSushi/utf8-ranges#83141b376b93484341c68fbca3ca110ae5cd2708"
+                  dependencies = [
+                   "serde 1.0.0",
+                  ]
+                ENTRY
+              end
+
+              File.write("Cargo.lock", lockfile_content)
+            end
+          end
+
+          it "swaps SSH to HTTPS in the lockfile so cargo sees consistent sources" do
+            updated_lockfile_content
+
+            expect(lockfile_on_disk.last).not_to include("git+ssh://")
+            expect(lockfile_on_disk.last).to include("git+https://")
+          end
+
+          it "produces a lockfile with no duplicate entries" do
+            content = updated_lockfile_content
+
+            expect(content).to include(%(name = "time"\nversion = "0.1.40"))
+            expect(content).not_to include("git+https://")
+            expect(content).to include("git+ssh://")
+            expect(content.scan('name = "utf8-ranges"').count).to eq(1)
+            expect(content).to include("chrono")
+            expect(content).to include("url")
           end
         end
 
@@ -515,6 +1158,271 @@ RSpec.describe Dependabot::Cargo::FileUpdater::LockfileUpdater do
           )
         end
       end
+
+      context "when cargo selects a different version due to dependency constraints" do
+        subject(:result) { updated_lockfile_content }
+
+        let(:previous_version) { Gem::Version.new(dependency_previous_version) }
+        let(:time_entry_regex) { /\[\[package\]\].*?name = "time".*?version = "(.*?)"/m }
+
+        context "when cargo selects a newer but different version" do
+          it "updates the dependency successfully" do
+            expect { result }.not_to raise_error
+
+            version_str = result.match(time_entry_regex)[1]
+            expect(Gem::Version.new(version_str)).to be > previous_version
+          end
+
+          # This test would fail without our implementation when cargo selects
+          # a different version than expected (e.g., 0.1.39 instead of 0.1.40)
+          context "when simulating version constraint scenario" do
+            let(:test_updater) do
+              described_class.new(
+                dependencies: [dependency],
+                dependency_files: dependency_files,
+                credentials: [{
+                  "type" => "git_source",
+                  "host" => "github.com"
+                }]
+              )
+            end
+
+            before do
+              # Mock the cargo update to return a different version
+              allow(test_updater).to receive(:run_cargo_command) do |command, _fingerprint|
+                if command.include?("cargo update")
+                  # Write a lockfile with 0.1.39 instead of expected 0.1.40
+                  constrained_lockfile = lockfile_body
+                                         .gsub("0.1.38", "0.1.39")
+                                         .gsub("d5d788d3aa77bc0ef3e9621256885555368b47bd495c13dd2e7413c89f845520",
+                                               "a36d7c4b3b2b3bb5f51754f7b778dcbf88e99cd3")
+                  File.write("Cargo.lock", constrained_lockfile)
+                end
+              end
+            end
+
+            it "still accepts the update when version differs from expected" do
+              # This would raise "Failed to update time!" without our fix
+              result = test_updater.updated_lockfile_content
+              expect(result).to include('version = "0.1.39"')
+            end
+          end
+        end
+
+        describe ".LOCKFILE_ENTRY_REGEX" do
+          let(:sample) do
+            <<~LOCK
+              [[package]]
+              name = "time"
+              version = "0.1.39"
+              source = "registry+https://github.com/rust-lang/crates.io-index"
+              checksum = "abc123"
+            LOCK
+          end
+
+          it "matches a package stanza" do
+            expect(sample).to match(described_class::LOCKFILE_ENTRY_REGEX)
+          end
+
+          it "captures multiple package entries" do
+            double_sample = sample + "\n" + sample.gsub("time", "other").gsub("0.1.39", "1.0.0")
+            matches = double_sample.scan(described_class::LOCKFILE_ENTRY_REGEX)
+            expect(matches.size).to eq(2)
+          end
+        end
+
+        describe "version comparison behavior" do
+          it "correctly identifies newer versions" do
+            expect(Gem::Version.new("0.1.39")).to be > previous_version
+            expect(Gem::Version.new("0.1.40")).to be > previous_version
+            expect(Gem::Version.new("0.1.37")).not_to be > previous_version
+          end
+        end
+
+        context "when an impossible version is requested" do
+          let(:dependency_version) { "99.0.0" }
+          let(:requirements) do
+            [{ file: "Cargo.toml", requirement: "99.0.0", groups: [], source: nil }]
+          end
+
+          it "raises HelperSubprocessFailed" do
+            expect { result }.to raise_error(Dependabot::SharedHelpers::HelperSubprocessFailed)
+          end
+        end
+      end
+
+      context "when there are multiple packages with ambiguous specification" do
+        it "catches ambiguous specification early and raises DependencyFileNotEvaluatable" do
+          # Mock cargo command to return ambiguous specification output
+          ambiguous_output = <<~OUTPUT
+            error: There are multiple `orion_conf` packages in your project, and the specification `orion_conf@0.1.5` is ambiguous.
+            Please re-run this command with one of the following specifications:
+             registry+https://github.com/rust-lang/crates.io-index#orion_conf@0.1.5
+             git+https://github.com/galaxy-sec/orion-conf.git?tag=v0.1.5#orion_conf@0.1.5
+          OUTPUT
+
+          # Mock the run_cargo_command method directly to simulate the ambiguous error
+          allow(updater).to receive(:run_cargo_command) do |_command, _options|
+            # Simulate what run_cargo_command does when it encounters ambiguous specification
+            regex = /There are multiple `([^`]+)` packages.*specification `([^`]+)` is ambiguous/
+            if regex.match?(ambiguous_output)
+              match = ambiguous_output.match(regex)
+              raise Dependabot::DependencyFileNotEvaluatable, "Ambiguous package specification: #{match[2]}"
+            end
+          end
+
+          # Expect it to raise DependencyFileNotEvaluatable with the short message
+          expect do
+            updater.updated_lockfile_content
+          end.to raise_error(
+            Dependabot::DependencyFileNotEvaluatable,
+            "Ambiguous package specification: orion_conf@0.1.5"
+          )
+        end
+      end
+
+      describe "binary path errors" do
+        let(:manifest_fixture_name) { "bare_version_specified" }
+        let(:lockfile_fixture_name) { "bare_version_specified" }
+
+        context "when binary path is invalid" do
+          before do
+            # Mock the cargo command to simulate binary path error
+            allow(updater).to receive(:run_cargo_command).and_raise(
+              Dependabot::SharedHelpers::HelperSubprocessFailed.new(
+                message: "couldn't find `src/chargebee_codegen.rs`. " \
+                         "Please specify bin.path if you want to use a non-default path.",
+                error_context: {}
+              )
+            )
+          end
+
+          it "raises a DependencyFileNotResolvable error with clear message" do
+            expect { updater.updated_lockfile_content }
+              .to raise_error(Dependabot::DependencyFileNotResolvable) do |error|
+                expect(error.message).to include("Source file 'src/chargebee_codegen.rs' not found")
+                expect(error.message).to include("Please check the bin.path configuration")
+              end
+          end
+        end
+
+        context "when binary target is not found" do
+          before do
+            # Mock the cargo command to simulate binary target not found error
+            allow(updater).to receive(:run_cargo_command).and_raise(
+              Dependabot::SharedHelpers::HelperSubprocessFailed.new(
+                message: "cannot find binary `my_binary` in package `my_package`",
+                error_context: {}
+              )
+            )
+          end
+
+          it "raises a DependencyFileNotResolvable error" do
+            expect { updater.updated_lockfile_content }
+              .to raise_error(Dependabot::DependencyFileNotResolvable) do |error|
+                expect(error.message).to include("Binary target 'my_binary' not found")
+                expect(error.message).to include("Please check the [[bin]] configuration")
+              end
+          end
+        end
+
+        context "when binary path with specific location is not found" do
+          before do
+            # Mock the specific error format from the actual log
+            allow(updater).to receive(:run_cargo_command).and_raise(
+              Dependabot::SharedHelpers::HelperSubprocessFailed.new(
+                message: "can't find `chargebee_codegen` bin at `src/bin/chargebee_codegen.rs` " \
+                         "or `src/bin/chargebee_codegen/main.rs`. " \
+                         "Please specify bin.path if you want to use a non-default path.",
+                error_context: {}
+              )
+            )
+          end
+
+          it "raises a DependencyFileNotResolvable error with specific path info" do
+            expect { updater.updated_lockfile_content }
+              .to raise_error(Dependabot::DependencyFileNotResolvable) do |error|
+                expect(error.message).to include("Binary 'chargebee_codegen' not found at expected path")
+                expect(error.message).to include("Please check the bin.path configuration")
+              end
+          end
+        end
+      end
+    end
+  end
+
+  # Pure, offline unit tests of the movement detector that decides whether a
+  # plain `cargo update` moved the dependency (if not, the `--precise` fallback
+  # fires). Each runs over a real cargo lockfile with one targeted edit, locking
+  # the three review fixes in place without a subprocess.
+  describe "#dependency_move_signature" do
+    subject(:moved?) do
+      updater.send(:dependency_move_signature, before_lockfile, dependency) !=
+        updater.send(:dependency_move_signature, after_lockfile, dependency)
+    end
+
+    let(:before_lockfile) { fixture("projects", project_name, "Cargo.lock") }
+
+    # Applies the block to the single `[[package]]` entry named `owner`.
+    def edit_block(content, owner, &block)
+      block_regex = /^\[\[package\]\]\nname = "#{Regexp.escape(owner)}"\n.*?(?=\n\[\[package\]\]|\z)/m
+      content.sub(block_regex, &block)
+    end
+
+    context "when only the dependency's own outgoing edges are re-rendered" do
+      # Cargo version-qualifies an outgoing edge once a sibling coexists,
+      # rewriting `futures`'s block without `futures` itself moving. Identity is
+      # name/version/source only, so this must not read as movement.
+      let(:project_name) { "futures_lockstep" }
+      let(:dependency_name) { "futures" }
+      let(:dependency_version) { "0.3.34" }
+      let(:dependency_previous_version) { "0.3.33" }
+      let(:after_lockfile) do
+        edit_block(before_lockfile, "futures") do |block|
+          block.sub(%( "futures-util",), %( "futures-util 0.3.33",))
+        end
+      end
+
+      it { is_expected.to be(false) }
+    end
+
+    context "when two parents swap the dependency's version between them" do
+      # app: 1.3.2 -> 2.13.1 and other: 2.13.1 -> 1.3.2. The globally-sorted set
+      # of edge strings is unchanged, so movement is only visible because each
+      # edge is qualified by its parent package.
+      let(:project_name) { "bitflags_coexisting" }
+      let(:dependency_name) { "bitflags" }
+      let(:dependency_version) { "2.13.1" }
+      let(:dependency_previous_version) { "1.3.2" }
+      let(:after_lockfile) do
+        swapped = edit_block(before_lockfile, "app") do |block|
+          block.sub(%( "bitflags 1.3.2",), %( "bitflags 2.13.1",))
+        end
+        edit_block(swapped, "other") do |block|
+          block.sub(%( "bitflags 2.13.1",), %( "bitflags 1.3.2",))
+        end
+      end
+
+      it { is_expected.to be(true) }
+    end
+  end
+
+  describe "#dependency_reference_edges" do
+    subject(:edges) { updater.send(:dependency_reference_edges, lockfile, dependency) }
+
+    # `nix 0.29.0` is locked twice - from crates.io and from the git tag - so
+    # two parents share name+version and differ only by `source`, both pointing
+    # at `bitflags 2.13.1`. The edges must stay distinct; dropping `source` from
+    # the parent id would collapse them and let a move between them cancel out.
+    let(:lockfile) { fixture("projects", "duplicate_source_parents", "Cargo.lock") }
+    let(:dependency_name) { "bitflags" }
+
+    it "qualifies duplicate-source parents distinctly by source" do
+      nix_edges = edges.select { |edge| edge.include?(%(name = "nix")) }
+      expect(nix_edges.length).to eq(2)
+      expect(nix_edges.uniq.length).to eq(2)
+      expect(nix_edges).to include(a_string_including('source = "registry+'))
+      expect(nix_edges).to include(a_string_including('source = "git+'))
     end
   end
 end

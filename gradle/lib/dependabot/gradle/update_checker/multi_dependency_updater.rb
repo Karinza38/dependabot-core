@@ -1,6 +1,7 @@
-# typed: true
+# typed: strong
 # frozen_string_literal: true
 
+require "sorbet-runtime"
 require "dependabot/gradle/file_parser"
 require "dependabot/gradle/update_checker"
 
@@ -8,21 +9,50 @@ module Dependabot
   module Gradle
     class UpdateChecker
       class MultiDependencyUpdater
+        extend T::Sig
+
         require_relative "version_finder"
         require_relative "requirements_updater"
 
-        def initialize(dependency:, dependency_files:, credentials:,
-                       target_version_details:, ignored_versions:,
-                       raise_on_ignored: false)
-          @dependency       = dependency
+        sig do
+          params(
+            dependency: Dependabot::Dependency,
+            dependency_files: T::Array[Dependabot::DependencyFile],
+            credentials: T::Array[Dependabot::Credential],
+            target_version_details: T.nilable(T::Hash[Symbol, Object]),
+            ignored_versions: T::Array[String],
+            raise_on_ignored: T::Boolean
+          ).void
+        end
+        def initialize(
+          dependency:,
+          dependency_files:,
+          credentials:,
+          target_version_details:,
+          ignored_versions:,
+          raise_on_ignored: false
+        )
+          @dependency = dependency
           @dependency_files = dependency_files
-          @credentials      = credentials
-          @target_version   = target_version_details&.fetch(:version)
-          @source_url       = target_version_details&.fetch(:source_url)
+          @credentials = credentials
+          @target_version = T.let(
+            version_from_details(target_version_details),
+            T.nilable(Dependabot::Gradle::Version)
+          )
+          @source_url = T.let(
+            source_url_from_details(target_version_details),
+            T.nilable(String)
+          )
           @ignored_versions = ignored_versions
           @raise_on_ignored = raise_on_ignored
+          @update_possible = T.let(nil, T.nilable(T::Boolean))
+          @updated_dependencies = T.let(nil, T.nilable(T::Array[Dependabot::Dependency]))
+          @dependencies_to_update = T.let(nil, T.nilable(T::Array[Dependabot::Dependency]))
+          @property_name = T.let(nil, T.nilable(String))
+          @dependency_set = T.let(nil, T.nilable(T::Hash[Symbol, String]))
+          @updated_requirements = T.let({}, T::Hash[String, T::Array[Dependabot::DependencyRequirement]])
         end
-
+        sig { returns(T::Boolean) }
         def update_possible?
           return false unless target_version
 
@@ -41,6 +71,7 @@ module Dependabot
             end
         end
 
+        sig { returns(T::Array[Dependabot::Dependency]) }
         def updated_dependencies
           raise "Update not possible!" unless update_possible?
 
@@ -59,13 +90,37 @@ module Dependabot
 
         private
 
+        sig { params(details: T.nilable(T::Hash[Symbol, Object])).returns(T.nilable(Dependabot::Gradle::Version)) }
+        def version_from_details(details)
+          version = details&.fetch(:version, nil)
+          version if version.is_a?(Dependabot::Gradle::Version)
+        end
+
+        sig { params(details: T.nilable(T::Hash[Symbol, Object])).returns(T.nilable(String)) }
+        def source_url_from_details(details)
+          source_url = details&.fetch(:source_url, nil)
+          source_url if source_url.is_a?(String)
+        end
+
+        sig { returns(Dependabot::Dependency) }
         attr_reader :dependency
+
+        sig { returns(T::Array[Dependabot::DependencyFile]) }
         attr_reader :dependency_files
+
+        sig { returns(T::Array[Dependabot::Credential]) }
         attr_reader :credentials
+
+        sig { returns(T.nilable(Dependabot::Gradle::Version)) }
         attr_reader :target_version
+
+        sig { returns(T.nilable(String)) }
         attr_reader :source_url
+
+        sig { returns(T::Array[String]) }
         attr_reader :ignored_versions
 
+        sig { returns(T::Array[Dependabot::Dependency]) }
         def dependencies_to_update
           @dependencies_to_update ||=
             Gradle::FileParser.new(
@@ -73,8 +128,8 @@ module Dependabot
               source: nil
             ).parse.select do |dep|
               dep.requirements.any? do |r|
-                tmp_p_name = r.dig(:metadata, :property_name)
-                tmp_dep_set = r.dig(:metadata, :dependency_set)
+                tmp_p_name = r.metadata_string("property_name")
+                tmp_dep_set = r.metadata_string_hash("dependency_set")
                 next true if property_name && tmp_p_name == property_name
 
                 dependency_set && tmp_dep_set == dependency_set
@@ -82,20 +137,22 @@ module Dependabot
             end
         end
 
+        sig { returns(T.nilable(String)) }
         def property_name
           @property_name ||= dependency.requirements
-                                       .find { |r| r.dig(:metadata, :property_name) }
-                                       &.dig(:metadata, :property_name)
+                                       .find { |r| r.metadata_string("property_name") }
+                                       &.metadata_string("property_name")
         end
 
+        sig { returns(T.nilable(T::Hash[Symbol, String])) }
         def dependency_set
           @dependency_set ||= dependency.requirements
-                                        .find { |r| r.dig(:metadata, :dependency_set) }
-                                        &.dig(:metadata, :dependency_set)
+                                        .find { |r| r.metadata_string_hash("dependency_set") }
+                                        &.metadata_string_hash("dependency_set")
         end
 
+        sig { params(dep: Dependabot::Dependency).returns(T::Array[Dependabot::DependencyRequirement]) }
         def updated_requirements(dep)
-          @updated_requirements ||= {}
           @updated_requirements[dep.name] ||=
             RequirementsUpdater.new(
               requirements: dep.requirements,

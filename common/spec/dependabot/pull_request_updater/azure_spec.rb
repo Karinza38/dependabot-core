@@ -37,12 +37,14 @@ RSpec.describe Dependabot::PullRequestUpdater::Azure do
   let(:temp_branch) { source_branch + "-temp" }
   let(:path) { "files/are/here" }
   let(:credentials) do
-    [Dependabot::Credential.new({
-      "type" => "git_source",
-      "host" => "dev.azure.com",
-      "username" => "x-access-token",
-      "password" => "token"
-    })]
+    [Dependabot::Credential.new(
+      {
+        "type" => "git_source",
+        "host" => "dev.azure.com",
+        "username" => "x-access-token",
+        "password" => "token"
+      }
+    )]
   end
 
   let(:gemfile) do
@@ -186,6 +188,25 @@ RSpec.describe Dependabot::PullRequestUpdater::Azure do
           .to_return(status: 200, body: fixture("azure", "update_ref_failed.json"))
 
         expect { updater.update }.to raise_error(Dependabot::PullRequestUpdater::Azure::PullRequestUpdateFailed)
+      end
+
+      context "when the commit response has no ref updates" do
+        before do
+          stub_request(:post, create_commit_url)
+            .to_return(
+              status: 201,
+              body: JSON.dump(refUpdates: []),
+              headers: json_header
+            )
+        end
+
+        it "raises a helpful error" do
+          expect { updater.update }
+            .to raise_error(
+              Dependabot::PullRequestUpdater::Azure::PullRequestUpdateFailed,
+              "created commit refUpdates must contain at least one object"
+            )
+        end
       end
     end
 

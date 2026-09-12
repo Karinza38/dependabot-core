@@ -78,48 +78,6 @@ RSpec.describe Dependabot::Maven::FileUpdater do
 
   it_behaves_like "a dependency file updater"
 
-  describe "#updated_files_regex" do
-    subject(:updated_files_regex) { described_class.updated_files_regex }
-
-    it "is not empty" do
-      expect(updated_files_regex).not_to be_empty
-    end
-
-    context "when files match the regex patterns" do
-      it "returns true for files that should be updated" do
-        matching_files = [
-          "pom.xml",
-          "subproject/pom.xml",
-          "extensions.xml",
-          "subproject/extensions.xml",
-          "somefile.xml",
-          "subproject/somefile.xml",
-          "configs/pom.xml",
-          "configs/somefile.xml"
-        ]
-
-        matching_files.each do |file_name|
-          expect(updated_files_regex).to(be_any { |regex| file_name.match?(regex) })
-        end
-      end
-
-      it "returns false for files that should not be updated" do
-        non_matching_files = [
-          "README.md",
-          ".github/workflow/main.yml",
-          "some_random_file.rb",
-          "requirements.txt",
-          "package-lock.json",
-          "package.json"
-        ]
-
-        non_matching_files.each do |file_name|
-          expect(updated_files_regex).not_to(be_any { |regex| file_name.match?(regex) })
-        end
-      end
-    end
-  end
-
   describe "#updated_dependency_files" do
     subject(:updated_files) { updater.updated_dependency_files }
 
@@ -128,6 +86,43 @@ RSpec.describe Dependabot::Maven::FileUpdater do
     end
 
     its(:length) { is_expected.to eq(1) }
+
+    context "when updating a dependency declared in a .target file" do
+      let(:target_body) { fixture("target-files", "example.target") }
+      let(:target_file) do
+        Dependabot::DependencyFile.new(content: target_body, name: "releng/myproject.target")
+      end
+      let(:dependency_files) { [pom, target_file] }
+      let(:dependency) do
+        Dependabot::Dependency.new(
+          name: "commons-io:commons-io",
+          version: "2.22.0",
+          requirements: [{
+            file: "releng/myproject.target",
+            requirement: "2.22.0",
+            groups: [],
+            source: nil,
+            metadata: { packaging_type: "jar" }
+          }],
+          previous_requirements: [{
+            file: "releng/myproject.target",
+            requirement: "2.11.0",
+            groups: [],
+            source: nil,
+            metadata: { packaging_type: "jar" }
+          }],
+          package_manager: "maven"
+        )
+      end
+
+      it "returns the updated .target file" do
+        expect(updated_files.map(&:name)).to include("releng/myproject.target")
+        updated_target_file = updated_files.find { |f| f.name == "releng/myproject.target" }
+
+        expect(updated_target_file&.content).to include("<version>2.22.0</version>")
+        expect(updated_target_file&.content).not_to include("<version>2.11.0</version>")
+      end
+    end
 
     describe "the updated pom file" do
       subject(:updated_pom_file) do
@@ -202,14 +197,14 @@ RSpec.describe Dependabot::Maven::FileUpdater do
             requirements: [{
               file: "pom.xml",
               requirement: "1.6.0.RELEASE",
-              groups: [],
+              groups: ["plugin"],
               source: nil,
               metadata: { packaging_type: "jar" }
             }],
             previous_requirements: [{
               file: "pom.xml",
               requirement: "1.5.8.RELEASE",
-              groups: [],
+              groups: ["plugin"],
               source: nil,
               metadata: { packaging_type: "jar" }
             }],
@@ -224,6 +219,259 @@ RSpec.describe Dependabot::Maven::FileUpdater do
         its(:content) { is_expected.to include("<version>0.7.9</version>") }
       end
 
+      context "with a transitive dependency not added to dependencyManagement with indentation 2" do
+        let(:pom_body) do
+          fixture("poms", "transitive_dependency_pom_version_not_defined.xml")
+        end
+        let(:dependency) do
+          Dependabot::Dependency.new(
+            name: "org.apache.zookeeper:zookeeper",
+            version: "3.7.2",
+            requirements: [{
+              file: "pom.xml",
+              requirement: "3.7.2",
+              groups: [],
+              source: nil,
+              metadata: { packaging_type: "jar" }
+            }],
+            previous_requirements: [{
+              file: "pom.xml",
+              requirement: "3.4.6",
+              groups: [],
+              source: nil,
+              metadata: { packaging_type: "jar" }
+            }],
+            package_manager: "maven"
+          )
+        end
+
+        its(:content) do
+          is_expected.to include(
+            "  <dependencyManagement>
+    <dependencies>
+      <dependency>
+        <groupId>org.apache.zookeeper</groupId>
+        <artifactId>zookeeper</artifactId>
+        <version>3.7.2</version>
+      </dependency>
+    </dependencies>
+  </dependencyManagement>"
+          )
+        end
+      end
+
+      context "with a transitive dependency not added to dependencyManagement with mixed indentation" do
+        let(:pom_body) do
+          fixture("poms", "transitive_dependency_pom_version_not_defined_mixed_indentation.xml")
+        end
+        let(:dependency) do
+          Dependabot::Dependency.new(
+            name: "org.apache.zookeeper:zookeeper",
+            version: "3.7.2",
+            requirements: [{
+              file: "pom.xml",
+              requirement: "3.7.2",
+              groups: [],
+              source: nil,
+              metadata: { packaging_type: "jar" }
+            }],
+            previous_requirements: [{
+              file: "pom.xml",
+              requirement: "3.4.6",
+              groups: [],
+              source: nil,
+              metadata: { packaging_type: "jar" }
+            }],
+            package_manager: "maven"
+          )
+        end
+
+        its(:content) do
+          is_expected.to include(
+            "  <dependencyManagement>
+    <dependencies>
+      <dependency>
+        <groupId>org.apache.zookeeper</groupId>
+        <artifactId>zookeeper</artifactId>
+        <version>3.7.2</version>
+      </dependency>
+    </dependencies>
+  </dependencyManagement>"
+          )
+        end
+      end
+
+      context "with a transitive dependency not in dependencyManagement and pom file doesn't have XML namespace" do
+        let(:pom_body) do
+          fixture("poms", "transitive_dependency_pom_version_not_defined_no_namespace.xml")
+        end
+        let(:dependency) do
+          Dependabot::Dependency.new(
+            name: "org.apache.zookeeper:zookeeper",
+            version: "3.7.2",
+            requirements: [{
+              file: "pom.xml",
+              requirement: "3.7.2",
+              groups: [],
+              source: nil,
+              metadata: { packaging_type: "jar" }
+            }],
+            previous_requirements: [{
+              file: "pom.xml",
+              requirement: "3.4.6",
+              groups: [],
+              source: nil,
+              metadata: { packaging_type: "jar" }
+            }],
+            package_manager: "maven"
+          )
+        end
+
+        its(:content) do
+          is_expected.to include(
+            "    <dependencyManagement>
+        <dependencies>
+            <dependency>
+                <groupId>org.apache.zookeeper</groupId>
+                <artifactId>zookeeper</artifactId>
+                <version>3.7.2</version>
+            </dependency>
+        </dependencies>
+    </dependencyManagement>"
+          )
+        end
+      end
+
+      context "with a transitive dependency already exists in dependencyManagement section" do
+        let(:pom_body) do
+          fixture("poms", "transitive_dependency_pom_version_defined.xml")
+        end
+        let(:dependency) do
+          Dependabot::Dependency.new(
+            name: "org.apache.zookeeper:zookeeper",
+            version: "3.7.2",
+            requirements: [{
+              file: "pom.xml",
+              requirement: "3.7.2",
+              groups: [],
+              source: nil,
+              metadata: { packaging_type: "jar" }
+            }],
+            previous_requirements: [{
+              file: "pom.xml",
+              requirement: "3.4.6",
+              groups: [],
+              source: nil,
+              metadata: { packaging_type: "jar" }
+            }],
+            package_manager: "maven"
+          )
+        end
+
+        its(:content) do
+          is_expected.to include(
+            "    <dependencyManagement>
+        <dependencies>
+            <dependency>
+                <groupId>org.apache.zookeeper</groupId>
+                <artifactId>zookeeper</artifactId>
+                <version>3.7.2</version>
+            </dependency>
+        </dependencies>
+    </dependencyManagement>"
+          )
+        end
+      end
+
+      context "with a new transitive dependency in existing dependencyManagement that is consistently formatted" do
+        let(:pom_body) do
+          fixture("poms", "transitive_dependency_pom_dep_management_exist.xml")
+        end
+        let(:dependency) do
+          Dependabot::Dependency.new(
+            name: "org.apache.zookeeper:zookeeper",
+            version: "3.7.2",
+            requirements: [{
+              file: "pom.xml",
+              requirement: "3.7.2",
+              groups: [],
+              source: nil,
+              metadata: { packaging_type: "jar" }
+            }],
+            previous_requirements: [{
+              file: "pom.xml",
+              requirement: "3.4.6",
+              groups: [],
+              source: nil,
+              metadata: { packaging_type: "jar" }
+            }],
+            package_manager: "maven"
+          )
+        end
+
+        its(:content) do
+          is_expected.to include(
+            "  <dependencyManagement>
+    <dependencies>
+      <dependency>
+        <groupId>org.junit</groupId>
+        <artifactId>junit-bom</artifactId>
+        <version>5.11.0</version>
+        <type>pom</type>
+        <scope>import</scope>
+      </dependency>
+      <dependency>
+        <groupId>org.apache.zookeeper</groupId>
+        <artifactId>zookeeper</artifactId>
+        <version>3.7.2</version>
+      </dependency>
+    </dependencies>
+  </dependencyManagement>"
+          )
+        end
+      end
+
+      context "with a new transitive dependency that is consistently formatted with tabs" do
+        let(:pom_body) do
+          fixture("poms", "transitive_dependency_pom_version_not_defined_with_tabs.xml")
+        end
+        let(:dependency) do
+          Dependabot::Dependency.new(
+            name: "org.apache.zookeeper:zookeeper",
+            version: "3.7.2",
+            requirements: [{
+              file: "pom.xml",
+              requirement: "3.7.2",
+              groups: [],
+              source: nil,
+              metadata: { packaging_type: "jar" }
+            }],
+            previous_requirements: [{
+              file: "pom.xml",
+              requirement: "3.4.6",
+              groups: [],
+              source: nil,
+              metadata: { packaging_type: "jar" }
+            }],
+            package_manager: "maven"
+          )
+        end
+
+        its(:content) do
+          is_expected.to include(
+            "	<dependencyManagement>
+		<dependencies>
+			<dependency>
+				<groupId>org.apache.zookeeper</groupId>
+				<artifactId>zookeeper</artifactId>
+				<version>3.7.2</version>
+			</dependency>
+		</dependencies>
+	</dependencyManagement>"
+          )
+        end
+      end
+
       context "with a repeated dependency" do
         let(:pom_body) { fixture("poms", "repeated_pom.xml") }
         let(:dependency) do
@@ -233,26 +481,26 @@ RSpec.describe Dependabot::Maven::FileUpdater do
             requirements: [{
               file: "pom.xml",
               requirement: "3.0.0-M2",
-              groups: [],
+              groups: ["plugin"],
               source: nil,
               metadata: { property_name: "maven-javadoc-plugin.version" }
             }, {
               file: "pom.xml",
               requirement: "3.0.0-M2",
-              groups: [],
+              groups: ["plugin"],
               source: nil,
               metadata: { packaging_type: "jar" }
             }],
             previous_requirements: [{
               file: "pom.xml",
               requirement: "3.0.0-M1",
-              groups: [],
+              groups: ["plugin"],
               source: nil,
               metadata: { property_name: "maven-javadoc-plugin.version" }
             }, {
               file: "pom.xml",
               requirement: "2.10.4",
-              groups: [],
+              groups: ["plugin"],
               source: nil,
               metadata: { packaging_type: "jar" }
             }],
@@ -644,8 +892,10 @@ RSpec.describe Dependabot::Maven::FileUpdater do
 
           it "updates the version in the POM" do
             expect(updated_pom_file.content)
-              .to include("<artifactId>basic-pom</artifactId>\n  " \
-                          "<version>5.0.0.RELEASE</version>")
+              .to include(
+                "<artifactId>basic-pom</artifactId>\n  " \
+                "<version>5.0.0.RELEASE</version>"
+              )
             expect(updated_pom_file.content)
               .to include("<version>4.5.3</version>")
           end
@@ -1175,6 +1425,201 @@ RSpec.describe Dependabot::Maven::FileUpdater do
           expect(updated_files.last.content)
             .to include("<version>5.0.0.RELEASE</version>")
         end
+      end
+    end
+  end
+
+  # Wrapper updates are grouped per wrapper so a grouped distribution + wrapper-plugin bump
+  # regenerates each wrapper exactly once (no duplicate/conflicting files), and a module wrapper is
+  # regenerated against its own pom rather than the repo root.
+  describe "#updated_dependency_files with the maven wrapper experiment" do
+    let(:wrapper_updater_class) { Dependabot::Maven::FileUpdater::WrapperUpdater }
+    let(:marker_file) do
+      Dependabot::DependencyFile.new(name: ".mvn/wrapper/maven-wrapper.properties", content: "updated", directory: "/")
+    end
+    let(:wrapper_double) { instance_double(wrapper_updater_class, update_files: [marker_file]) }
+
+    let(:properties_name) { ".mvn/wrapper/maven-wrapper.properties" }
+    let(:properties_file) { Dependabot::DependencyFile.new(name: properties_name, content: "distributionUrl=x\n") }
+    let(:dependency_files) { [pom, properties_file] }
+
+    let(:distribution_dep) do
+      Dependabot::Dependency.new(
+        name: "org.apache.maven:apache-maven",
+        version: "3.9.11",
+        previous_version: "3.9.9",
+        requirements: [{
+          requirement: "3.9.11",
+          file: properties_name,
+          source: { type: "maven-distribution", property: "distributionUrl", url: "https://example/3.9.11.zip" },
+          groups: [],
+          metadata: { distribution_version: "3.9.11", wrapper_version: "3.3.5" }
+        }],
+        package_manager: "maven"
+      )
+    end
+    let(:wrapper_dep) do
+      Dependabot::Dependency.new(
+        name: "org.apache.maven.wrapper:maven-wrapper",
+        version: "3.3.5",
+        previous_version: "3.3.4",
+        requirements: [{
+          requirement: "3.3.5",
+          file: properties_name,
+          source: { type: "maven-distribution", property: "wrapperVersion" },
+          groups: [],
+          metadata: { distribution_version: "3.9.11", wrapper_version: "3.3.5" }
+        }],
+        package_manager: "maven"
+      )
+    end
+    let(:dependencies) { [distribution_dep, wrapper_dep] }
+
+    before do
+      Dependabot::Experiments.register(:maven_wrapper_updater, true)
+      allow(wrapper_updater_class).to receive(:new).and_return(wrapper_double)
+    end
+
+    it "regenerates the shared wrapper exactly once for a grouped update" do
+      updater.updated_dependency_files
+      expect(wrapper_updater_class).to have_received(:new).once
+    end
+
+    it "does not emit the same wrapper file twice" do
+      names = updater.updated_dependency_files.map(&:name)
+      expect(names.count(properties_name)).to eq(1)
+    end
+
+    it "passes both resolved target versions to the single generator" do
+      captured = nil
+      allow(wrapper_updater_class).to receive(:new) do |**kwargs|
+        captured = kwargs
+        wrapper_double
+      end
+      updater.updated_dependency_files
+      expect(captured).to include(distribution_version: "3.9.11", wrapper_version: "3.3.5")
+    end
+
+    context "with string-keyed source and metadata" do
+      before do
+        [distribution_dep, wrapper_dep].each do |dependency|
+          requirement = dependency.requirements.first
+          requirement[:source] = requirement.source_hash.transform_keys(&:to_s)
+          requirement[:metadata] = requirement.metadata.transform_keys(&:to_s)
+        end
+      end
+
+      it "passes both resolved target versions to the single generator" do
+        captured = nil
+        allow(wrapper_updater_class).to receive(:new) do |**kwargs|
+          captured = kwargs
+          wrapper_double
+        end
+
+        updater.updated_dependency_files
+
+        expect(captured).to include(distribution_version: "3.9.11", wrapper_version: "3.3.5")
+      end
+    end
+
+    context "when the wrapper lives in a module (non-root)" do
+      let(:properties_name) { "module/.mvn/wrapper/maven-wrapper.properties" }
+      let(:module_pom) { Dependabot::DependencyFile.new(name: "module/pom.xml", content: "<project></project>") }
+      let(:dependency_files) { [pom, module_pom, properties_file] }
+      let(:dependencies) { [distribution_dep] }
+
+      it "selects the module pom as the build file" do
+        captured = nil
+        allow(wrapper_double).to receive(:update_files) do |bf|
+          captured = bf
+          [marker_file]
+        end
+        updater.updated_dependency_files
+        expect(captured.name).to eq("module/pom.xml")
+      end
+    end
+
+    context "when one dependency contains requirements for multiple wrappers" do
+      let(:module_properties_name) { "module/.mvn/wrapper/maven-wrapper.properties" }
+      let(:module_properties_file) do
+        Dependabot::DependencyFile.new(name: module_properties_name, content: "distributionUrl=y\n")
+      end
+      let(:module_pom) { Dependabot::DependencyFile.new(name: "module/pom.xml", content: "<project></project>") }
+      let(:dependency_files) { [pom, properties_file, module_pom, module_properties_file] }
+      let(:dependencies) do
+        [Dependabot::Dependency.new(
+          name: "org.apache.maven:apache-maven",
+          version: "3.9.11",
+          previous_version: "3.9.9",
+          requirements: [properties_name, module_properties_name].map do |file|
+            {
+              requirement: "3.9.11",
+              file: file,
+              source: {
+                type: "maven-distribution",
+                property: "distributionUrl",
+                url: "https://example/3.9.11.zip"
+              },
+              groups: [],
+              metadata: { distribution_version: "3.9.11", wrapper_version: "3.3.5" }
+            }
+          end,
+          package_manager: "maven"
+        )]
+      end
+
+      it "regenerates every wrapper with requirements scoped to its properties file" do
+        captured_dependencies = []
+        allow(wrapper_updater_class).to receive(:new) do |**kwargs|
+          captured_dependencies << kwargs.fetch(:dependency)
+          wrapper_double
+        end
+        updater.updated_dependency_files
+        expect(captured_dependencies.map { |dep| dep.requirements.map(&:file) })
+          .to contain_exactly([properties_name], [module_properties_name])
+      end
+    end
+
+    context "when a wrapper coordinate also has a regular POM requirement" do
+      let(:dependencies) do
+        [Dependabot::Dependency.new(
+          name: "org.apache.maven:apache-maven",
+          version: "3.9.11",
+          previous_version: "3.9.9",
+          requirements: [
+            distribution_dep.requirements.first,
+            {
+              requirement: "3.9.11",
+              file: "pom.xml",
+              source: nil,
+              groups: [],
+              metadata: { packaging_type: "jar" }
+            }
+          ],
+          previous_requirements: [
+            Dependabot::DependencyRequirement.create(
+              distribution_dep.requirements.first.merge(requirement: "3.9.9")
+            ),
+            {
+              requirement: "3.9.9",
+              file: "pom.xml",
+              source: nil,
+              groups: [],
+              metadata: { packaging_type: "jar" }
+            }
+          ],
+          package_manager: "maven"
+        )]
+      end
+
+      it "routes the non-wrapper requirement through the POM updater" do
+        captured_dependency = nil
+        allow(updater).to receive(:update_files_for_dependency) do |original_files:, dependency:|
+          captured_dependency = dependency
+          original_files
+        end
+        updater.updated_dependency_files
+        expect(captured_dependency.requirements.map(&:file)).to eq(["pom.xml"])
       end
     end
   end

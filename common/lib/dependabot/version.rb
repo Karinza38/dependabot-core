@@ -24,12 +24,34 @@ module Dependabot
       T.cast(super, Dependabot::Version)
     end
 
+    sig do
+      overridable
+        .params(_from_version: String, _to_version: String)
+        .returns(T.nilable(String))
+    end
+    def self.update_type(_from_version, _to_version)
+      nil
+    end
+
     # Opt-in to Rubygems 4 behavior
     sig { override.overridable.params(version: VersionParameter).returns(T::Boolean) }
     def self.correct?(version)
       return false if version.nil?
 
       version.to_s.match?(ANCHORED_VERSION_PATTERN)
+    end
+
+    # RubyGems 4 eagerly computes a numeric sort key in Gem::Version#initialize and
+    # skips it for prereleases. Dependabot's subclasses override #prerelease? with
+    # ecosystem-specific semantics, so a version with alphabetic segments (e.g.
+    # "1.0.0.RELEASE" or "2.0.0.post1") can report prerelease? == false and reach
+    # RubyGems' radix comparison, which raises when a segment is a String. Returning
+    # nil for those versions falls back to the segment-by-segment comparison.
+    sig { override.overridable.returns(T.nilable(Integer)) }
+    def compute_sort_key
+      return if canonical_segments.any?(String)
+
+      super
     end
 
     sig { overridable.returns(String) }
@@ -72,6 +94,38 @@ module Dependabot
     sig { returns(String) }
     def lowest_prerelease_suffix
       "a"
+    end
+
+    # https://semver.org/#is-there-a-suggested-regular-expression-regex-to-check-a-semver-string
+    SEMVER_REGEX = /
+            # major.minor.patch
+            ^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)
+            # pre-release
+            (?:-(
+              (?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*)
+              (?:\.(?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*))*
+            ))?
+            # build metadata
+            (?:\+(
+              [0-9a-zA-Z-]+(?:\.[0-9a-zA-Z-]+)*
+            ))?$/x
+
+    sig { params(version: String).returns(T::Boolean) }
+    def self.valid_semver?(version)
+      !version.match(SEMVER_REGEX).nil?
+    end
+
+    sig { returns(T.nilable([Integer, Integer, Integer])) }
+    def semver_parts
+      # Extracts only the numeric major.minor.patch part of the version, ensuring it starts with a number
+      match = to_semver.match(/^\d+(?:\.\d+)?(?:\.\d+)?(?=[^\d]|$)/)
+      return nil unless match
+
+      first_match = match[0]
+      return nil unless first_match
+
+      major, minor, patch = first_match.split(".").map(&:to_i)
+      [major || 0, minor || 0, patch || 0]
     end
   end
 end

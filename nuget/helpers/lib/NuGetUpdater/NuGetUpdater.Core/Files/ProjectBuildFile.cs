@@ -8,14 +8,17 @@ internal sealed class ProjectBuildFile : XmlBuildFile
         => Parse(basePath, path, File.ReadAllText(path));
 
     public static ProjectBuildFile Parse(string basePath, string path, string xml)
-        => new(basePath, path, Parser.ParseText(xml));
+        => new(basePath, path, Parse(xml));
 
     public ProjectBuildFile(string basePath, string path, XmlDocumentSyntax contents)
         : base(basePath, path, contents)
     {
     }
 
-    public IXmlElementSyntax ProjectNode => Contents.RootSyntax;
+    public static XmlDocumentSyntax Parse(string contents) => Parser.ParseText(contents);
+
+    public IXmlElementSyntax ProjectNode => Contents.RootSyntax
+        ?? throw new UnparseableFileException("Project file does not contain a root element", Path);
 
     public IEnumerable<IXmlElementSyntax> SdkNodes => ProjectNode
         .GetElements("Sdk", StringComparison.OrdinalIgnoreCase);
@@ -106,12 +109,10 @@ internal sealed class ProjectBuildFile : XmlBuildFile
             return null;
         }
 
-        var isVersionOverride = false;
         var version = element.GetAttributeOrSubElementValue("Version", StringComparison.OrdinalIgnoreCase);
         if (version is null)
         {
             version = element.GetAttributeOrSubElementValue("VersionOverride", StringComparison.OrdinalIgnoreCase);
-            isVersionOverride = version is not null;
         }
 
         dependencies.AddRange(
@@ -120,8 +121,7 @@ internal sealed class ProjectBuildFile : XmlBuildFile
                         Name: dep.Trim(),
                         Version: string.IsNullOrEmpty(version) ? null : version,
                         Type: GetDependencyType(element.Name),
-                        IsUpdate: isUpdate,
-                        IsOverride: isVersionOverride))
+                        IsUpdate: isUpdate))
         );
 
 
@@ -143,17 +143,69 @@ internal sealed class ProjectBuildFile : XmlBuildFile
         .Where(e =>
             e.Name.Equals("ProjectReference", StringComparison.OrdinalIgnoreCase) ||
             e.Name.Equals("ProjectFile", StringComparison.OrdinalIgnoreCase))
-        .Select(e => PathHelper.GetFullPathFromRelative(System.IO.Path.GetDirectoryName(Path)!, e.GetAttribute("Include").Value));
+        .Select(e => e.GetAttributeValueCaseInsensitive("Include")
+            ?? throw new UnparseableFileException($"`{e.Name}` element missing `Include` attribute", Path))
+        .Select(include => PathHelper.GetFullPathFromRelative(System.IO.Path.GetDirectoryName(Path)!, include));
 
     public void NormalizeDirectorySeparatorsInProject()
     {
+        // `//Reference/HintPath`
         var hintPathNodes = Contents.Descendants()
             .Where(e =>
                 e.Name.Equals("HintPath", StringComparison.OrdinalIgnoreCase) &&
-                e.Parent.Name.Equals("Reference", StringComparison.OrdinalIgnoreCase))
-            .Select(e => (XmlElementSyntax)e.AsNode);
+                (e.Parent?.Name ?? "").Equals("Reference", StringComparison.OrdinalIgnoreCase))
+            .Select(e => e.AsNode)
+            .OfType<XmlElementSyntax>();
         var updatedXml = Contents.ReplaceNodes(hintPathNodes,
             (_, n) => n.WithContent(n.GetContentValue().Replace("/", "\\")).AsNode);
+        Update(updatedXml);
+
+        // `//Target/Error[starts-with(@Condition, '!Exists(' and Text)]`
+        var errorsWithConditions = Contents.Descendants()
+            .Where(e =>
+                e.Name.Equals("Error", StringComparison.OrdinalIgnoreCase) &&
+                (e.Parent?.Name ?? "").Equals("Target", StringComparison.OrdinalIgnoreCase) &&
+                e.GetAttributeValue("Condition")?.StartsWith("!Exists(") == true &&
+                e.GetAttribute("Text") is not null)
+            .Select(e => e.AsNode)
+            .OfType<XmlEmptyElementSyntax>();
+        updatedXml = Contents.ReplaceNodes(errorsWithConditions,
+            (_, n) =>
+            {
+                var conditionAttr = n.GetAttribute("Condition")
+                    ?? throw new InvalidOperationException("Expected Error element to have a Condition attribute");
+                var newConditionAttr = conditionAttr.WithValue(conditionAttr.Value.Replace("/", "\\"));
+                n = (XmlEmptyElementSyntax)n.ReplaceAttribute(conditionAttr, newConditionAttr).AsNode;
+
+                var textAttr = n.GetAttribute("Text")
+                    ?? throw new InvalidOperationException("Expected Error element to have a Text attribute");
+                var newTextAttr = textAttr.WithValue(textAttr.Value.Replace("/", "\\"));
+                return n.ReplaceAttribute(textAttr, newTextAttr).AsNode;
+            });
+        Update(updatedXml);
+
+        // `/Project/Import[starts-with(@Condition, 'Exists(') and Project]`
+        var importsWithConditions = Contents.Descendants()
+            .Where(e =>
+                e.Name.Equals("Import", StringComparison.OrdinalIgnoreCase) &&
+                (e.Parent?.Name ?? "").Equals("Project", StringComparison.OrdinalIgnoreCase) &&
+                e.GetAttributeValue("Condition")?.StartsWith("Exists(") == true &&
+                e.GetAttribute("Project") is not null)
+            .Select(e => e.AsNode)
+            .OfType<XmlEmptyElementSyntax>();
+        updatedXml = Contents.ReplaceNodes(importsWithConditions,
+            (_, n) =>
+            {
+                var projectAttr = n.GetAttribute("Project")
+                    ?? throw new InvalidOperationException("Expected Import element to have a Project attribute");
+                var newProjectAttr = projectAttr.WithValue(projectAttr.Value.Replace("/", "\\"));
+                n = (XmlEmptyElementSyntax)n.ReplaceAttribute(projectAttr, newProjectAttr).AsNode;
+
+                var conditionAttr = n.GetAttribute("Condition")
+                    ?? throw new InvalidOperationException("Expected Import element to have a Condition attribute");
+                var newConditionAttr = conditionAttr.WithValue(conditionAttr.Value.Replace("/", "\\"));
+                return n.ReplaceAttribute(conditionAttr, newConditionAttr).AsNode;
+            });
         Update(updatedXml);
     }
 

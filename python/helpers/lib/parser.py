@@ -14,41 +14,113 @@ from pip._internal.req.constructors import (
 )
 
 from packaging.requirements import InvalidRequirement, Requirement
-# TODO: Replace 3p package `toml` with 3.11's new stdlib `tomllib` once we drop
-# support for Python 3.10.
-import toml
+# TODO: Replace 3p package `tomli` with 3.11's new stdlib `tomllib` once we
+#       drop support for Python 3.10.
+import tomli
 
 # Inspired by pips internal check:
 # https://github.com/pypa/pip/blob/0bb3ac87f5bb149bd75cceac000844128b574385/src/pip/_internal/req/req_file.py#L35
 COMMENT_RE = re.compile(r'(^|\s+)#.*$')
 
 
-def parse_pep621_dependencies(pyproject_path):
-    project_toml = toml.load(pyproject_path)
+def parse_pep621_pep735_dependencies(pyproject_path):
+    with open(pyproject_path, "rb") as file:
+        project_toml = tomli.load(file)
 
-    def parse_toml_section_pep621_dependencies(pyproject_path, dependencies):
+    def version_from_req(specifier_set):
+        if (len(specifier_set) == 1 and
+                next(iter(specifier_set)).operator in {"==", "==="}):
+            return next(iter(specifier_set)).version
+
+    def original_requirement_from_entry(entry, req):
+        """Extract the original requirement string.
+
+        The packaging library normalizes specifiers
+        (removes spaces, reorders operators), but we
+        need the original so the file updater regex
+        can match the file content.
+        """
+        # Strip the name (and any extras like [filecache]) from the start
+        remainder = entry[len(req.name):].strip()
+
+        # Strip extras bracket if present, e.g. [filecache]
+        if remainder.startswith("["):
+            close = remainder.index("]")
+            remainder = remainder[close + 1:].strip()
+
+        # Strip markers from the end, e.g. "; python_version < '3.4'"
+        if req.marker:
+            marker_pos = remainder.find(";")
+            if marker_pos != -1:
+                remainder = remainder[:marker_pos].strip()
+
+        return remainder
+
+    def parse_requirement(entry, pyproject_path, requirement_type=None):
+        try:
+            req = Requirement(entry)
+        except InvalidRequirement as e:
+            print(json.dumps({"error": repr(e)}))
+            exit(1)
+        else:
+            data = {
+                "name": req.name,
+                "version": version_from_req(req.specifier),
+                "markers": str(req.marker) or None,
+                "file": pyproject_path,
+                "requirement": str(req.specifier),
+                "source_requirement":
+                    original_requirement_from_entry(entry, req),
+                "extras": sorted(list(req.extras)),
+                "requirement_type": requirement_type,
+            }
+            return data
+
+    def parse_toml_section_pep621_dependencies(
+        pyproject_path, dependencies, requirement_type=None
+    ):
         requirement_packages = []
 
-        def version_from_req(specifier_set):
-            if (len(specifier_set) == 1 and
-                    next(iter(specifier_set)).operator in {"==", "==="}):
-                return next(iter(specifier_set)).version
-
         for dependency in dependencies:
-            try:
-                req = Requirement(dependency)
-            except InvalidRequirement as e:
-                print(json.dumps({"error": repr(e)}))
-                exit(1)
-            else:
-                requirement_packages.append({
-                    "name": req.name,
-                    "version": version_from_req(req.specifier),
-                    "markers": str(req.marker) or None,
-                    "file": pyproject_path,
-                    "requirement": str(req.specifier),
-                    "extras": sorted(list(req.extras))
-                })
+            parsed_dependency = parse_requirement(
+                dependency, pyproject_path, requirement_type
+            )
+            requirement_packages.append(parsed_dependency)
+
+        return requirement_packages
+
+    def parse_toml_section_pep735_dependencies(
+        pyproject_path,
+        dependency_groups,
+        group_name,
+        visited=None,
+    ):
+        requirement_packages = []
+        visited = visited or set()
+
+        if group_name in visited:
+            return requirement_packages
+
+        visited.add(group_name)
+        dependencies = dependency_groups.get(group_name, [])
+        for entry in dependencies:
+            # Handle direct requirement
+            if isinstance(entry, str):
+                parsed_dependency = parse_requirement(
+                    entry, pyproject_path, group_name
+                )
+                requirement_packages.append(parsed_dependency)
+            # Handle include-group directive
+            elif isinstance(entry, dict) and "include-group" in entry:
+                included_group = entry["include-group"]
+                requirement_packages.extend(
+                    parse_toml_section_pep735_dependencies(
+                        pyproject_path,
+                        dependency_groups,
+                        included_group,
+                        visited
+                    )
+                )
 
         return requirement_packages
 
@@ -61,7 +133,8 @@ def parse_pep621_dependencies(pyproject_path):
             dependencies_toml = project_section['dependencies']
             runtime_dependencies = parse_toml_section_pep621_dependencies(
                 pyproject_path,
-                dependencies_toml
+                dependencies_toml,
+                "dependencies"
             )
             dependencies.extend(runtime_dependencies)
 
@@ -72,16 +145,26 @@ def parse_pep621_dependencies(pyproject_path):
             for group in optional_dependencies_toml:
                 group_dependencies = parse_toml_section_pep621_dependencies(
                     pyproject_path,
-                    optional_dependencies_toml[group]
+                    optional_dependencies_toml[group],
+                    group
                 )
                 dependencies.extend(group_dependencies)
+
+    if 'dependency-groups' in project_toml:
+        dependency_groups = project_toml['dependency-groups']
+        for group_name in dependency_groups:
+            group_dependencies = parse_toml_section_pep735_dependencies(
+                pyproject_path, dependency_groups, group_name
+            )
+            dependencies.extend(group_dependencies)
 
     if 'build-system' in project_toml:
         build_system_section = project_toml['build-system']
         if 'requires' in build_system_section:
             build_system_dependencies = parse_toml_section_pep621_dependencies(
                 pyproject_path,
-                build_system_section['requires']
+                build_system_section['requires'],
+                "build-system.requires"
             )
             dependencies.extend(build_system_dependencies)
 

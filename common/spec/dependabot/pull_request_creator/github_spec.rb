@@ -140,6 +140,22 @@ RSpec.describe Dependabot::PullRequestCreator::Github do
   end
 
   describe "#create" do
+    context "when GitHub returns a malformed tree response" do
+      before do
+        stub_request(:post, "#{repo_api_url}/git/trees")
+          .to_return(
+            status: 200,
+            body: JSON.dump(sha: 1),
+            headers: json_header
+          )
+      end
+
+      it "raises a bad response error" do
+        expect { creator.create }
+          .to raise_error(Dependabot::PrivateSourceBadResponse, /tree sha must be a string/)
+      end
+    end
+
     it "pushes a commit to GitHub" do
       creator.create
 
@@ -541,7 +557,7 @@ RSpec.describe Dependabot::PullRequestCreator::Github do
                   "&state=all"
             stub_request(:get, url).to_return(
               status: 200,
-              body: "[{ \"closed\": true }]",
+              body: '[{"state":"closed","merged_at":"2026-08-14T00:00:00Z"}]',
               headers: json_header
             )
             stub_request(
@@ -599,6 +615,24 @@ RSpec.describe Dependabot::PullRequestCreator::Github do
                   )
               end
             end
+
+            context "when the PR is closed but unmerged" do
+              before do
+                url = "#{repo_api_url}/pulls?head=gocardless:#{branch_name}" \
+                      "&state=all"
+                stub_request(:get, url).to_return(
+                  status: 200,
+                  body: '[{"number":1347,"state":"closed","merged_at":null}]',
+                  headers: json_header
+                )
+              end
+
+              it "does not recreate the pull request" do
+                expect { creator.create }
+                  .to raise_error(Dependabot::PullRequestCreator::UnmergedPRExists, /1347/)
+                expect(WebMock).not_to have_requested(:post, "#{repo_api_url}/pulls")
+              end
+            end
           end
         end
       end
@@ -625,8 +659,10 @@ RSpec.describe Dependabot::PullRequestCreator::Github do
 
         it "returns a suitable exception" do
           expect { creator.create }
-            .to raise_error(Dependabot::PullRequestCreator::BranchAlreadyExists,
-                            "Duplicate branch #{branch_name} already exists")
+            .to raise_error(
+              Dependabot::PullRequestCreator::BranchAlreadyExists,
+              "Duplicate branch #{branch_name} already exists"
+            )
         end
       end
     end

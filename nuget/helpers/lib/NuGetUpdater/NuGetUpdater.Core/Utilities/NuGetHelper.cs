@@ -1,5 +1,3 @@
-using System.Diagnostics.CodeAnalysis;
-
 namespace NuGetUpdater.Core;
 
 internal static class NuGetHelper
@@ -10,7 +8,7 @@ internal static class NuGetHelper
         try
         {
             var tempProjectPath = await MSBuildHelper.CreateTempProjectAsync(tempDirectory, repoRoot, projectPath, "netstandard2.0", packages, logger, usePackageDownload: true);
-            var (exitCode, stdOut, stdErr) = await ProcessEx.RunAsync("dotnet", ["restore", tempProjectPath]);
+            var (exitCode, stdOut, stdErr) = await ProcessEx.RunDotnetWithoutMSBuildEnvironmentVariablesAsync(["restore", tempProjectPath], tempDirectory.FullName);
 
             return exitCode == 0;
         }

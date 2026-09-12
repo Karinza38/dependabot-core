@@ -40,6 +40,133 @@ RSpec.describe Dependabot::Python::FileParser do
 
     its(:length) { is_expected.to eq(5) }
 
+    context "with requirements helper results" do
+      let(:requirements_body) { "requests[security]==2.31.0\n" }
+      let(:helper_record) do
+        {
+          "name" => "requests",
+          "version" => "2.31.0",
+          "markers" => "None",
+          "file" => "requirements.txt",
+          "requirement" => "==2.31.0",
+          "extras" => ["security"]
+        }
+      end
+      let(:helper_result) { [helper_record] }
+
+      before do
+        allow(Dependabot::SharedHelpers).to receive(:run_helper_subprocess).and_call_original
+        allow(Dependabot::SharedHelpers).to receive(:run_helper_subprocess)
+          .with(hash_including(function: "parse_requirements")).and_return(helper_result)
+        allow(parser).to receive(:python_raw_version).and_return("3.13.1")
+      end
+
+      it "preserves Python's dependency name and extras metadata" do
+        expect(dependencies.first).to have_attributes(name: "requests", version: "2.31.0", package_manager: "pip")
+        expect(dependencies.first.metadata).to include(extras: "security")
+        expect(dependencies.first.requirements).to eq(
+          [{
+            requirement: "==2.31.0",
+            file: "requirements.txt",
+            groups: ["dependencies"],
+            source: nil
+          }]
+        )
+      end
+
+      [nil, "None"].each do |marker|
+        context "with #{marker.inspect} as the marker" do
+          let(:helper_record) { super().merge("markers" => marker, "version" => nil, "requirement" => "<3") }
+
+          it "does not filter an unmarked requirement" do
+            expect(dependencies.map(&:name)).to eq(["requests"])
+          end
+        end
+      end
+
+      context "without a marker field" do
+        let(:helper_record) { super().except("markers") }
+
+        it "treats the requirement as unmarked" do
+          expect(dependencies.map(&:name)).to eq(["requests"])
+        end
+      end
+
+      context "with an empty marker and an upper-bound requirement" do
+        let(:helper_record) { super().merge("markers" => "", "requirement" => "<3") }
+
+        it "preserves the existing upper-bound filtering" do
+          expect(dependencies).to be_empty
+        end
+      end
+
+      context "with a missing helper result" do
+        let(:helper_result) { nil }
+
+        it "reports a malformed requirements result" do
+          expect { dependencies }.to raise_error(
+            Dependabot::DependencyFileNotEvaluatable,
+            "parse_requirements result must be an array"
+          )
+        end
+      end
+
+      context "with a malformed record excluded by its marker" do
+        let(:helper_result) do
+          [
+            helper_record,
+            helper_record.merge("name" => "ignored", "markers" => "python_version < \"3.0\"", "extras" => [1])
+          ]
+        end
+
+        it "rejects the complete result before filtering records" do
+          expect { dependencies }.to raise_error(
+            Dependabot::DependencyFileNotEvaluatable,
+            /parse_requirements result\[1\].*extras/
+          )
+        end
+      end
+
+      context "with invalid requirement syntax" do
+        let(:helper_record) { super().merge("requirement" => "not a requirement") }
+
+        it "preserves the requirement evaluation error" do
+          expect { dependencies }.to raise_error(Dependabot::DependencyFileNotEvaluatable)
+        end
+      end
+
+      [
+        ["InstallationError: invalid input", Dependabot::DependencyFileNotEvaluatable],
+        ["Unexpected helper failure", Dependabot::SharedHelpers::HelperSubprocessFailed]
+      ].each do |message, error_class|
+        context "when the helper reports #{message}" do
+          let(:helper_error) do
+            Dependabot::SharedHelpers::HelperSubprocessFailed.new(message: message, error_context: {})
+          end
+
+          before do
+            allow(Dependabot::SharedHelpers).to receive(:run_helper_subprocess)
+              .with(hash_including(function: "parse_requirements")).and_raise(helper_error)
+          end
+
+          it "preserves the existing helper error mapping" do
+            expect { dependencies }.to raise_error(error_class, message)
+          end
+        end
+      end
+
+      context "when the helper call itself raises a type error" do
+        before do
+          allow(Dependabot::SharedHelpers).to receive(:run_helper_subprocess)
+            .with(hash_including(function: "parse_requirements")).and_raise(TypeError, "unexpected helper type error")
+        end
+
+        it "does not treat it as a malformed result" do
+          expect { dependencies }.to raise_error(TypeError, "unexpected helper type error")
+        end
+      end
+    end
+
     context "with a version specified" do
       describe "the first dependency" do
         subject(:dependency) { dependencies.first }
@@ -106,16 +233,73 @@ RSpec.describe Dependabot::Python::FileParser do
     end
 
     context "with markers" do
-      context "when including a < in the marker" do
+      context "when the marker <= 2.6" do
+        before do
+          allow(parser).to receive(:python_raw_version).and_return("2.6")
+        end
+
         let(:requirements_fixture_name) { "markers.txt" }
 
-        it "parses only the >= marker" do
+        it "then the dependency version should be 1.0.4" do
           expect(dependencies.length).to eq(1)
 
           dependency = dependencies.first
 
           expect(dependency).to be_a(Dependabot::Dependency)
           expect(dependency.name).to eq("distro")
+          expect(dependency.version).to eq("1.0.4")
+          expect(dependency.requirements).to eq(
+            [{
+              requirement: "==1.0.4",
+              file: "requirements.txt",
+              groups: ["dependencies"],
+              source: nil
+            }]
+          )
+        end
+      end
+
+      context "when the marker => 2.7" do
+        before do
+          allow(parser).to receive(:python_raw_version).and_return("2.7")
+        end
+
+        let(:requirements_fixture_name) { "markers.txt" }
+
+        it "then the dependency version should be 1.3.0" do
+          expect(dependencies.length).to eq(1)
+
+          dependency = dependencies.first
+
+          expect(dependency).to be_a(Dependabot::Dependency)
+          expect(dependency.name).to eq("distro")
+          expect(dependency.version).to eq("1.3.0")
+          expect(dependency.requirements).to eq(
+            [{
+              requirement: "==1.3.0",
+              file: "requirements.txt",
+              groups: ["dependencies"],
+              source: nil
+            }]
+          )
+        end
+      end
+
+      context "when there is a combination of multiple conditions with 'and' in a marker" do
+        before do
+          allow(parser).to receive(:python_raw_version).and_return("3.13.1")
+        end
+
+        # python_version >= '3.0' and python_version <= '3.7'
+        let(:requirements_fixture_name) { "markers_with_combination_of_conditions.txt" }
+
+        it "then the dependency version should be 1.3.0" do
+          expect(dependencies.length).to eq(1)
+
+          dependency = dependencies.first
+
+          expect(dependency).to be_a(Dependabot::Dependency)
+          expect(dependency.name).to eq("arrow")
           expect(dependency.version).to eq("1.3.0")
           expect(dependency.requirements).to eq(
             [{
@@ -149,6 +333,18 @@ RSpec.describe Dependabot::Python::FileParser do
           )
         end
       end
+
+      context "when the marker is malformed" do
+        before do
+          allow(parser).to receive(:python_raw_version).and_return("3.13.3")
+        end
+
+        let(:requirements_fixture_name) { "malformed_markers.txt" }
+
+        it "does not return any dependencies" do
+          expect(dependencies).to be_empty
+        end
+      end
     end
 
     context "with extras" do
@@ -159,7 +355,7 @@ RSpec.describe Dependabot::Python::FileParser do
 
         it "has the right details" do
           expect(dependency).to be_a(Dependabot::Dependency)
-          expect(dependency.name).to eq("psycopg2[bar,foo]")
+          expect(dependency.name).to eq("psycopg2")
           expect(dependency.version).to eq("2.6.1")
           expect(dependency.requirements).to eq(
             [{
@@ -169,6 +365,7 @@ RSpec.describe Dependabot::Python::FileParser do
               source: nil
             }]
           )
+          expect(dependency.metadata[:extras]).to eq("bar,foo")
         end
       end
     end
@@ -380,17 +577,20 @@ RSpec.describe Dependabot::Python::FileParser do
             expect(dependency).to be_a(Dependabot::Dependency)
             expect(dependency.name).to eq("requests")
             expect(dependency.version).to eq("2.0.0")
-            expect(dependency.requirements).to contain_exactly({
-              requirement: nil,
-              file: "requirements.txt",
-              groups: ["dependencies"],
-              source: nil
-            }, {
-              requirement: "==2.0.0",
-              file: "constraints.txt",
-              groups: ["dependencies"],
-              source: nil
-            })
+            expect(dependency.requirements).to contain_exactly(
+              {
+                requirement: nil,
+                file: "requirements.txt",
+                groups: ["dependencies"],
+                source: nil
+              },
+              {
+                requirement: "==2.0.0",
+                file: "constraints.txt",
+                groups: ["dependencies"],
+                source: nil
+              }
+            )
           end
         end
 
@@ -406,17 +606,20 @@ RSpec.describe Dependabot::Python::FileParser do
               expect(dependency).to be_a(Dependabot::Dependency)
               expect(dependency.name).to eq("requests")
               expect(dependency.version).to eq("2.0.0")
-              expect(dependency.requirements).to contain_exactly({
-                requirement: "==2.0.0",
-                file: "constraints.txt",
-                groups: ["dependencies"],
-                source: nil
-              }, {
-                requirement: "==2.4.1",
-                file: "requirements.txt",
-                groups: ["dependencies"],
-                source: nil
-              })
+              expect(dependency.requirements).to contain_exactly(
+                {
+                  requirement: "==2.0.0",
+                  file: "constraints.txt",
+                  groups: ["dependencies"],
+                  source: nil
+                },
+                {
+                  requirement: "==2.4.1",
+                  file: "requirements.txt",
+                  groups: ["dependencies"],
+                  source: nil
+                }
+              )
             end
           end
         end
@@ -706,67 +909,75 @@ RSpec.describe Dependabot::Python::FileParser do
       its(:length) { is_expected.to eq(6) }
 
       it "has the right details" do
-        expect(dependencies).to contain_exactly(Dependabot::Dependency.new(
-                                                  name: "requests",
-                                                  version: "2.4.1",
-                                                  requirements: [{
-                                                    requirement: "==2.4.1",
-                                                    file: "requirements.txt",
-                                                    groups: ["dependencies"],
-                                                    source: nil
-                                                  }],
-                                                  package_manager: "pip"
-                                                ), Dependabot::Dependency.new(
-                                                     name: "attrs",
-                                                     version: "18.0.0",
-                                                     requirements: [{
-                                                       requirement: "==18.0.0",
-                                                       file: "more_requirements.txt",
-                                                       groups: ["dependencies"],
-                                                       source: nil
-                                                     }],
-                                                     package_manager: "pip"
-                                                   ), Dependabot::Dependency.new(
-                                                        name: "aiocache[redis]",
-                                                        version: "0.10.0",
-                                                        requirements: [{
-                                                          requirement: "==0.10.0",
-                                                          file: "more_requirements.txt",
-                                                          groups: ["dependencies"],
-                                                          source: nil
-                                                        }],
-                                                        package_manager: "pip"
-                                                      ), Dependabot::Dependency.new(
-                                                           name: "luigi",
-                                                           version: "2.2.0",
-                                                           requirements: [{
-                                                             requirement: "==2.2.0",
-                                                             file: "more_requirements.txt",
-                                                             groups: ["dependencies"],
-                                                             source: nil
-                                                           }],
-                                                           package_manager: "pip"
-                                                         ), Dependabot::Dependency.new(
-                                                              name: "psycopg2",
-                                                              version: "2.6.1",
-                                                              requirements: [{
-                                                                requirement: "==2.6.1",
-                                                                file: "more_requirements.txt",
-                                                                groups: ["dependencies"],
-                                                                source: nil
-                                                              }],
-                                                              package_manager: "pip"
-                                                            ), Dependabot::Dependency.new(
-                                                                 name: "pytest",
-                                                                 version: "3.4.0",
-                                                                 requirements: [{
-                                                                   requirement: "==3.4.0",
-                                                                   file: "more_requirements.txt",
-                                                                   groups: ["dependencies"],
-                                                                   source: nil
-                                                                 }],
-                                                                 package_manager: "pip"
-                                                               ))
+        expect(dependencies).to contain_exactly(
+          Dependabot::Dependency.new(
+            name: "requests",
+            version: "2.4.1",
+            requirements: [{
+              requirement: "==2.4.1",
+              file: "requirements.txt",
+              groups: ["dependencies"],
+              source: nil
+            }],
+            package_manager: "pip"
+          ),
+          Dependabot::Dependency.new(
+            name: "attrs",
+            version: "18.0.0",
+            requirements: [{
+              requirement: "==18.0.0",
+              file: "more_requirements.txt",
+              groups: ["dependencies"],
+              source: nil
+            }],
+            package_manager: "pip"
+          ),
+          Dependabot::Dependency.new(
+            name: "aiocache",
+            version: "0.10.0",
+            requirements: [{
+              requirement: "==0.10.0",
+              file: "more_requirements.txt",
+              groups: ["dependencies"],
+              source: nil
+            }],
+            package_manager: "pip",
+            metadata: { extras: "redis" }
+          ),
+          Dependabot::Dependency.new(
+            name: "luigi",
+            version: "2.2.0",
+            requirements: [{
+              requirement: "==2.2.0",
+              file: "more_requirements.txt",
+              groups: ["dependencies"],
+              source: nil
+            }],
+            package_manager: "pip"
+          ),
+          Dependabot::Dependency.new(
+            name: "psycopg2",
+            version: "2.6.1",
+            requirements: [{
+              requirement: "==2.6.1",
+              file: "more_requirements.txt",
+              groups: ["dependencies"],
+              source: nil
+            }],
+            package_manager: "pip"
+          ),
+          Dependabot::Dependency.new(
+            name: "pytest",
+            version: "3.4.0",
+            requirements: [{
+              requirement: "==3.4.0",
+              file: "more_requirements.txt",
+              groups: ["dependencies"],
+              source: nil
+            }],
+            package_manager: "pip"
+          )
+        )
       end
     end
 
@@ -845,17 +1056,20 @@ RSpec.describe Dependabot::Python::FileParser do
               expect(dependency).to be_a(Dependabot::Dependency)
               expect(dependency.name).to eq("attrs")
               expect(dependency.version).to eq("17.3.0")
-              expect(dependency.requirements).to contain_exactly({
-                requirement: nil,
-                file: "requirements/test.in",
-                groups: ["dependencies"],
-                source: nil
-              }, {
-                requirement: "==17.3.0",
-                file: "requirements.txt",
-                groups: ["dependencies"],
-                source: nil
-              })
+              expect(dependency.requirements).to contain_exactly(
+                {
+                  requirement: nil,
+                  file: "requirements/test.in",
+                  groups: ["dependencies"],
+                  source: nil
+                },
+                {
+                  requirement: "==17.3.0",
+                  file: "requirements.txt",
+                  groups: ["dependencies"],
+                  source: nil
+                }
+              )
             end
           end
         end
@@ -880,6 +1094,14 @@ RSpec.describe Dependabot::Python::FileParser do
                 }]
               )
             end
+          end
+
+          it "returns the correct ecosystem and package manager set" do
+            ecosystem = parser.ecosystem
+
+            expect(ecosystem.name).to eq("Python")
+            expect(ecosystem.package_manager.name).to eq("pip-compile")
+            expect(ecosystem.language.name).to eq("python")
           end
         end
       end
@@ -967,12 +1189,12 @@ RSpec.describe Dependabot::Python::FileParser do
 
         describe "a dependency with extras" do
           subject(:dependency) do
-            dependencies.find { |d| d.name == "requests[security]" }
+            dependencies.find { |d| d.name == "requests" }
           end
 
           it "has the right details" do
             expect(dependency).to be_a(Dependabot::Dependency)
-            expect(dependency.name).to eq("requests[security]")
+            expect(dependency.name).to eq("requests")
             expect(dependency.version).to be_nil
             expect(dependency.requirements).to eq(
               [{
@@ -982,6 +1204,7 @@ RSpec.describe Dependabot::Python::FileParser do
                 source: nil
               }]
             )
+            expect(dependency.metadata[:extras]).to eq("security")
           end
         end
       end
@@ -1053,12 +1276,12 @@ RSpec.describe Dependabot::Python::FileParser do
 
         describe "a dependency with extras" do
           subject(:dependency) do
-            dependencies.find { |d| d.name == "requests[security]" }
+            dependencies.find { |d| d.name == "requests" }
           end
 
           it "has the right details" do
             expect(dependency).to be_a(Dependabot::Dependency)
-            expect(dependency.name).to eq("requests[security]")
+            expect(dependency.name).to eq("requests")
             expect(dependency.version).to be_nil
             expect(dependency.requirements).to eq(
               [{
@@ -1068,6 +1291,7 @@ RSpec.describe Dependabot::Python::FileParser do
                 source: nil
               }]
             )
+            expect(dependency.metadata[:extras]).to eq("security")
           end
         end
       end
@@ -1370,6 +1594,69 @@ RSpec.describe Dependabot::Python::FileParser do
       it "returns the dependencies with multiple requirements" do
         expect { dependencies }.not_to raise_error
         expect(dependencies.map(&:name)).to contain_exactly("numpy", "scipy")
+      end
+    end
+
+    context "with requires-poetry constraint in pyproject.toml" do
+      let(:files) { [pyproject, poetry_lock] }
+      let(:pyproject) do
+        Dependabot::DependencyFile.new(
+          name: "pyproject.toml",
+          content: fixture("pyproject_files", pyproject_fixture)
+        )
+      end
+      let(:poetry_lock) do
+        Dependabot::DependencyFile.new(
+          name: "poetry.lock",
+          content: fixture("poetry_locks", "poetry.lock")
+        )
+      end
+
+      context "when the constraint is satisfied by the installed version" do
+        let(:pyproject_fixture) { "requires_poetry_satisfied.toml" }
+
+        it "populates the requirement on the package manager" do
+          ecosystem = parser.ecosystem
+
+          expect(ecosystem.package_manager.name).to eq("poetry")
+          expect(ecosystem.package_manager.requirement).not_to be_nil
+          expect(ecosystem.package_manager.requirement.to_s).to include(">= 2.0")
+        end
+      end
+
+      context "when the constraint is not satisfied by the installed version" do
+        let(:pyproject_fixture) { "requires_poetry_not_satisfied.toml" }
+
+        it "raises ToolVersionNotSupported when raise_if_unsupported! is called" do
+          ecosystem = parser.ecosystem
+
+          expect { ecosystem.raise_if_unsupported! }.to raise_error(Dependabot::ToolVersionNotSupported) do |error|
+            expect(error.tool_name).to eq("poetry")
+            expect(error.supported_versions).to eq(">= 3.0")
+          end
+        end
+      end
+
+      context "when the constraint has multiple parts" do
+        let(:pyproject_fixture) { "requires_poetry_complex.toml" }
+
+        it "populates the requirement on the package manager" do
+          ecosystem = parser.ecosystem
+
+          expect(ecosystem.package_manager.name).to eq("poetry")
+          expect(ecosystem.package_manager.requirement).not_to be_nil
+        end
+      end
+
+      context "when requires-poetry is absent" do
+        let(:pyproject_fixture) { "basic_poetry_dependencies.toml" }
+
+        it "has no requirement on the package manager" do
+          ecosystem = parser.ecosystem
+
+          expect(ecosystem.package_manager.name).to eq("poetry")
+          expect(ecosystem.package_manager.requirement).to be_nil
+        end
       end
     end
   end

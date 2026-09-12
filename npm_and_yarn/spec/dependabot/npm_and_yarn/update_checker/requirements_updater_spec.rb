@@ -304,17 +304,20 @@ RSpec.describe Dependabot::NpmAndYarn::UpdateChecker::RequirementsUpdater do
           let(:other_requirement_string) { "^0.x.x" }
 
           it "updates both requirements" do
-            expect(updater.updated_requirements).to contain_exactly({
-              file: "package.json",
-              requirement: "^1.5.0",
-              groups: [],
-              source: nil
-            }, {
-              file: "another/package.json",
-              requirement: "^1.x.x",
-              groups: [],
-              source: nil
-            })
+            expect(updater.updated_requirements).to contain_exactly(
+              {
+                file: "package.json",
+                requirement: "^1.5.0",
+                groups: [],
+                source: nil
+              },
+              {
+                file: "another/package.json",
+                requirement: "^1.x.x",
+                groups: [],
+                source: nil
+              }
+            )
           end
 
           context "when one of them is a pre-release" do
@@ -327,17 +330,20 @@ RSpec.describe Dependabot::NpmAndYarn::UpdateChecker::RequirementsUpdater do
               end
 
               it "updates the non-prerelease requirement" do
-                expect(updater.updated_requirements).to contain_exactly({
-                  file: "package.json",
-                  requirement: "1.1.0-alpha.1",
-                  groups: [],
-                  source: nil
-                }, {
-                  file: "another/package.json",
-                  requirement: "1.1.0-alpha.1",
-                  groups: [],
-                  source: nil
-                })
+                expect(updater.updated_requirements).to contain_exactly(
+                  {
+                    file: "package.json",
+                    requirement: "1.1.0-alpha.1",
+                    groups: [],
+                    source: nil
+                  },
+                  {
+                    file: "another/package.json",
+                    requirement: "1.1.0-alpha.1",
+                    groups: [],
+                    source: nil
+                  }
+                )
               end
             end
           end
@@ -617,17 +623,20 @@ RSpec.describe Dependabot::NpmAndYarn::UpdateChecker::RequirementsUpdater do
           let(:other_requirement_string) { "^0.x.x" }
 
           it "updates the requirement that needs to be updated" do
-            expect(updater.updated_requirements).to contain_exactly({
-              file: "package.json",
-              requirement: "^1.2.3",
-              groups: [],
-              source: nil
-            }, {
-              file: "another/package.json",
-              requirement: "^1.x.x",
-              groups: [],
-              source: nil
-            })
+            expect(updater.updated_requirements).to contain_exactly(
+              {
+                file: "package.json",
+                requirement: "^1.2.3",
+                groups: [],
+                source: nil
+              },
+              {
+                file: "another/package.json",
+                requirement: "^1.x.x",
+                groups: [],
+                source: nil
+              }
+            )
           end
 
           context "when dealing with the same file" do
@@ -646,21 +655,56 @@ RSpec.describe Dependabot::NpmAndYarn::UpdateChecker::RequirementsUpdater do
             end
 
             it "updates both requirements" do
-              expect(updater.updated_requirements).to contain_exactly({
-                requirement: "1.5.x",
-                file: "package.json",
-                groups: ["dependencies"],
-                source: nil
-              }, {
-                requirement: "^1.5.0",
-                file: "package.json",
-                groups: ["devDependencies"],
-                source: nil
-              })
+              expect(updater.updated_requirements).to contain_exactly(
+                {
+                  requirement: "1.5.x",
+                  file: "package.json",
+                  groups: ["dependencies"],
+                  source: nil
+                },
+                {
+                  requirement: "^1.5.0",
+                  file: "package.json",
+                  groups: ["devDependencies"],
+                  source: nil
+                }
+              )
             end
           end
         end
       end
+    end
+
+    context "with a JSR short form requirement" do
+      let(:update_strategy) { Dependabot::RequirementsUpdateStrategy::BumpVersions }
+      let(:latest_resolvable_version) { Gem::Version.new("3.2.0") }
+      let(:package_json_req_string) { "jsr:^3.0.0" }
+
+      its([:requirement]) { is_expected.to eq("jsr:^3.2.0") }
+    end
+
+    context "with a JSR long form requirement" do
+      let(:update_strategy) { Dependabot::RequirementsUpdateStrategy::BumpVersions }
+      let(:latest_resolvable_version) { Gem::Version.new("3.2.0") }
+      let(:package_json_req_string) { "jsr:@arendjr/text-clipper@^3.0.0" }
+
+      its([:requirement]) { is_expected.to eq("jsr:@arendjr/text-clipper@^3.2.0") }
+    end
+
+    context "with a JSR requirement when version is already satisfied" do
+      let(:update_strategy) { Dependabot::RequirementsUpdateStrategy::BumpVersionsIfNecessary }
+      let(:latest_resolvable_version) { Gem::Version.new("3.0.5") }
+      let(:package_json_req_string) { "jsr:^3.0.0" }
+
+      its([:requirement]) { is_expected.to eq("jsr:^3.0.0") }
+    end
+
+    context "with a JSR requirement when widening ranges" do
+      let(:update_strategy) { Dependabot::RequirementsUpdateStrategy::WidenRanges }
+      let(:latest_resolvable_version) { Gem::Version.new("4.0.0") }
+      let(:package_json_req_string) { "jsr:^3.0.0" }
+
+      its([:requirement]) { is_expected.to eq("jsr:^4.0.0") }
     end
 
     context "when dealing with a requirement being left alone" do

@@ -9,6 +9,88 @@ require "dependabot/updater/operations"
 require "spec_helper"
 
 RSpec.describe Dependabot::Updater::DependencyGroupChangeBatch do
+  describe "#merge" do
+    let(:initial_file) do
+      Dependabot::DependencyFile.new(name: "Gemfile.lock", content: "initial", directory: "/")
+    end
+    let(:updated_file) do
+      Dependabot::DependencyFile.new(name: "Gemfile.lock", content: "first update", directory: "/")
+    end
+    let(:second_update) do
+      Dependabot::DependencyFile.new(name: "Gemfile.lock", content: "second update", directory: "/")
+    end
+    let(:vendored_file) do
+      Dependabot::DependencyFile.new(
+        name: "vendor/cache/example.gem",
+        content: "vendored",
+        directory: "/",
+        vendored_file: true
+      )
+    end
+    let(:batch) { described_class.new(initial_dependency_files: [initial_file]) }
+    let(:logger) { instance_double(Logger, debug?: true, debug: nil) }
+
+    before do
+      allow(Dependabot).to receive(:logger).and_return(logger)
+    end
+
+    it "tracks changed and vendored files" do
+      change = instance_double(
+        Dependabot::DependencyChange,
+        updated_dependencies: [],
+        updated_dependency_files: [updated_file, vendored_file],
+        notices: []
+      )
+
+      batch.merge(change)
+
+      expect(batch.updated_dependency_files).to contain_exactly(updated_file, vendored_file)
+    end
+
+    it "increments repeated changes and retains the newest file" do
+      first_change = instance_double(
+        Dependabot::DependencyChange,
+        updated_dependencies: [],
+        updated_dependency_files: [updated_file],
+        notices: []
+      )
+      second_change = instance_double(
+        Dependabot::DependencyChange,
+        updated_dependencies: [],
+        updated_dependency_files: [second_update],
+        notices: []
+      )
+
+      batch.merge(first_change)
+      expect(logger).to receive(:debug).with("  - /Gemfile.lock ( Changed 2 times )")
+      batch.merge(second_change)
+
+      expect(batch.updated_dependency_files).to eq([second_update])
+    end
+
+    it "deduplicates notices from dependency changes" do
+      notice = Dependabot::Notice.new(
+        mode: Dependabot::Notice::NoticeMode::WARN,
+        type: "cooldown_date_unavailable",
+        package_manager_name: "bundler",
+        description: "Cooldown was not applied.",
+        show_in_pr: true,
+        show_alert: false
+      )
+      change = instance_double(
+        Dependabot::DependencyChange,
+        updated_dependencies: [],
+        updated_dependency_files: [],
+        notices: [notice]
+      )
+
+      batch.merge(change)
+      batch.merge(change)
+
+      expect(batch.notices).to contain_exactly(notice)
+    end
+  end
+
   describe "current_dependency_files" do
     let(:files) do
       [
@@ -33,16 +115,20 @@ RSpec.describe Dependabot::Updater::DependencyGroupChangeBatch do
     let(:directory) { "/" }
 
     it "returns the current dependency files filtered by directory" do
-      expect(described_class.new(initial_dependency_files: files)
-        .current_dependency_files(job).map(&:name)).to eq(%w(Gemfile Gemfile.lock))
+      expect(
+        described_class.new(initial_dependency_files: files)
+                .current_dependency_files(job).map(&:name)
+      ).to eq(%w(Gemfile Gemfile.lock))
     end
 
     context "when the directory has a dot" do
       let(:directory) { "/." }
 
       it "normalizes the directory" do
-        expect(described_class.new(initial_dependency_files: files)
-          .current_dependency_files(job).map(&:name)).to eq(%w(Gemfile Gemfile.lock))
+        expect(
+          described_class.new(initial_dependency_files: files)
+                    .current_dependency_files(job).map(&:name)
+        ).to eq(%w(Gemfile Gemfile.lock))
       end
     end
 
@@ -50,8 +136,10 @@ RSpec.describe Dependabot::Updater::DependencyGroupChangeBatch do
       let(:directory) { "/hello/.." }
 
       it "normalizes the directory" do
-        expect(described_class.new(initial_dependency_files: files)
-          .current_dependency_files(job).map(&:name)).to eq(%w(Gemfile Gemfile.lock))
+        expect(
+          described_class.new(initial_dependency_files: files)
+                    .current_dependency_files(job).map(&:name)
+        ).to eq(%w(Gemfile Gemfile.lock))
       end
     end
   end

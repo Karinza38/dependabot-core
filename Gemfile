@@ -2,31 +2,46 @@
 
 source "https://rubygems.org"
 
+gem "dependabot-bazel", path: "bazel"
+gem "dependabot-bun", path: "bun"
 gem "dependabot-bundler", path: "bundler"
 gem "dependabot-cargo", path: "cargo"
 gem "dependabot-common", path: "common"
 gem "dependabot-composer", path: "composer"
+gem "dependabot-conda", path: "conda"
+gem "dependabot-deno", path: "deno"
 gem "dependabot-devcontainers", path: "devcontainers"
 gem "dependabot-docker", path: "docker"
+gem "dependabot-docker_compose", path: "docker"
 gem "dependabot-dotnet_sdk", path: "dotnet_sdk"
 gem "dependabot-elm", path: "elm"
 gem "dependabot-github_actions", path: "github_actions"
 gem "dependabot-git_submodules", path: "git_submodules"
 gem "dependabot-go_modules", path: "go_modules"
 gem "dependabot-gradle", path: "gradle"
+gem "dependabot-helm", path: "helm"
 gem "dependabot-hex", path: "hex"
+gem "dependabot-julia", path: "julia"
 gem "dependabot-maven", path: "maven"
 gem "dependabot-npm_and_yarn", path: "npm_and_yarn"
 gem "dependabot-nuget", path: "nuget"
+gem "dependabot-opentofu", path: "opentofu"
+gem "dependabot-pre_commit", path: "pre_commit"
 gem "dependabot-pub", path: "pub"
 gem "dependabot-python", path: "python"
+gem "dependabot-rust_toolchain", path: "rust_toolchain"
+gem "dependabot-sbt", path: "sbt"
 gem "dependabot-silent", path: "silent"
 gem "dependabot-swift", path: "swift"
 gem "dependabot-terraform", path: "terraform"
+gem "dependabot-uv", path: "uv"
+gem "dependabot-vcpkg", path: "vcpkg"
 
 # Sorbet
-gem "sorbet", "0.5.11630", group: :development
-gem "tapioca", "0.16.3", require: false, group: :development
+gem "sorbet", "~> 0.6", group: :development
+gem "tapioca", "~> 0.19", require: false, group: :development
+
+gem "zeitwerk", "~> 2.8"
 
 common_gemspec = File.expand_path("common/dependabot-common.gemspec", __dir__)
 
@@ -43,7 +58,7 @@ deps_shared_with_common = %w(
   simplecov
   stackprof
   strscan
-  turbo_tests
+  turbo_tests2
   vcr
   webmock
   webrick

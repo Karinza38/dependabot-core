@@ -75,13 +75,15 @@ dependabot update -f input-preexisting.yml --local . --updater-image ghcr.io/dep
 -- input.yml --
 job:
   package-manager: "silent"
+  cooldown:
+    default-days: 0
   source:
     directories:
       - "/foo"
       - "/bar"
     provider: example
-    hostname: example.com
-    api-endpoint: https://example.com/api/v3
+    hostname: 127.0.0.1
+    api-endpoint: http://127.0.0.1/api/v3
     repo: dependabot/smoke-tests
   dependency-groups:
     - name: all
@@ -92,13 +94,15 @@ job:
 -- input-preexisting.yml --
 job:
   package-manager: "silent"
+  cooldown:
+    default-days: 0
   source:
     directories:
       - "/foo"
       - "/bar"
     provider: example
-    hostname: example.com
-    api-endpoint: https://example.com/api/v3
+    hostname: 127.0.0.1
+    api-endpoint: http://127.0.0.1/api/v3
     repo: dependabot/smoke-tests
   dependency-groups:
     - name: all

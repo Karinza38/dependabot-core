@@ -148,6 +148,217 @@ RSpec.describe Dependabot::Cargo::FileFetcher do
     end
   end
 
+  context "with a config file at repository root and Cargo.toml in subdirectory" do
+    let(:source) do
+      Dependabot::Source.new(
+        provider: "github",
+        repo: "gocardless/bump",
+        directory: "my_dir"
+      )
+    end
+
+    let(:url) do
+      "https://api.github.com/repos/gocardless/bump/contents/my_dir/"
+    end
+
+    before do
+      # Mock the subdirectory listing (includes Cargo.toml and Cargo.lock)
+      stub_request(:get, "https://api.github.com/repos/gocardless/bump/contents/my_dir?ref=sha")
+        .with(headers: { "Authorization" => "token token" })
+        .to_return(
+          status: 200,
+          body: fixture("github", "contents_cargo_with_lockfile.json"),
+          headers: json_header
+        )
+
+      # Mock Cargo.toml in subdirectory
+      stub_request(:get, url + "Cargo.toml?ref=sha")
+        .with(headers: { "Authorization" => "token token" })
+        .to_return(
+          status: 200,
+          body: fixture("github", "contents_cargo_manifest.json"),
+          headers: json_header
+        )
+
+      # Mock Cargo.lock in subdirectory
+      stub_request(:get, url + "Cargo.lock?ref=sha")
+        .with(headers: { "Authorization" => "token token" })
+        .to_return(
+          status: 200,
+          body: fixture("github", "contents_cargo_lockfile.json"),
+          headers: json_header
+        )
+
+      # No config in subdirectory's .cargo directory
+      stub_request(:get, url + ".cargo?ref=sha")
+        .with(headers: { "Authorization" => "token token" })
+        .to_return(status: 404, headers: json_header)
+
+      stub_request(:get, url + ".cargo/config.toml?ref=sha")
+        .with(headers: { "Authorization" => "token token" })
+        .to_return(status: 404, headers: json_header)
+
+      stub_request(:get, url + ".cargo/config?ref=sha")
+        .with(headers: { "Authorization" => "token token" })
+        .to_return(status: 404, headers: json_header)
+
+      # Config at repository root
+      stub_request(:get, "https://api.github.com/repos/gocardless/bump/contents/.cargo?ref=sha")
+        .with(headers: { "Authorization" => "token token" })
+        .to_return(
+          status: 200,
+          body: fixture("github", "contents_cargo_dir.json"),
+          headers: json_header
+        )
+
+      stub_request(:get, "https://api.github.com/repos/gocardless/bump/contents/.cargo/config.toml?ref=sha")
+        .with(headers: { "Authorization" => "token token" })
+        .to_return(
+          status: 200,
+          body: fixture("github", "contents_cargo_config.json"),
+          headers: json_header
+        )
+    end
+
+    it "fetches the Cargo.toml, Cargo.lock, and config.toml from root" do
+      expect(file_fetcher_instance.files.map(&:name))
+        .to match_array(%w(Cargo.lock Cargo.toml .cargo/config.toml))
+    end
+  end
+
+  context "with a config file at repository root and Cargo.toml in a deeply nested directory" do
+    let(:source) do
+      Dependabot::Source.new(
+        provider: "github",
+        repo: "gocardless/bump",
+        directory: "a/b/c"
+      )
+    end
+
+    let(:url) do
+      "https://api.github.com/repos/gocardless/bump/contents/a/b/c/"
+    end
+
+    before do
+      # Mock the nested directory listing (includes Cargo.toml and Cargo.lock)
+      stub_request(:get, "https://api.github.com/repos/gocardless/bump/contents/a/b/c?ref=sha")
+        .with(headers: { "Authorization" => "token token" })
+        .to_return(
+          status: 200,
+          body: fixture("github", "contents_cargo_with_lockfile.json"),
+          headers: json_header
+        )
+
+      stub_request(:get, url + "Cargo.toml?ref=sha")
+        .with(headers: { "Authorization" => "token token" })
+        .to_return(
+          status: 200,
+          body: fixture("github", "contents_cargo_manifest.json"),
+          headers: json_header
+        )
+
+      stub_request(:get, url + "Cargo.lock?ref=sha")
+        .with(headers: { "Authorization" => "token token" })
+        .to_return(
+          status: 200,
+          body: fixture("github", "contents_cargo_lockfile.json"),
+          headers: json_header
+        )
+
+      # No config anywhere between the nested directory and the repository root
+      %w(a/b/c a/b a).each do |dir|
+        base = "https://api.github.com/repos/gocardless/bump/contents/#{dir}"
+        stub_request(:get, "#{base}/.cargo?ref=sha")
+          .with(headers: { "Authorization" => "token token" })
+          .to_return(status: 404, headers: json_header)
+        stub_request(:get, "#{base}/.cargo/config.toml?ref=sha")
+          .with(headers: { "Authorization" => "token token" })
+          .to_return(status: 404, headers: json_header)
+        stub_request(:get, "#{base}/.cargo/config?ref=sha")
+          .with(headers: { "Authorization" => "token token" })
+          .to_return(status: 404, headers: json_header)
+      end
+
+      # Config at repository root, reachable only by walking up multiple parent dirs
+      stub_request(:get, "https://api.github.com/repos/gocardless/bump/contents/.cargo?ref=sha")
+        .with(headers: { "Authorization" => "token token" })
+        .to_return(
+          status: 200,
+          body: fixture("github", "contents_cargo_dir.json"),
+          headers: json_header
+        )
+
+      stub_request(:get, "https://api.github.com/repos/gocardless/bump/contents/.cargo/config.toml?ref=sha")
+        .with(headers: { "Authorization" => "token token" })
+        .to_return(
+          status: 200,
+          body: fixture("github", "contents_cargo_config.json"),
+          headers: json_header
+        )
+    end
+
+    it "names the config file exactly '.cargo/config.toml' regardless of nesting depth" do
+      config = file_fetcher_instance.files.find { |f| f.name.end_with?("config.toml") }
+
+      expect(config.name).to eq(".cargo/config.toml")
+      # Depth is captured in the directory / path, never in the name.
+      expect(config.path).to eq("/a/b/c/.cargo/config.toml")
+    end
+  end
+
+  context "with cargo config files in both the package directory and the repository root" do
+    let(:source) do
+      Dependabot::Source.new(
+        provider: "github",
+        repo: "gocardless/bump",
+        directory: "my_dir"
+      )
+    end
+
+    let(:url) do
+      "https://api.github.com/repos/gocardless/bump/contents/my_dir/"
+    end
+
+    before do
+      stub_request(:get, "https://api.github.com/repos/gocardless/bump/contents/my_dir?ref=sha")
+        .with(headers: { "Authorization" => "token token" })
+        .to_return(status: 200, body: fixture("github", "contents_cargo_with_lockfile.json"), headers: json_header)
+
+      stub_request(:get, url + "Cargo.toml?ref=sha")
+        .with(headers: { "Authorization" => "token token" })
+        .to_return(status: 200, body: fixture("github", "contents_cargo_manifest.json"), headers: json_header)
+
+      stub_request(:get, url + "Cargo.lock?ref=sha")
+        .with(headers: { "Authorization" => "token token" })
+        .to_return(status: 200, body: fixture("github", "contents_cargo_lockfile.json"), headers: json_header)
+
+      # Local config in the package directory
+      stub_request(:get, url + ".cargo?ref=sha")
+        .with(headers: { "Authorization" => "token token" })
+        .to_return(status: 200, body: fixture("github", "contents_cargo_dir.json"), headers: json_header)
+      stub_request(:get, url + ".cargo/config.toml?ref=sha")
+        .with(headers: { "Authorization" => "token token" })
+        .to_return(status: 200, body: fixture("github", "contents_cargo_config.json"), headers: json_header)
+
+      # Config also present at the repository root (an ancestor directory)
+      stub_request(:get, "https://api.github.com/repos/gocardless/bump/contents/.cargo/config.toml?ref=sha")
+        .with(headers: { "Authorization" => "token token" })
+        .to_return(status: 200, body: fixture("github", "contents_cargo_config.json"), headers: json_header)
+    end
+
+    it "fetches both the package-directory and ancestor cargo configs" do
+      config_files = file_fetcher_instance.files.select { |f| f.name.end_with?(".cargo/config.toml") }
+
+      expect(config_files.map(&:name))
+        .to match_array(%w(.cargo/config.toml ../.cargo/config.toml))
+      # The ancestor config keeps its relative path so Cargo can merge it,
+      # while the package-directory config keeps the canonical name.
+      expect(config_files.map(&:path))
+        .to match_array(%w(/my_dir/.cargo/config.toml /.cargo/config.toml))
+      expect(config_files).to all(be_support_file)
+    end
+  end
+
   context "without a lockfile" do
     before do
       stub_request(:get, url + "?ref=sha")
@@ -168,9 +379,11 @@ RSpec.describe Dependabot::Cargo::FileFetcher do
     end
 
     it "provides the Rust channel" do
-      expect(file_fetcher_instance.ecosystem_versions).to eq({
-        package_managers: { "cargo" => "default" }
-      })
+      expect(file_fetcher_instance.ecosystem_versions).to eq(
+        {
+          package_managers: { "cargo" => "default" }
+        }
+      )
     end
   end
 
@@ -228,9 +441,11 @@ RSpec.describe Dependabot::Cargo::FileFetcher do
     end
 
     it "provides the Rust channel" do
-      expect(file_fetcher_instance.ecosystem_versions).to eq({
-        package_managers: { "cargo" => "1.2.3" }
-      })
+      expect(file_fetcher_instance.ecosystem_versions).to eq(
+        {
+          package_managers: { "cargo" => "1.2.3" }
+        }
+      )
     end
   end
 
@@ -365,14 +580,25 @@ RSpec.describe Dependabot::Cargo::FileFetcher do
         end
 
         before do
-          stub_request(:get, "https://api.github.com/repos/gocardless/bump/" \
-                             "contents/my_dir?ref=sha")
+          stub_request(
+            :get,
+            "https://api.github.com/repos/gocardless/bump/" \
+            "contents/my_dir?ref=sha"
+          )
             .with(headers: { "Authorization" => "token token" })
             .to_return(
               status: 200,
               body: fixture("github", "contents_cargo_without_lockfile.json"),
               headers: json_header
             )
+
+          # No cargo config in the parent (repository root) directory
+          stub_request(:get, "https://api.github.com/repos/gocardless/bump/contents/.cargo/config.toml?ref=sha")
+            .with(headers: { "Authorization" => "token token" })
+            .to_return(status: 404, headers: json_header)
+          stub_request(:get, "https://api.github.com/repos/gocardless/bump/contents/.cargo/config?ref=sha")
+            .with(headers: { "Authorization" => "token token" })
+            .to_return(status: 404, headers: json_header)
         end
 
         it "fetches the path dependency's Cargo.toml" do
@@ -678,7 +904,7 @@ RSpec.describe Dependabot::Cargo::FileFetcher do
 
       stub_request(:get, url + "excluded/Cargo.toml?ref=sha")
         .with(headers: { "Authorization" => "token token" })
-        .to_return(status: 200, body: member_fixture, headers: json_header)
+        .to_return(status: 200, body: excluded_fixture, headers: json_header)
     end
 
     let(:parent_fixture) do
@@ -740,6 +966,762 @@ RSpec.describe Dependabot::Cargo::FileFetcher do
     it "raises a DependencyFileNotFound error" do
       expect { file_fetcher_instance.files }
         .to raise_error(Dependabot::DependencyFileNotFound)
+    end
+  end
+
+  context "with a workspace root containing a path dependency to a member" do
+    before do
+      stub_request(:get, url + "?ref=sha")
+        .with(headers: { "Authorization" => "token token" })
+        .to_return(
+          status: 200,
+          body: fixture("github", "contents_cargo_without_lockfile.json"),
+          headers: json_header
+        )
+      stub_request(:get, url + "Cargo.toml?ref=sha")
+        .with(headers: { "Authorization" => "token token" })
+        .to_return(
+          status: 200,
+          body: fixture(
+            "github",
+            "path_dependency_in_workspace_root",
+            "contents_cargo_manifest_workspace.json"
+          ),
+          headers: json_header
+        )
+      stub_request(:get, url + "child/Cargo.toml?ref=sha")
+        .with(headers: { "Authorization" => "token token" })
+        .to_return(
+          status: 200,
+          body: fixture(
+            "github",
+            "path_dependency_in_workspace_root",
+            "contents_cargo_manifest_child.json"
+          ),
+          headers: json_header
+        )
+    end
+
+    it "fetches the dependencies successfully" do
+      expect(file_fetcher_instance.files.map(&:name))
+        .to match_array(%w(.cargo/config.toml Cargo.toml child/Cargo.toml))
+      expect(file_fetcher_instance.files.map(&:path))
+        .to match_array(%w(/.cargo/config.toml /Cargo.toml /child/Cargo.toml))
+    end
+  end
+
+  context "with a path dependency to a workspace member" do
+    let(:root_url) do
+      "https://api.github.com/repos/gocardless/bump/"
+    end
+    let(:url) do
+      root_url + "contents/"
+    end
+
+    before do
+      # No root Cargo.toml
+      stub_request(:get, root_url + "Cargo.toml?ref=sha")
+        .with(headers: { "Authorization" => "token token" })
+        .to_return(status: 404, headers: json_header)
+
+      # Contents of these dirs aren't important
+      stub_request(:get, root_url + "?ref=sha")
+        .with(headers: { "Authorization" => "token token" })
+        .to_return(
+          status: 200,
+          body: fixture("github", "path_dependency_workspace_member", "contents_dir_detached_crate_success.json"),
+          headers: json_header
+        )
+      stub_request(:get, /#{Regexp.escape(url)}detached_crate_(success|fail_1|fail_2)\?ref=sha/)
+        .with(headers: { "Authorization" => "token token" })
+        .to_return(
+          status: 200,
+          body: fixture("github", "path_dependency_workspace_member", "contents_dir_detached_crate_success.json"),
+          headers: json_header
+        )
+
+      # Ignoring any .cargo requests
+      stub_request(:get, %r{#{Regexp.escape(url)}\w+/\.cargo\?ref=sha})
+        .with(headers: { "Authorization" => "token token" })
+        .to_return(status: 404, headers: json_header)
+      stub_request(:get, %r{#{Regexp.escape(url)}.*\.cargo/config\.toml\?ref=sha})
+        .with(headers: { "Authorization" => "token token" })
+        .to_return(status: 404, headers: json_header)
+      stub_request(:get, %r{#{Regexp.escape(url)}.*\.cargo/config\?ref=sha})
+        .with(headers: { "Authorization" => "token token" })
+        .to_return(status: 404, headers: json_header)
+
+      # All the manifest requests
+      stub_request(:get, url + "detached_crate_fail_1/Cargo.toml?ref=sha")
+        .with(headers: { "Authorization" => "token token" })
+        .to_return(
+          status: 200,
+          body: fixture(
+            "github",
+            "path_dependency_workspace_member",
+            "contents_cargo_manifest_detached_crate_fail_1.json"
+          ),
+          headers: json_header
+        )
+      stub_request(:get, url + "detached_crate_fail_2/Cargo.toml?ref=sha")
+        .with(headers: { "Authorization" => "token token" })
+        .to_return(
+          status: 200,
+          body: fixture(
+            "github",
+            "path_dependency_workspace_member",
+            "contents_cargo_manifest_detached_crate_fail_2.json"
+          ),
+          headers: json_header
+        )
+      stub_request(:get, url + "detached_crate_success/Cargo.toml?ref=sha")
+        .with(headers: { "Authorization" => "token token" })
+        .to_return(
+          status: 200,
+          body: fixture(
+            "github",
+            "path_dependency_workspace_member",
+            "contents_cargo_manifest_detached_crate_success.json"
+          ),
+          headers: json_header
+        )
+      stub_request(:get, url + "detached_workspace_member/Cargo.toml?ref=sha")
+        .with(headers: { "Authorization" => "token token" })
+        .to_return(
+          status: 200,
+          body: fixture(
+            "github",
+            "path_dependency_workspace_member",
+            "contents_cargo_manifest_detached_workspace_member.json"
+          ),
+          headers: json_header
+        )
+      stub_request(:get, url + "incorrect_detached_workspace_member/Cargo.toml?ref=sha")
+        .with(headers: { "Authorization" => "token token" })
+        .to_return(
+          status: 200,
+          body: fixture(
+            "github",
+            "path_dependency_workspace_member",
+            "contents_cargo_manifest_incorrect_detached_workspace_member.json"
+          ),
+          headers: json_header
+        )
+      stub_request(:get, url + "incorrect_workspace/Cargo.toml?ref=sha")
+        .with(headers: { "Authorization" => "token token" })
+        .to_return(
+          status: 200,
+          body: fixture(
+            "github",
+            "path_dependency_workspace_member",
+            "contents_cargo_manifest_incorrect_workspace.json"
+          ),
+          headers: json_header
+        )
+      stub_request(:get, url + "workspace/Cargo.toml?ref=sha")
+        .with(headers: { "Authorization" => "token token" })
+        .to_return(
+          status: 200,
+          body: fixture("github", "path_dependency_workspace_member", "contents_cargo_manifest_workspace.json"),
+          headers: json_header
+        )
+      stub_request(:get, url + "workspace/nested_one/nested_two/Cargo.toml?ref=sha")
+        .with(headers: { "Authorization" => "token token" })
+        .to_return(
+          status: 200,
+          body: fixture(
+            "github",
+            "path_dependency_workspace_member",
+            "contents_cargo_manifest_workspace_nested_one_nested_two.json"
+          ),
+          headers: json_header
+        )
+
+      # nested_one dir has nothing of interest
+      stub_request(:get, url + "workspace/nested_one?ref=sha")
+        .with(headers: { "Authorization" => "token token" })
+        .to_return(status: 200, body: "[]", headers: json_header)
+      stub_request(:get, url + "workspace/nested_one/Cargo.toml?ref=sha")
+        .with(headers: { "Authorization" => "token token" })
+        .to_return(status: 404, headers: json_header)
+    end
+
+    context "with a resolvable workspace root" do
+      let(:source) do
+        Dependabot::Source.new(
+          provider: "github",
+          repo: "gocardless/bump",
+          directory: "detached_crate_success/"
+        )
+      end
+
+      it "fetches the dependencies successfully" do
+        expect(file_fetcher_instance.files.map(&:name))
+          .to match_array(
+            %w(
+              Cargo.toml
+              ../detached_workspace_member/Cargo.toml
+              ../workspace/Cargo.toml
+              ../workspace/nested_one/nested_two/Cargo.toml
+            )
+          )
+        expect(file_fetcher_instance.files.map(&:path))
+          .to match_array(
+            %w(
+              /detached_crate_success/Cargo.toml
+              /detached_workspace_member/Cargo.toml
+              /workspace/Cargo.toml
+              /workspace/nested_one/nested_two/Cargo.toml
+            )
+          )
+      end
+    end
+
+    context "with no workspace root via parent directory search" do
+      let(:source) do
+        Dependabot::Source.new(
+          provider: "github",
+          repo: "gocardless/bump",
+          directory: "detached_crate_fail_1/"
+        )
+      end
+
+      it "fetches as many dependencies as possible, without erroring" do
+        expect(file_fetcher_instance.files.map(&:name))
+          .to match_array(
+            %w(
+              ../incorrect_workspace/Cargo.toml Cargo.toml
+            )
+          )
+        expect(file_fetcher_instance.files.map(&:path))
+          .to match_array(
+            %w(
+              /detached_crate_fail_1/Cargo.toml /incorrect_workspace/Cargo.toml
+            )
+          )
+      end
+    end
+
+    context "with no workspace root via package.workspace key" do
+      let(:source) do
+        Dependabot::Source.new(
+          provider: "github",
+          repo: "gocardless/bump",
+          directory: "detached_crate_fail_2/"
+        )
+      end
+
+      it "fetches as many dependencies as possible, without erroring" do
+        expect(file_fetcher_instance.files.map(&:name))
+          .to match_array(
+            %w(
+              ../incorrect_detached_workspace_member/Cargo.toml Cargo.toml
+            )
+          )
+        expect(file_fetcher_instance.files.map(&:path))
+          .to match_array(
+            %w(
+              /detached_crate_fail_2/Cargo.toml /incorrect_detached_workspace_member/Cargo.toml
+            )
+          )
+      end
+    end
+  end
+
+  describe "#expand_workspaces" do
+    let(:file_fetcher_instance) do
+      described_class.new(source: source, credentials: credentials)
+    end
+    let(:source) do
+      Dependabot::Source.new(
+        provider: "github",
+        repo: "test/repo",
+        directory: "/"
+      )
+    end
+
+    before do
+      allow(file_fetcher_instance).to receive_messages(commit: "sha", directory: "")
+    end
+
+    context "when workspace path is a simple glob pattern" do
+      it "expands workspace paths with wildcards" do
+        allow(file_fetcher_instance).to receive(:repo_contents)
+          .with(dir: "packages/", raise_errors: false)
+          .and_return([
+            Data.define(:type, :path).new("dir", "packages/crate1"),
+            Data.define(:type, :path).new("dir", "packages/crate2"),
+            Data.define(:type, :path).new("file", "packages/README.md")
+          ])
+
+        result = file_fetcher_instance.send(:expand_workspaces, "packages/*")
+        expect(result).to contain_exactly("packages/crate1", "packages/crate2")
+      end
+    end
+
+    context "when workspace path is exactly '*'" do
+      it "handles the edge case without throwing nil error" do
+        allow(file_fetcher_instance).to receive(:repo_contents)
+          .with(dir: "", raise_errors: false)
+          .and_return([
+            Data.define(:type, :path).new("dir", "crate1"),
+            Data.define(:type, :path).new("dir", "crate2"),
+            Data.define(:type, :path).new("file", "README.md")
+          ])
+
+        result = file_fetcher_instance.send(:expand_workspaces, "*")
+        expect(result).to match_array(%w(crate1 crate2))
+      end
+    end
+
+    context "when workspace path starts with '*'" do
+      it "handles paths that start with wildcard" do
+        allow(file_fetcher_instance).to receive(:repo_contents)
+          .with(dir: "", raise_errors: false)
+          .and_return([
+            Data.define(:type, :path).new("dir", "test-crate"),
+            Data.define(:type, :path).new("dir", "prod-crate"),
+            Data.define(:type, :path).new("file", "README.md")
+          ])
+
+        result = file_fetcher_instance.send(:expand_workspaces, "*-crate")
+        expect(result).to match_array(%w(test-crate prod-crate))
+      end
+    end
+
+    context "when workspace path contains multiple wildcards" do
+      it "handles multiple wildcards correctly" do
+        allow(file_fetcher_instance).to receive(:repo_contents)
+          .with(dir: "src/", raise_errors: false)
+          .and_return([
+            Data.define(:type, :path).new("dir", "src/bin-crate-v1"),
+            Data.define(:type, :path).new("dir", "src/lib-crate-v2"),
+            Data.define(:type, :path).new("dir", "src/other")
+          ])
+
+        result = file_fetcher_instance.send(:expand_workspaces, "src/*-crate-*")
+        expect(result).to contain_exactly("src/bin-crate-v1", "src/lib-crate-v2")
+      end
+    end
+
+    context "when no directories match the pattern" do
+      it "returns empty array when no matches found" do
+        allow(file_fetcher_instance).to receive(:repo_contents)
+          .with(dir: "nonexistent/", raise_errors: false)
+          .and_return([])
+
+        result = file_fetcher_instance.send(:expand_workspaces, "nonexistent/*")
+        expect(result).to eq([])
+      end
+    end
+
+    context "when workspace path has nested wildcards" do
+      it "handles nested directory patterns" do
+        allow(file_fetcher_instance).to receive(:repo_contents)
+          .with(dir: "apps/", raise_errors: false)
+          .and_return([
+            Data.define(:type, :path).new("dir", "apps/web/frontend"),
+            Data.define(:type, :path).new("dir", "apps/api/backend"),
+            Data.define(:type, :path).new("file", "apps/config.json")
+          ])
+
+        result = file_fetcher_instance.send(:expand_workspaces, "apps/*/frontend")
+        expect(result).to contain_exactly("apps/web/frontend")
+      end
+    end
+  end
+
+  describe "#uses_workspace_dependencies?" do
+    let(:file_fetcher_instance) do
+      described_class.new(source: source, credentials: credentials)
+    end
+
+    context "when manifest has regular workspace dependencies" do
+      let(:manifest_with_workspace_deps) do
+        {
+          "dependencies" => {
+            "serde" => { "workspace" => true },
+            "tokio" => "1.0"
+          }
+        }
+      end
+
+      it "returns true" do
+        expect(file_fetcher_instance.send(:uses_workspace_dependencies?, manifest_with_workspace_deps)).to be(true)
+      end
+    end
+
+    context "when manifest has dev workspace dependencies" do
+      let(:manifest_with_dev_workspace_deps) do
+        {
+          "dev-dependencies" => {
+            "criterion" => { "workspace" => true }
+          }
+        }
+      end
+
+      it "returns true" do
+        expect(file_fetcher_instance.send(:uses_workspace_dependencies?, manifest_with_dev_workspace_deps)).to be(true)
+      end
+    end
+
+    context "when manifest has build workspace dependencies" do
+      let(:manifest_with_build_workspace_deps) do
+        {
+          "build-dependencies" => {
+            "cc" => { "workspace" => true }
+          }
+        }
+      end
+
+      it "returns true" do
+        expect(
+          file_fetcher_instance.send(
+            :uses_workspace_dependencies?,
+            manifest_with_build_workspace_deps
+          )
+        ).to be(true)
+      end
+    end
+
+    context "when manifest has target-specific workspace dependencies" do
+      let(:manifest_with_target_workspace_deps) do
+        {
+          "target" => {
+            "wasm32-unknown-unknown" => {
+              "dependencies" => {
+                "wasm-bindgen" => { "workspace" => true }
+              }
+            }
+          }
+        }
+      end
+
+      it "returns true" do
+        expect(
+          file_fetcher_instance.send(
+            :uses_workspace_dependencies?,
+            manifest_with_target_workspace_deps
+          )
+        ).to be(true)
+      end
+    end
+
+    context "when manifest has no workspace dependencies" do
+      let(:manifest_without_workspace_deps) do
+        {
+          "dependencies" => {
+            "serde" => "1.0",
+            "tokio" => "1.0"
+          },
+          "dev-dependencies" => {
+            "criterion" => "0.4"
+          }
+        }
+      end
+
+      it "returns false" do
+        expect(file_fetcher_instance.send(:uses_workspace_dependencies?, manifest_without_workspace_deps)).to be(false)
+      end
+    end
+
+    context "when manifest is empty" do
+      let(:empty_manifest) { {} }
+
+      it "returns false" do
+        expect(file_fetcher_instance.send(:uses_workspace_dependencies?, empty_manifest)).to be(false)
+      end
+    end
+  end
+
+  describe "workspace root fetching for workspace dependencies" do
+    let(:file_fetcher_instance) do
+      described_class.new(source: source, credentials: credentials)
+    end
+
+    describe "integration with fetch_workspace_files" do
+      let(:workspace_member_file) do
+        Dependabot::DependencyFile.new(
+          name: "internal/Cargo.toml",
+          content: "[package]\nname = \"internal\"\n\n[dependencies]\nanstyle = { workspace = true }\n"
+        )
+      end
+
+      let(:workspace_root_file) do
+        Dependabot::DependencyFile.new(
+          name: "Cargo.toml",
+          content: "[workspace]\nmembers = [\"internal\"]\n\n[workspace.dependencies]\nanstyle = \"1.0.8\"\n"
+        )
+      end
+
+      before do
+        allow(file_fetcher_instance).to receive(:find_workspace_root)
+          .with(workspace_member_file)
+          .and_return(workspace_root_file)
+      end
+
+      it "includes workspace root when workspace member uses workspace dependencies" do
+        # Mock the workspace dependency paths from the root file
+        allow(file_fetcher_instance).to receive(:workspace_dependency_paths_from_file)
+          .with(workspace_root_file)
+          .and_return(["internal/Cargo.toml"])
+
+        # Mock the workspace dependency paths from the member file (recursive call)
+        allow(file_fetcher_instance).to receive(:workspace_dependency_paths_from_file)
+          .with(workspace_member_file)
+          .and_return([])
+
+        allow(file_fetcher_instance).to receive(:fetch_file_from_host)
+          .with("internal/Cargo.toml", fetch_submodules: true)
+          .and_return(workspace_member_file)
+
+        # Mock the cargo_toml method call
+        allow(file_fetcher_instance).to receive(:fetch_file_from_host)
+          .with("Cargo.toml")
+          .and_return(workspace_root_file)
+
+        # Call the method under test
+        result = file_fetcher_instance.send(
+          :fetch_workspace_files,
+          file: workspace_root_file,
+          previously_fetched_files: []
+        )
+
+        # Should include both the workspace member and the workspace root
+        expect(result.map(&:name)).to include("internal/Cargo.toml", "Cargo.toml")
+      end
+    end
+
+    describe "integration with fetch_files" do
+      let(:main_cargo_file) do
+        Dependabot::DependencyFile.new(
+          name: "Cargo.toml",
+          content: "[package]\nname = \"test\"\n\n[dependencies]\nserde = { workspace = true }\n"
+        )
+      end
+
+      let(:workspace_root_file) do
+        Dependabot::DependencyFile.new(
+          name: "../Cargo.toml",
+          content: "[workspace]\nmembers = [\"test\"]\n\n[workspace.dependencies]\nserde = \"1.0\"\n"
+        )
+      end
+
+      before do
+        allow(file_fetcher_instance).to receive_messages(
+          cargo_toml: main_cargo_file,
+          cargo_lock: nil,
+          cargo_config: nil,
+          rust_toolchain: nil,
+          fetch_path_dependency_and_workspace_files: []
+        )
+        allow(file_fetcher_instance).to receive(:find_workspace_root)
+          .with(main_cargo_file)
+          .and_return(workspace_root_file)
+      end
+
+      it "includes workspace root when main Cargo.toml uses workspace dependencies" do
+        files = file_fetcher_instance.fetch_files
+
+        expect(files.map(&:name)).to include("Cargo.toml", "../Cargo.toml")
+      end
+    end
+
+    describe "integration with fetch_path_dependency_files" do
+      let(:main_file) do
+        Dependabot::DependencyFile.new(
+          name: "Cargo.toml",
+          content: "[package]\nname = \"main\"\n\n[dependencies]\ninternal = { path = \"../internal\" }\n"
+        )
+      end
+
+      let(:path_dep_file) do
+        Dependabot::DependencyFile.new(
+          name: "../internal/Cargo.toml",
+          content: "[package]\nname = \"internal\"\n\n[dependencies]\nserde = { workspace = true }\n"
+        )
+      end
+
+      let(:workspace_root_file) do
+        Dependabot::DependencyFile.new(
+          name: "../Cargo.toml",
+          content: "[workspace]\nmembers = [\"internal\"]\n\n[workspace.dependencies]\nserde = \"1.0\"\n"
+        )
+      end
+
+      before do
+        allow(file_fetcher_instance).to receive(:path_dependency_paths_from_file)
+          .with(main_file)
+          .and_return(["../internal/Cargo.toml"])
+
+        # Mock for the path dependency file itself (no further path dependencies)
+        allow(file_fetcher_instance).to receive(:path_dependency_paths_from_file)
+          .with(path_dep_file)
+          .and_return([])
+
+        allow(file_fetcher_instance).to receive(:fetch_file_from_host)
+          .with("../internal/Cargo.toml", fetch_submodules: true)
+          .and_return(path_dep_file)
+
+        # Mock workspace_member? to return true for our test case
+        allow(file_fetcher_instance).to receive(:workspace_member?)
+          .and_return(false)
+        allow(file_fetcher_instance).to receive(:workspace_member?)
+          .with(hash_including("dependencies" => hash_including("serde" => { "workspace" => true })))
+          .and_return(true)
+
+        allow(file_fetcher_instance).to receive(:find_workspace_root)
+          .with(path_dep_file)
+          .and_return(workspace_root_file)
+      end
+
+      it "includes workspace root when path dependency uses workspace dependencies" do
+        result = file_fetcher_instance.send(
+          :fetch_path_dependency_files,
+          file: main_file,
+          previously_fetched_files: []
+        )
+
+        # Should include the path dependency and its workspace root
+        expect(result.map(&:name)).to include("../internal/Cargo.toml", "../Cargo.toml")
+      end
+    end
+  end
+
+  describe "filename normalization" do
+    # Tests for the Cargo-specific filename normalization fix
+    # This addresses the "No Cargo.toml!" error caused by leading slashes in filenames
+
+    describe "normalization logic" do
+      it "normalizes various filename formats correctly" do
+        test_cases = [
+          # [input, expected_output]
+          ["Cargo.toml", "Cargo.toml"],
+          ["./Cargo.toml", "Cargo.toml"],
+          ["/Cargo.toml", "Cargo.toml"],
+          ["subdir/Cargo.toml", "subdir/Cargo.toml"],
+          ["/subdir/Cargo.toml", "subdir/Cargo.toml"],
+          ["./subdir/../Cargo.toml", "Cargo.toml"],
+          ["/./subdir/../Cargo.toml", "Cargo.toml"],
+          ["//Cargo.toml", "Cargo.toml"], # Multiple leading slashes
+          ["///deep/path/Cargo.toml", "deep/path/Cargo.toml"]
+        ]
+
+        test_cases.each do |input, expected|
+          # Test the inline normalization logic
+          normalized = Pathname.new(input).cleanpath.to_s.gsub(%r{^/+}, "")
+          expect(normalized).to eq(expected),
+                                "Expected #{input.inspect} to normalize to #{expected.inspect}, " \
+                                "got #{normalized.inspect}"
+        end
+      end
+    end
+
+    describe "#fetch_file_from_host" do
+      let(:source) do
+        Dependabot::Source.new(
+          provider: "github",
+          repo: "gocardless/bump",
+          directory: "/"
+        )
+      end
+
+      before do
+        stub_request(:get, url + "?ref=sha")
+          .with(headers: { "Authorization" => "token token" })
+          .to_return(
+            status: 200,
+            body: fixture("github", "contents_cargo_with_lockfile.json"),
+            headers: json_header
+          )
+      end
+
+      it "normalizes filenames when fetching files" do
+        file = file_fetcher_instance.send(:fetch_file_from_host, "Cargo.toml")
+        expect(file.name).to eq("Cargo.toml")
+        expect(file.name).not_to start_with("/")
+      end
+
+      it "preserves subdirectory paths while removing leading slashes" do
+        # Mock a file in a subdirectory
+        stub_request(:get, url + "subdir/Cargo.toml?ref=sha")
+          .with(headers: { "Authorization" => "token token" })
+          .to_return(
+            status: 200,
+            body: fixture("github", "contents_cargo_manifest.json"),
+            headers: json_header
+          )
+
+        file = file_fetcher_instance.send(:fetch_file_from_host, "subdir/Cargo.toml")
+        expect(file.name).to eq("subdir/Cargo.toml")
+        expect(file.name).not_to start_with("/")
+      end
+    end
+
+    describe "integration with file parser" do
+      # This test verifies that our fix resolves the "No Cargo.toml!" issue
+      let(:cargo_parser_class) do
+        Class.new do
+          def initialize(dependency_files:, **_)
+            @dependency_files = dependency_files
+            check_required_files
+          end
+
+          def get_original_file(filename)
+            @dependency_files.find { |f| f.name == filename }
+          end
+
+          def check_required_files
+            raise "No Cargo.toml!" unless get_original_file("Cargo.toml")
+          end
+        end
+      end
+
+      before do
+        stub_request(:get, url + "?ref=sha")
+          .with(headers: { "Authorization" => "token token" })
+          .to_return(
+            status: 200,
+            body: fixture("github", "contents_cargo_with_lockfile.json"),
+            headers: json_header
+          )
+      end
+
+      it "fetches files with normalized names that can be found by the parser" do
+        files = file_fetcher_instance.files
+
+        # Verify all files have normalized names (no leading slashes)
+        files.each do |file|
+          expect(file.name).not_to start_with("/"),
+                                   "File #{file.name} should not start with '/'"
+        end
+
+        # Verify the parser can find the files
+        expect { cargo_parser_class.new(dependency_files: files) }
+          .not_to raise_error
+      end
+
+      it "handles files from subdirectories correctly" do
+        # Create test files as if they were fetched with our normalization
+        files = [
+          Dependabot::DependencyFile.new(
+            name: "Cargo.toml",
+            content: "[package]\nname = \"test\"\n"
+          ),
+          Dependabot::DependencyFile.new(
+            name: "subdir/Cargo.toml",
+            content: "[package]\nname = \"subdir\"\n"
+          )
+        ]
+
+        # Parser should be able to find the main Cargo.toml
+        expect { cargo_parser_class.new(dependency_files: files) }
+          .not_to raise_error
+
+        # Verify file names are correct
+        expect(files[0].name).to eq("Cargo.toml")
+        expect(files[1].name).to eq("subdir/Cargo.toml")
+      end
     end
   end
 end

@@ -1,4 +1,11 @@
 version: 2
+multi-ecosystem-groups:
+  uv-ecosystem:
+    schedule:
+      interval: "weekly"
+      day: "sunday"
+      time: "16:00"
+
 updates:
   - package-ecosystem: "bundler"
     directories:
@@ -28,11 +35,12 @@ updates:
         update-types:
           - "minor"
           - "patch"
+      per-dependency:
+        group-by: "dependency-name"
 
   # Watch the per-ecosystem native helpers
   - package-ecosystem: "composer"
     directories:
-      - "/composer/helpers/v1"
       - "/composer/helpers/v2"
     schedule:
       interval: "weekly"
@@ -58,12 +66,26 @@ updates:
   - package-ecosystem: "docker"
     directories:
       - "/"
-      - "/go_modules"
       - "/cargo"
+      - "/docker"
+      - "/go_modules"
+      - "/gradle"
+      - "/helm"
+      - "/maven"
+      - "/nix"
     schedule:
       interval: "weekly"
       day: "sunday"
       time: "16:00"
+    groups:
+      container-tools:
+        patterns:
+          - "alpine/helm"
+          - "oras-project/oras"
+          - "regclient/regctl*"
+          - "sigstore/cosign/cosign*"
+      per-image:
+        group-by: "dependency-name"
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
@@ -74,11 +96,27 @@ updates:
       all-actions:
         patterns: [ "*" ]
   - package-ecosystem: "gomod"
-    directory: "/go_modules/helpers"
+    directories:
+      - "/go_modules/helpers"
+      - "/silent/tests"
     schedule:
       interval: "weekly"
       day: "sunday"
       time: "16:00"
+    groups:
+      per-dependency:
+        group-by: "dependency-name"
+  - package-ecosystem: "julia"
+    directories:
+      - "/julia/helpers"
+      - "/julia/helpers/DependabotHelper.jl"
+    schedule:
+      interval: "weekly"
+      day: "sunday"
+      time: "16:00"
+    groups:
+      per-dependency:
+        group-by: "dependency-name"
   - package-ecosystem: "mix"
     directory: "/hex/helpers"
     schedule:
@@ -86,7 +124,9 @@ updates:
       day: "sunday"
       time: "16:00"
   - package-ecosystem: "npm"
-    directory: "/npm_and_yarn/helpers"
+    directories:
+      - "/bun/helpers"
+      - "/npm_and_yarn/helpers"
     schedule:
       interval: "weekly"
       day: "sunday"
@@ -112,6 +152,8 @@ updates:
         update-types:
           - "minor"
           - "patch"
+      per-dependency:
+        group-by: "dependency-name"
     ignore:
       - dependency-name: "npm"
         update-types: [ "version-update:semver-major" ]
@@ -124,13 +166,15 @@ updates:
     groups:
       common:
         patterns:
-          - pip
+          - hashin
           - cython
           - flake8
-      poetry:
+      # Keep the package managers themselves separate because they are higher risk
+      # and also higher visibility--ie, users generally want latest, so we don't
+      # want breakage in the `common` group to prevent updating package manager versions
+      pip:
         patterns:
-          - poetry
-          - hashin
+          - pip
       pip-tools:
         patterns:
           - pip-tools
@@ -138,6 +182,9 @@ updates:
         patterns:
           - pipfile
           - pipenv
+      poetry:
+        patterns:
+          - poetry
   - package-ecosystem: "pub"
     directory: "/pub/helpers"
     schedule:
@@ -150,6 +197,10 @@ updates:
       interval: "weekly"
       day: "sunday"
       time: "16:00"
+    groups:
+      microsoft-build:
+        patterns:
+          - "Microsoft.Build*"
   - package-ecosystem: "dotnet-sdk"
     directory: "/nuget/helpers/lib/NuGetUpdater"
     schedule:
@@ -162,3 +213,24 @@ updates:
       interval: "weekly"
       day: "sunday"
       time: "16:00"
+    ignore:
+      # This revision must remain aligned with the SDK and assembly versions used by NuGetUpdater.
+      - dependency-name: "nuget/helpers/lib/NuGet.Client"
+  - package-ecosystem: "maven"
+    directory: "/maven/lib/dependabot/maven/"
+    schedule:
+      interval: "weekly"
+      day: "sunday"
+      time: "16:00"
+  - package-ecosystem: "docker"
+    directory: "/uv"
+    multi-ecosystem-group: "uv-ecosystem"
+    patterns: ["*"]
+  - package-ecosystem: "pip"
+    directory: "/uv/helpers"
+    multi-ecosystem-group: "uv-ecosystem"
+    patterns: ["*"]
+    ignore:
+      # Ignore major updates as most major updates will need manual intervention
+      - dependency-name: "*"
+        update-types: [ "version-update:semver-major" ]

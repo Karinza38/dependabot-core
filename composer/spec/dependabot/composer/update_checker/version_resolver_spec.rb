@@ -307,11 +307,37 @@ RSpec.describe Dependabot::Composer::UpdateChecker::VersionResolver do
       after { ENV.delete("COMPOSER_PROCESS_TIMEOUT") }
 
       it "raises a Dependabot::PrivateSourceTimedOut error" do
-        pending("TODO: this URL has no DNS record post GitHub acquisition, so switch to a routable URL that hangs")
         expect { resolver.latest_resolvable_version }
           .to raise_error(Dependabot::PrivateSourceTimedOut) do |error|
-            expect(error.source).to eq("https://composer.dependabot.com")
+            expect(error.source).to eq("https://example.com:81")
           end
+      end
+    end
+
+    context "when run_update_checker returns nil" do
+      let(:project_name) { "check_original_requirements_resolvable" }
+
+      before do
+        # Mock run_update_checker to return nil
+        allow(resolver).to receive(:run_update_checker).and_return(nil) # rubocop:disable RSpec/SubjectStub
+      end
+
+      it "returns false when run_update_checker returns nil" do
+        result = resolver.send(:check_original_requirements_resolvable)
+        expect(result).to be(false)
+      end
+    end
+
+    context "when encountering a dist-only internal package" do
+      let(:project_name) { "path_source_with_dev_prefix" }
+      let(:dependency_name) { "path_dep/path_dep" }
+      let(:dependency_version) { "dev-main" }
+      let(:latest_allowable_version) { nil }
+      let(:requirements_to_unlock) { :none }
+      let(:string_req) { "dev-main" }
+
+      it "resolves the latest version without a version mismatch" do
+        expect(resolver.latest_resolvable_version).to be_nil
       end
     end
   end

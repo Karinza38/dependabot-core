@@ -3,6 +3,7 @@
 
 require "spec_helper"
 require "dependabot/dependency_file"
+require "dependabot/shared_helpers"
 require "dependabot/cargo/update_checker/file_preparer"
 require "dependabot/cargo/update_checker/version_resolver"
 
@@ -193,6 +194,29 @@ RSpec.describe Dependabot::Cargo::UpdateChecker::VersionResolver do
             expect(error.message)
               .to include("feature `metabuild` is required")
           end
+      end
+    end
+
+    context "when using a feature that doesn't exist on the dependency" do
+      it "doesn't raise an error for singular feature mismatch" do
+        error_message = "package `hashbrown` does not have that feature.\n" \
+                        " package `hashbrown` does have feature `rayon`"
+        error = Dependabot::SharedHelpers::HelperSubprocessFailed.new(
+          message: error_message,
+          error_context: {}
+        )
+
+        expect { resolver.send(:handle_cargo_errors, error) }.not_to raise_error
+      end
+
+      it "doesn't raise an error for plural feature mismatch" do
+        error_message = "package `example` does not have these features"
+        error = Dependabot::SharedHelpers::HelperSubprocessFailed.new(
+          message: error_message,
+          error_context: {}
+        )
+
+        expect { resolver.send(:handle_cargo_errors, error) }.not_to raise_error
       end
     end
 
@@ -430,6 +454,127 @@ RSpec.describe Dependabot::Cargo::UpdateChecker::VersionResolver do
       end
     end
 
+    context "with multiple locked versions of a transitive dependency" do
+      let(:manifest_fixture_name) { "multiple_locked_versions" }
+      let(:lockfile_fixture_name) { "multiple_locked_versions" }
+      let(:dependency_name) { "getrandom" }
+      let(:dependency_version) { "0.4.2" }
+      let(:requirements) { [] }
+
+      it "returns the version of the exact package Cargo updated" do
+        expect(latest_resolvable_version).to be >= Gem::Version.new("0.4.3")
+        expect(latest_resolvable_version).to be < Gem::Version.new("0.5.0")
+      end
+
+      context "when resolving the older locked line" do
+        let(:dependency_version) { "0.2.17" }
+
+        it "does not report the newer line as its update" do
+          expect(latest_resolvable_version).to be >= Gem::Version.new("0.2.17")
+          expect(latest_resolvable_version).to be < Gem::Version.new("0.3.0")
+        end
+      end
+    end
+
+    context "when Cargo splits a unified line across a version boundary" do
+      let(:manifest_fixture_name) { "split_locked_version" }
+      let(:lockfile_fixture_name) { "split_locked_version" }
+      let(:dependency_name) { "getrandom" }
+      let(:dependency_version) { "0.3.4" }
+      let(:requirements) { [] }
+      let(:new_entry) do
+        <<~ENTRY
+          [[package]]
+          name = "getrandom"
+          version = "0.4.3"
+          source = "registry+https://github.com/rust-lang/crates.io-index"
+          checksum = "33dd44ee55ff66aa77bb88cc99dd00ee11ff22aa33bb44cc55dd66aa77bb88cc"
+
+        ENTRY
+      end
+
+      before do
+        status = instance_double(Process::Status, success?: true)
+        allow(Open3).to receive(:capture2e) do
+          content = File.read("Cargo.lock")
+          File.write(
+            "Cargo.lock",
+            content.sub(
+              %([[package]]\nname = "split-locked-version"),
+              new_entry + %([[package]]\nname = "split-locked-version")
+            )
+          )
+          ["", status]
+        end
+      end
+
+      it "returns the newly introduced line rather than the retained one" do
+        expect(latest_resolvable_version).to eq(Gem::Version.new("0.4.3"))
+      end
+
+      context "when the split adds more than one new identity" do
+        let(:second_entry) do
+          <<~ENTRY
+            [[package]]
+            name = "getrandom"
+            version = "0.5.1"
+            source = "registry+https://github.com/rust-lang/crates.io-index"
+            checksum = "44ee55ff66aa77bb88cc99dd00ee11ff22aa33bb44cc55dd66aa77bb88cc99dd"
+
+          ENTRY
+        end
+
+        before do
+          status = instance_double(Process::Status, success?: true)
+          allow(Open3).to receive(:capture2e) do
+            content = File.read("Cargo.lock")
+            File.write(
+              "Cargo.lock",
+              content.sub(
+                %([[package]]\nname = "split-locked-version"),
+                new_entry + second_entry + %([[package]]\nname = "split-locked-version")
+              )
+            )
+            ["", status]
+          end
+        end
+
+        it "returns the highest newly introduced line" do
+          expect(latest_resolvable_version).to eq(Gem::Version.new("0.5.1"))
+        end
+      end
+    end
+
+    context "when a source-less package shares the git dependency's name" do
+      let(:manifest_fixture_name) { "git_dependency_multiple_refs" }
+      let(:lockfile_fixture_name) { "git_dependency_multiple_refs" }
+      let(:dependency_name) { "utf8-ranges" }
+      let(:dependency_version) { "83141b376b93484341c68fbca3ca110ae5cd2708" }
+      let(:requirements) do
+        [{
+          file: "Cargo.toml",
+          requirement: nil,
+          groups: ["dependencies"],
+          source: {
+            type: "git",
+            url: "https://github.com/BurntSushi/utf8-ranges",
+            branch: "main",
+            ref: nil
+          }
+        }]
+      end
+
+      before do
+        status = instance_double(Process::Status, success?: true)
+        allow(Open3).to receive(:capture2e).and_return(["", status])
+      end
+
+      it "ignores the source-less package when building the update spec" do
+        expect(latest_resolvable_version.to_s)
+          .to eq("83141b376b93484341c68fbca3ca110ae5cd2708")
+      end
+    end
+
     context "when there's a virtual workspace" do
       let(:manifest_fixture_name) { "virtual_workspace_root" }
       let(:lockfile_fixture_name) { "virtual_workspace" }
@@ -605,6 +750,174 @@ RSpec.describe Dependabot::Cargo::UpdateChecker::VersionResolver do
         let(:path_dependency_manifest_fixture_name) { "cargo-registry-s3-ssl-optional" }
 
         it { is_expected.to be >= Gem::Version.new("0.10.41") }
+      end
+    end
+
+    describe "#resolvability_error?" do
+      context "with binary path errors" do
+        it "detects couldn't find binary file error" do
+          message = "couldn't find `src/chargebee_codegen.rs`. " \
+                    "Please specify bin.path if you want to use a non-default path."
+          expect(resolver.send(:resolvability_error?, message)).to be(true)
+        end
+
+        it "detects failed to find binary file error" do
+          message = "failed to find `src/chargebee_codegen.rs` in package `my-package`"
+          expect(resolver.send(:resolvability_error?, message)).to be(true)
+        end
+
+        it "detects could not find binary file error" do
+          message = "could not find `src/main.rs` for binary `my-binary`"
+          expect(resolver.send(:resolvability_error?, message)).to be(true)
+        end
+
+        it "detects cannot find binary error" do
+          message = "cannot find binary `my_binary` in package `my_package`"
+          expect(resolver.send(:resolvability_error?, message)).to be(true)
+        end
+
+        it "detects binary target not found error" do
+          message = "binary target `my_target` not found in manifest"
+          expect(resolver.send(:resolvability_error?, message)).to be(true)
+        end
+
+        it "detects bin.path hint message" do
+          message = "error: cannot find binary file. Please specify bin.path if you want to use a non-default path."
+          expect(resolver.send(:resolvability_error?, message)).to be(true)
+        end
+      end
+
+      context "with existing error patterns" do
+        it "detects failed to parse lock error" do
+          message = "failed to parse lock file"
+          expect(resolver.send(:resolvability_error?, message)).to be(true)
+        end
+
+        it "detects workspace error" do
+          message = "believes it's in a workspace"
+          expect(resolver.send(:resolvability_error?, message)).to be(true)
+        end
+
+        it "detects feature requirement error" do
+          message = "feature `metabuild` is required"
+          expect(resolver.send(:resolvability_error?, message)).to be(true)
+        end
+      end
+
+      context "with non-resolvability errors" do
+        context "with non-resolvability errors" do
+          it "does not detect unrelated errors when original requirements are resolvable" do
+            # Create a new resolver instance to avoid stubbing the subject
+            non_error_resolver = described_class.new(
+              dependency: dependency,
+              prepared_dependency_files: dependency_files,
+              original_dependency_files: unprepared_dependency_files,
+              credentials: credentials
+            )
+
+            # Mock the original_requirements_resolvable? on the new instance
+            allow(non_error_resolver).to receive(:original_requirements_resolvable?).and_return(true)
+
+            message = "some other random error message"
+            expect(non_error_resolver.send(:resolvability_error?, message)).to be(false)
+          end
+        end
+      end
+    end
+  end
+
+  describe "#write_manifest_files" do
+    let(:manifest_fixture_name) { "bare_version_specified" }
+    let(:lockfile_fixture_name) { "bare_version_specified" }
+    let!(:manifest_content) { fixture("manifests", "bare_version_specified") }
+    let!(:lockfile_content) { fixture("lockfiles", "bare_version_specified") }
+
+    context "when file names have absolute paths" do
+      let(:absolute_path_manifest) do
+        Dependabot::DependencyFile.new(
+          name: "/Cargo.toml", # Absolute path that would cause permission error
+          content: manifest_content
+        )
+      end
+      let(:absolute_path_lockfile) do
+        Dependabot::DependencyFile.new(
+          name: "/Cargo.lock",
+          content: lockfile_content
+        )
+      end
+      let(:unprepared_dependency_files) { [absolute_path_manifest, absolute_path_lockfile] }
+
+      it "converts absolute paths to relative paths to avoid permission errors" do
+        # Create a temporary directory to test file writing
+        Dir.mktmpdir do |temp_dir|
+          Dir.chdir(temp_dir) do
+            # This should not raise a permission error
+            expect { resolver.send(:write_manifest_files, prepared: false) }.not_to raise_error
+
+            # Verify that the files were written with relative paths
+            expect(File.exist?("Cargo.toml")).to be(true)
+            expect(File.read("Cargo.toml")).to include("[package]")
+          end
+        end
+      end
+    end
+
+    context "when file names have relative paths" do
+      let(:relative_path_manifest) do
+        Dependabot::DependencyFile.new(
+          name: "subdir/Cargo.toml",
+          content: manifest_content
+        )
+      end
+      let(:relative_path_lockfile) do
+        Dependabot::DependencyFile.new(
+          name: "subdir/Cargo.lock",
+          content: lockfile_content
+        )
+      end
+      let(:unprepared_dependency_files) { [relative_path_manifest, relative_path_lockfile] }
+
+      it "preserves relative paths and creates necessary directories" do
+        Dir.mktmpdir do |temp_dir|
+          Dir.chdir(temp_dir) do
+            expect { resolver.send(:write_manifest_files, prepared: false) }.not_to raise_error
+
+            # Verify that the subdirectory was created and files were written
+            expect(File.exist?("subdir/Cargo.toml")).to be(true)
+            expect(File.read("subdir/Cargo.toml")).to include("[package]")
+            expect(Dir.exist?("subdir/src")).to be(true)
+            expect(File.exist?("subdir/src/lib.rs")).to be(true)
+          end
+        end
+      end
+    end
+
+    context "when file names are just filenames without paths" do
+      let(:simple_manifest) do
+        Dependabot::DependencyFile.new(
+          name: "Cargo.toml",
+          content: manifest_content
+        )
+      end
+      let(:simple_lockfile) do
+        Dependabot::DependencyFile.new(
+          name: "Cargo.lock",
+          content: lockfile_content
+        )
+      end
+      let(:unprepared_dependency_files) { [simple_manifest, simple_lockfile] }
+
+      it "writes files in the current directory" do
+        Dir.mktmpdir do |temp_dir|
+          Dir.chdir(temp_dir) do
+            expect { resolver.send(:write_manifest_files, prepared: false) }.not_to raise_error
+
+            expect(File.exist?("Cargo.toml")).to be(true)
+            expect(File.read("Cargo.toml")).to include("[package]")
+            expect(Dir.exist?("src")).to be(true)
+            expect(File.exist?("src/lib.rs")).to be(true)
+          end
+        end
       end
     end
   end

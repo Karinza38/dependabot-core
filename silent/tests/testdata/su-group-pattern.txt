@@ -54,6 +54,8 @@ pr-created expected-individual.json
 -- input.yml --
 job:
   package-manager: "silent"
+  cooldown:
+    default-days: 0
   dependencies:
     - related-a
     - related-b
@@ -62,8 +64,8 @@ job:
     directories:
       - "/"
     provider: example
-    hostname: example.com
-    api-endpoint: https://example.com/api/v3
+    hostname: 127.0.0.1
+    api-endpoint: http://127.0.0.1/api/v3
     repo: dependabot/smoke-tests
   security-advisories:
     - dependency-name: related-a

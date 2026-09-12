@@ -1,0 +1,131 @@
+using System.Collections.Immutable;
+using System.IO.Enumeration;
+using System.Text.Json;
+
+using NuGet.Versioning;
+
+namespace NuGetUpdater.Core.Run.ApiModel;
+
+public record DependencyGroup
+{
+    public required string Name { get; init; }
+    public string? AppliesTo { get; init; }
+
+    // TODO: make more strongly typed, but currently this seems to be:
+    //   "patterns" => string[] where each element is a wildcard name pattern
+    //   "exclude-patterns"=> string[] where each element is a wildcard name pattern
+    //   "dependency-type" => production|development // not used for nuget?
+    //   "update-types" => string[] where each element is one of major|minor|patch
+    public Dictionary<string, object> Rules { get; init; } = new();
+
+    public GroupMatcher GetGroupMatcher() => GroupMatcher.FromRules(Rules);
+}
+
+public enum GroupUpdateType
+{
+    Major,
+    Minor,
+    Patch,
+}
+
+public class GroupMatcher
+{
+    public ImmutableArray<string> Patterns { get; init; } = ImmutableArray<string>.Empty;
+    public ImmutableArray<string> ExcludePatterns { get; init; } = ImmutableArray<string>.Empty;
+    public ImmutableArray<GroupUpdateType> UpdateTypes { get; init; } = ImmutableArray<GroupUpdateType>.Empty;
+
+    public bool IsMatch(string dependencyName)
+    {
+        var isIncluded = Patterns.Any(p => FileSystemName.MatchesSimpleExpression(p, dependencyName));
+        var isExcluded = ExcludePatterns.Any(p => FileSystemName.MatchesSimpleExpression(p, dependencyName));
+        var isMatch = isIncluded && !isExcluded;
+        return isMatch;
+    }
+
+    public bool IsAllowedByVersion(NuGetVersion oldVersion, NuGetVersion newVersion)
+    {
+        if (newVersion <= oldVersion)
+        {
+            return false;
+        }
+
+        var isMajorBump = newVersion.Major > oldVersion.Major;
+        var isMinorBump = newVersion.Major == oldVersion.Major && newVersion.Minor > oldVersion.Minor;
+        var isPatchEquivalentBump = newVersion.Major == oldVersion.Major && newVersion.Minor == oldVersion.Minor;
+
+        var allowedUpdateTypes = new HashSet<GroupUpdateType>(UpdateTypes);
+
+        if (isMajorBump && allowedUpdateTypes.Contains(GroupUpdateType.Major))
+        {
+            return true;
+        }
+
+        if (isMinorBump && allowedUpdateTypes.Contains(GroupUpdateType.Minor))
+        {
+            return true;
+        }
+
+        if (isPatchEquivalentBump && allowedUpdateTypes.Contains(GroupUpdateType.Patch))
+        {
+            return true;
+        }
+
+        return false;
+    }
+
+    public static GroupMatcher FromRules(Dictionary<string, object> rules)
+    {
+        var patterns = GetStringArray(rules, "patterns", ["*"]); // default to matching everything unless explicitly excluded
+        var excludePatterns = GetStringArray(rules, "exclude-patterns", []);
+        var updateTypes = GetStringArray(rules, "update-types", ["major", "minor", "patch"]) // default to everything unless explicitly specified
+            .Select(s => s.ToLowerInvariant() switch
+            {
+                "major" => GroupUpdateType.Major,
+                "minor" => GroupUpdateType.Minor,
+                "patch" => GroupUpdateType.Patch,
+                _ => throw new InvalidOperationException($"Unknown update type: {s}"),
+            })
+            .ToImmutableArray();
+
+        return new GroupMatcher()
+        {
+            Patterns = patterns,
+            ExcludePatterns = excludePatterns,
+            UpdateTypes = updateTypes,
+        };
+    }
+
+    private static ImmutableArray<string> GetStringArray(Dictionary<string, object> rules, string propertyName, ImmutableArray<string> defaultValue)
+    {
+        if (!rules.TryGetValue(propertyName, out var propertyObject))
+        {
+            return defaultValue;
+        }
+
+        if (propertyObject is string[] stringArray)
+        {
+            // shortcut for unit tests which directly supply the array
+            return [.. stringArray];
+        }
+
+        var patternsElements = new List<string>();
+        if (propertyObject is JsonElement element &&
+            element.ValueKind == JsonValueKind.Array)
+        {
+            foreach (var arrayElement in element.EnumerateArray())
+            {
+                if (arrayElement.ValueKind == JsonValueKind.String)
+                {
+                    patternsElements.Add(arrayElement.GetString()!);
+                }
+            }
+        }
+
+        return [.. patternsElements];
+    }
+}
+
+public static class DependencyGroupExtensions
+{
+    public static bool IsSecurity(this DependencyGroup group) => group.AppliesTo == "security-updates";
+}
